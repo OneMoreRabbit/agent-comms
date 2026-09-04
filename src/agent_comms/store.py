@@ -7,7 +7,9 @@ so a partially-written file costs one line rather than the history.
 
 from __future__ import annotations
 
+import fcntl
 import json
+import os
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,6 +42,31 @@ class Store:
 
     def ensure(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+    def acquire_daemon_lock(self):
+        """Take the single-daemon lock, or raise `DaemonAlreadyRunning`.
+
+        An advisory `flock` on a file in the state directory. The OS releases it
+        when the process ends however it ends, so a killed daemon leaves no stale
+        lock to clear by hand — which a PID file would.
+        """
+        from .errors import DaemonAlreadyRunning
+
+        self.ensure()
+        lock_path = self.root / "daemon.lock"
+        handle = lock_path.open("w", encoding="utf-8")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            handle.close()
+            raise DaemonAlreadyRunning(
+                f"another comms daemon already holds {lock_path}. Two daemons on one bot "
+                "means two event queues, so every mention would be stored and handed to "
+                "notify_command twice. Stop the running one first."
+            ) from None
+        handle.write(str(os.getpid()))
+        handle.flush()
+        return handle
 
     # -- messages ----------------------------------------------------------
 

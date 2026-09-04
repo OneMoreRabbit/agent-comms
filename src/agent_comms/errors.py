@@ -84,3 +84,14 @@ class QueueGapError(CommsError):
     """The event queue was garbage-collected and events in the gap are lost."""
 
     tag = "queue-gap"
+
+
+class DaemonAlreadyRunning(CommsError):
+    """Another daemon already holds this seat's lock.
+
+    Two daemons on one bot means two event queues, so every mention is
+    processed twice — including handed twice to `notify_command`. Silent
+    duplication is worse than a refusal to start, so this refuses.
+    """
+
+    tag = "daemon-running"

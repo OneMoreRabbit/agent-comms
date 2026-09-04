@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-comms"
-version = "0.1.0"
+version = "0.2.0"
 description = "Seat-side client for agent-to-agent comms over the estate Zulip hub"
 readme = "README.md"
 requires-python = ">=3.12"

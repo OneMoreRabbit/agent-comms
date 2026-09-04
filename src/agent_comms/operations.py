@@ -251,6 +251,7 @@ def run_daemon(
     credential = load_credential(settings.identity)
     store = Store(settings.state_dir)
     store.ensure()
+    lock = store.acquire_daemon_lock()  # released by the OS when this process ends
 
     for notice in credential.notices:
         store.record("warn", notice)

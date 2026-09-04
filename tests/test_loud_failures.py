@@ -371,3 +371,29 @@ def test_reply_goes_to_the_mentions_own_topic(seat):
     operations.reply(301, "answered", transport_factory=lambda c: transport)
     assert transport.sent[-1]["topic"] == "agent-comms: a question"
     assert operations.inbox() == []
+
+
+# -- one daemon per seat ------------------------------------------------------
+
+def test_second_daemon_refuses_to_start(seat):
+    """Two daemons on one bot means every mention is processed twice."""
+    from agent_comms.errors import DaemonAlreadyRunning
+    from agent_comms.store import Store
+
+    held = Store(seat / ".comms").acquire_daemon_lock()
+    try:
+        with pytest.raises(DaemonAlreadyRunning, match="two event queues"):
+            operations.run_daemon(
+                transport_factory=lambda c: FakeTransport(), max_iterations=1
+            )
+    finally:
+        held.close()
+
+
+def test_lock_is_released_when_the_holder_goes(seat):
+    """An flock dies with the process, so a killed daemon leaves nothing to clear."""
+    from agent_comms.store import Store
+
+    store = Store(seat / ".comms")
+    store.acquire_daemon_lock().close()
+    operations.run_daemon(transport_factory=lambda c: FakeTransport(), max_iterations=1)
