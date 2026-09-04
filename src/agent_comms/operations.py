@@ -7,9 +7,12 @@ raises. `cli.py` is the only module that formats for a human.
 
 from __future__ import annotations
 
+import json
 import re
+import subprocess
+import time
 import urllib.parse
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable
 
@@ -118,8 +121,13 @@ def preflight(
         report.add("credential", False, str(exc))
         return report
     report.add("credential", True, f"{credential.source} → {credential.site}")
+    report.warnings.extend(credential.notices)
 
     hub = Hub(transport_factory(credential), settings, credential)
+    identity_notices = hub.verify_identity()
+    report.add("identity", True, f"expected bot '{settings.identity.bot_name}'")
+    report.warnings.extend(identity_notices)
+
     try:
         hub.verify_subscription()
         report.add("subscription", True, f"subscribed to '{settings.channel}'")
@@ -232,33 +240,45 @@ def run_daemon(
     """Hold the outbound connection and record what arrives.
 
     Returns the number of mentions stored. `max_iterations` bounds the loop for
-    tests; in a seat it runs unbounded.
+    tests; in a seat it runs unbounded until interrupted.
 
-    This never touches the working session. Mentions land in the store and the
-    consumer's designated comms conversation reads them from there — contract §3
-    'Non-invasive', and the one term that does not flex.
+    This never touches the working session. Mentions land in the store, and the
+    seat's designated comms conversation is reached through `notify_command` —
+    contract §3 'Non-invasive', the one term that does not flex. The client does
+    not decide *how* a seat surfaces a mention, only that it is not mid-task.
     """
     settings = load_settings(**kw)
     credential = load_credential(settings.identity)
     store = Store(settings.state_dir)
     store.ensure()
 
-    hub = Hub(transport_factory(credential), settings, credential)
-    hub.verify_subscription()
-    registration = hub.register_queue()
-    for warning in registration.warnings:
-        store.record("warn", warning)
+    for notice in credential.notices:
+        store.record("warn", notice)
 
-    stored, iterations = 0, 0
+    hub = Hub(transport_factory(credential), settings, credential)
+    for notice in hub.verify_identity():
+        store.record("warn", notice)
+    hub.verify_subscription()
+
+    registration = _resume_or_register(hub, store)
+
+    stored, iterations, backoff = 0, 0, 1
     while max_iterations is None or iterations < max_iterations:
         iterations += 1
         try:
             events = hub.get_events(registration)
+            backoff = 1
         except QueueGapError as exc:
             store.record("warn", f"{exc} Re-registering.")
-            registration = hub.register_queue()
-            for warning in registration.warnings:
-                store.record("warn", warning)
+            registration = _register(hub, store)
+            continue
+        except KeyboardInterrupt:  # pragma: no cover - operator stop
+            store.record("info", "daemon stopped by operator")
+            break
+        except Exception as exc:  # transport hiccup, not a contract failure
+            store.record("warn", f"event fetch failed ({exc}); retrying in {backoff}s")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
             continue
 
         for event in events:
@@ -267,8 +287,64 @@ def run_daemon(
                 continue
             store.append(mention)
             stored += 1
+            _notify(settings, store, mention)
             if on_mention is not None:
                 on_mention(mention)
         store.save_position(registration.queue_id, registration.last_event_id)
 
     return stored
+
+
+def _register(hub: Hub, store: Store) -> Registration:
+    registration = hub.register_queue()
+    for warning in registration.warnings:
+        store.record("warn", warning)
+    store.save_position(registration.queue_id, registration.last_event_id)
+    return registration
+
+
+def _resume_or_register(hub: Hub, store: Store) -> Registration:
+    """Resume a stored queue if one exists; otherwise register a fresh one.
+
+    Re-registering when a usable queue was already held silently forfeits
+    anything that arrived while the daemon was down — which is the gap §3 asks
+    us to report, not to create.
+    """
+    saved = store.load_position()
+    if not saved or not saved.get("queue_id"):
+        return _register(hub, store)
+
+    # Resume optimistically and let the main loop discover a dead queue. Probing
+    # with a get_events call here would fetch real events and discard them,
+    # advancing last_event_id past messages nobody ever saw. That is the silent
+    # loss §3 exists to prevent, so the probe is deliberately absent.
+    registration = hub.resume(saved["queue_id"], int(saved.get("last_event_id", 0)))
+    store.record(
+        "info",
+        f"resuming queue {registration.queue_id} from event {registration.last_event_id}",
+    )
+    return registration
+
+
+def _notify(settings: Settings, store: Store, mention: Mention) -> None:
+    """Hand a mention to the seat's comms conversation, if one is configured."""
+    if not settings.notify_command:
+        return
+    payload = json.dumps(asdict(mention), ensure_ascii=False)
+    try:
+        completed = subprocess.run(
+            settings.notify_command,
+            shell=True,
+            input=payload,
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        if completed.returncode != 0:
+            store.record(
+                "warn",
+                f"notify_command exited {completed.returncode} for message {mention.id}: "
+                f"{(completed.stderr or '').strip()[:400]}",
+            )
+    except Exception as exc:
+        store.record("warn", f"notify_command failed for message {mention.id}: {exc}")

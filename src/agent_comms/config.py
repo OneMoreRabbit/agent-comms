@@ -53,6 +53,19 @@ class Identity(BaseModel):
         """`~/.secrets/zuliprc-<project>-<seat>`, per the hub interface response."""
         return Path.home() / ".secrets" / f"zuliprc-{self.bot_name}"
 
+    @property
+    def credential_candidates(self) -> list[Path]:
+        """The contracted path first, then the shapes the estate has actually used.
+
+        The estate delivered `zuliprc-<seat>` rather than the contracted
+        `zuliprc-<project>-<seat>` (observed 2026-09-04). Refusing to start over
+        a filename would block the critical path for a naming difference, and
+        silently accepting it would let the divergence rot. So: accept, and say
+        so loudly — `load_credential` records a notice naming both paths.
+        """
+        secrets = Path.home() / ".secrets"
+        return [self.credential_path, secrets / f"zuliprc-{self.seat}"]
+
 
 class Settings(BaseModel):
     """Everything the client needs once comms is on."""
@@ -61,6 +74,15 @@ class Settings(BaseModel):
     channel: str = Field(description="The project channel this seat watches.")
     lifespan_secs: int = DEFAULT_LIFESPAN_SECS
     state_dir: Path = Field(default_factory=lambda: Path.home() / ".comms")
+    notify_command: str | None = Field(
+        default=None,
+        description=(
+            "Optional command run once per mention, with the mention as JSON on stdin. "
+            "This is the hand-off to the seat's comms conversation. The client does not "
+            "decide how a seat surfaces a mention — only that it is never the working "
+            "session (contract §3, 'Non-invasive')."
+        ),
+    )
 
     @field_validator("lifespan_secs")
     @classmethod
@@ -77,6 +99,13 @@ class Credential(BaseModel):
     key: str
     site: str
     source: str = Field(description="Where it came from, for `comms doctor` output.")
+    #: Non-fatal divergences found while loading. Surfaced, never swallowed.
+    notices: list[str] = Field(default_factory=list)
+
+    def __repr__(self) -> str:  # pragma: no cover - defensive
+        return f"Credential(email={self.email!r}, site={self.site!r}, source={self.source!r})"
+
+    __str__ = __repr__
 
     @field_validator("site")
     @classmethod
@@ -161,6 +190,7 @@ def load_settings(state_dir: Path | None = None, seat_manifest: Path | None = No
         channel=os.environ.get("AGENT_COMMS_CHANNEL") or file_cfg.get("channel") or project,
         lifespan_secs=int(file_cfg.get("lifespan_secs", DEFAULT_LIFESPAN_SECS)),
         state_dir=state_dir,
+        notify_command=os.environ.get("AGENT_COMMS_NOTIFY") or file_cfg.get("notify_command"),
     )
 
 
@@ -204,13 +234,23 @@ def load_credential(identity: Identity) -> Credential:
             )
         return Credential(email=env_email, key=env_key, site=site, source="environment")
 
-    path = identity.credential_path
-    if not path.exists():
+    candidates = identity.credential_candidates
+    path = next((p for p in candidates if p.exists()), None)
+    if path is None:
         raise CredentialMissing(
-            f"comms is enabled but no credential exists at {path}. The estate mints the "
-            f"bot '{identity.bot_name}' and delivers this file; until it does, this seat "
+            f"comms is enabled but no credential exists at {candidates[0]}. The estate mints "
+            f"the bot '{identity.bot_name}' and delivers this file; until it does, this seat "
             "cannot connect. This is reported as broken rather than quiet precisely "
             "because it is indistinguishable from 'comms disabled' on disk."
+        )
+
+    notices: list[str] = []
+    if path != identity.credential_path:
+        notices.append(
+            f"credential found at {path}, not the contracted "
+            f"{identity.credential_path}. Accepted so the seat can work, but the paths "
+            f"should converge: the contract derives the path from <project>-<seat>, and a "
+            f"seat that guesses filenames is one rename away from a silent outage."
         )
 
     try:
@@ -248,5 +288,9 @@ def load_credential(identity: Identity) -> Credential:
         )
 
     return Credential(
-        email=values["email"], key=values["key"], site=values["site"], source=str(path)
+        email=values["email"],
+        key=values["key"],
+        site=values["site"],
+        source=str(path),
+        notices=notices,
     )

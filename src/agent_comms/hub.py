@@ -81,6 +81,38 @@ class Hub:
                 "complete — ask for it rather than working around it."
             )
 
+    # -- attribution: is this bot who the vault thinks it is? --------------
+
+    def verify_identity(self) -> list[str]:
+        """Check the bot's name against ADR-0009 §1a, and report divergence.
+
+        Attribution is the only thing making a topology breach visible, since
+        §1's hierarchy is convention rather than server-enforced. A bot whose
+        name does not identify its project weakens exactly that. Reported, not
+        refused: a name is not a safety property, and blocking the critical path
+        over one would be the wrong trade.
+        """
+        expected = self._settings.identity.bot_name
+        result = self._t.call_endpoint(url="users/me", method="GET")
+        if result.get("result") != "success":
+            return [f"could not read this bot's own identity ({result.get('msg') or result!r})"]
+
+        notices: list[str] = []
+        actual = result.get("full_name") or ""
+        if actual != expected:
+            notices.append(
+                f"bot is named '{actual}', not '{expected}' as ADR-0009 §1a specifies "
+                f"(<project>-<seat>). Attribution still works within one channel, but the "
+                f"name does not identify the project — and it is the estate's other channels, "
+                f"where several projects meet, that the convention exists for."
+            )
+        if not result.get("is_bot"):
+            notices.append(
+                f"credential belongs to a human account ({result.get('email')}), not a bot. "
+                "Every message would be attributed to a person who did not send it."
+            )
+        return notices
+
     # -- §3: lifespan_secs not honoured ------------------------------------
 
     def verify_lifespan(self, registration: Registration) -> None:
@@ -150,6 +182,15 @@ class Hub:
         )
         self.verify_lifespan(registration)
         return registration
+
+    def resume(self, queue_id: str, last_event_id: int) -> Registration:
+        """Rebuild a Registration from a stored position, without re-registering.
+
+        A daemon restart inside the lifespan window should resume rather than
+        re-register: re-registering silently forfeits anything sent while it was
+        down, which is the gap §3 asks us to report rather than create.
+        """
+        return Registration(queue_id=queue_id, last_event_id=last_event_id)
 
     def get_events(self, registration: Registration) -> list[dict]:
         """Fetch the next batch, raising `QueueGapError` if the queue was collected.

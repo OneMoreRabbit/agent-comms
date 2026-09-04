@@ -225,6 +225,149 @@ def test_doctor_reports_every_check_not_just_the_first(seat):
     """An operator debugging a seat wants the whole picture."""
     report = operations.preflight(transport_factory=lambda c: FakeTransport())
     names = [n for n, _, _ in report.checks]
-    assert names == ["enabled", "credential", "subscription", "event queue"]
+    assert names == ["enabled", "credential", "identity", "subscription", "event queue"]
     assert report.ok
     assert any("lifespan unverified" in w for w in report.warnings)
+
+
+# -- attribution: the bot must be who the vault thinks it is -----------------
+
+def test_bot_name_divergence_is_reported_not_fatal(seat):
+    """A name is not a safety property; blocking the critical path over one is wrong.
+
+    But ADR-0009 §1a picked <project>-<seat> so a sender identifies its project,
+    and the estate minted 'agent-comms'. Report it.
+    """
+    report = operations.preflight(
+        transport_factory=lambda c: FakeTransport(full_name="agent-comms")
+    )
+    assert report.ok
+    assert any("not 'agent-eco-agent-comms'" in w for w in report.warnings)
+
+
+def test_human_account_credential_is_reported(seat):
+    report = operations.preflight(
+        transport_factory=lambda c: FakeTransport(is_bot=False)
+    )
+    assert any("human account" in w for w in report.warnings)
+
+
+def test_fallback_credential_path_is_accepted_and_reported(seat):
+    """The estate delivered zuliprc-<seat>; work, but say the paths diverged."""
+    contracted = seat / ".secrets" / "zuliprc-agent-eco-agent-comms"
+    fallback = seat / ".secrets" / "zuliprc-agent-comms"
+    contracted.rename(fallback)
+    fallback.chmod(0o600)
+    cred = load_credential(load_settings().identity)
+    assert cred.source == str(fallback)
+    assert any("not the contracted" in n for n in cred.notices)
+
+
+def test_contracted_path_wins_when_both_exist(seat):
+    fallback = seat / ".secrets" / "zuliprc-agent-comms"
+    fallback.write_text(
+        "[api]\nemail=x@y.z\nkey=k\nsite=https://agent.onemorerabbit.co.uk\n", encoding="utf-8"
+    )
+    fallback.chmod(0o600)
+    cred = load_credential(load_settings().identity)
+    assert cred.source.endswith("zuliprc-agent-eco-agent-comms")
+    assert cred.notices == []
+
+
+# -- the daemon ---------------------------------------------------------------
+
+def test_daemon_resumes_a_stored_queue_rather_than_re_registering(seat):
+    """Re-registering when a queue was held silently forfeits the gap."""
+    from agent_comms.store import Store
+    store = Store(seat / ".comms")
+    store.save_position("q-existing", 42)
+    transport = FakeTransport()
+    operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
+    assert transport.register_calls == []
+    assert "resuming queue q-existing" in (seat / ".comms" / "events.log").read_text()
+
+
+def test_resume_does_not_discard_events(seat):
+    """A resume probe that fetched and dropped events would lose them silently."""
+    from agent_comms.store import Store
+    Store(seat / ".comms").save_position("q-existing", 42)
+    transport = FakeTransport(event_batches=[{"result": "success", "events": [
+        {"id": 43, "type": "message", "flags": ["mentioned"], "message": {
+            "id": 401, "sender_full_name": "arch", "display_recipient": "agent-eco",
+            "subject": "t", "content": "must not be dropped",
+            "timestamp": 1, "stream_id": 7}},
+    ]}])
+    stored = operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
+    assert stored == 1, "the first batch after a resume must reach the store"
+
+
+def test_dead_stored_queue_falls_back_to_registering(seat):
+    from agent_comms.store import Store
+    Store(seat / ".comms").save_position("q-dead", 1)
+    transport = FakeTransport(event_batches=[
+        {"result": "error", "code": "BAD_EVENT_QUEUE_ID", "queue_id": "q-dead"},
+        {"result": "success", "events": []},
+    ])
+    operations.run_daemon(transport_factory=lambda c: transport, max_iterations=2)
+    assert len(transport.register_calls) == 1
+    assert "garbage-collected" in (seat / ".comms" / "events.log").read_text()
+
+
+def test_daemon_stores_only_mentions(seat):
+    """A project channel carries every conversation; only ours is ours."""
+    transport = FakeTransport(event_batches=[{"result": "success", "events": [
+        {"id": 1, "type": "message", "flags": ["mentioned"], "message": {
+            "id": 101, "sender_full_name": "arch", "display_recipient": "agent-eco",
+            "subject": "agent-comms: build it", "content": "please proceed",
+            "timestamp": 1756900000, "stream_id": 7}},
+        {"id": 2, "type": "message", "flags": [], "message": {
+            "id": 102, "sender_full_name": "someone", "display_recipient": "agent-eco",
+            "subject": "other", "content": "chatter", "timestamp": 1756900001, "stream_id": 7}},
+    ]}])
+    stored = operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
+    assert stored == 1
+    rows = operations.inbox()
+    assert len(rows) == 1 and rows[0].id == 101
+    assert "/#narrow/channel/7-agent-eco/topic/" in rows[0].permalink
+
+
+def test_notify_command_receives_the_mention(seat, tmp_path):
+    """The hand-off to the comms conversation — never the working session."""
+    out = tmp_path / "notified.json"
+    (seat / ".comms" / "config.toml").write_text(
+        f'enabled = true\nnotify_command = "cat > {out}"\n', encoding="utf-8"
+    )
+    transport = FakeTransport(event_batches=[{"result": "success", "events": [
+        {"id": 1, "type": "message", "flags": ["mentioned"], "message": {
+            "id": 201, "sender_full_name": "arch", "display_recipient": "agent-eco",
+            "subject": "agent-comms: ping", "content": "hello",
+            "timestamp": 1756900000, "stream_id": 7}},
+    ]}])
+    operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
+    assert '"id": 201' in out.read_text(encoding="utf-8")
+
+
+def test_failing_notify_command_is_recorded_not_swallowed(seat):
+    (seat / ".comms" / "config.toml").write_text(
+        'enabled = true\nnotify_command = "exit 7"\n', encoding="utf-8"
+    )
+    transport = FakeTransport(event_batches=[{"result": "success", "events": [
+        {"id": 1, "type": "message", "flags": ["mentioned"], "message": {
+            "id": 202, "sender_full_name": "arch", "display_recipient": "agent-eco",
+            "subject": "t", "content": "c", "timestamp": 1, "stream_id": 7}},
+    ]}])
+    operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
+    assert "notify_command exited 7" in (seat / ".comms" / "events.log").read_text()
+
+
+def test_reply_goes_to_the_mentions_own_topic(seat):
+    transport = FakeTransport(event_batches=[{"result": "success", "events": [
+        {"id": 1, "type": "message", "flags": ["mentioned"], "message": {
+            "id": 301, "sender_full_name": "arch", "display_recipient": "agent-eco",
+            "subject": "agent-comms: a question", "content": "?",
+            "timestamp": 1, "stream_id": 7}},
+    ]}])
+    operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
+    operations.reply(301, "answered", transport_factory=lambda c: transport)
+    assert transport.sent[-1]["topic"] == "agent-comms: a question"
+    assert operations.inbox() == []
