@@ -87,6 +87,8 @@ class Preflight:
     disabled: bool = False
     checks: list[tuple[str, bool, str]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    #: Recorded, not raised. Kept separate so a note never dilutes a warning.
+    notes: list[str] = field(default_factory=list)
 
     def add(self, name: str, passed: bool, detail: str = "") -> None:
         self.checks.append((name, passed, detail))
@@ -147,6 +149,7 @@ def preflight(
         f"registered {registration.queue_id} at lifespan_secs={settings.lifespan_secs}",
     )
     report.warnings.extend(registration.warnings)
+    report.notes.extend(registration.notes)
     return report
 
 
@@ -162,25 +165,54 @@ def _permalink(site: str, event_msg: dict) -> str:
     return f"{site}/#narrow/channel/{stream_id}-{slug}/topic/{quoted}/near/{event_msg['id']}"
 
 
-def mention_from_event(site: str, event: dict) -> Mention | None:
-    """Turn a Zulip message event into a stored mention, or None if not for us.
+def addressed_to_seat(settings: Settings, msg: dict, flags: list[str]) -> str | None:
+    """Is this message for this seat? Returns why, or None.
 
-    Only messages flagged `mentioned` are ours. A channel carries every
-    conversation in the project; without this filter a seat would store the lot.
+    Three ways to reach a seat, and the middle one was missing until 0.4:
+
+    1. **An explicit `@`-mention.** Unambiguous, always works.
+    2. **The topic convention.** ADR-0009 §1 puts one channel per project and
+       *"one topic per arch ↔ component conversation"*, and R1 agreed the naming
+       `<component>: <ask>` precisely *"so a seat can filter its own
+       conversations without relying on permissions"*. The topic **is** the
+       addressing. 0.1–0.3 matched only on mentions, which contradicted this
+       client's own contract §2a and made every message to a seat require an
+       `@`-mention — including replies in a topic already named for it.
+    3. **A direct message** to the bot.
+
+    Everything else in the channel is other people's conversation, and is not
+    stored: with one channel per project, matching everything would wake every
+    seat on every message.
     """
+    if "mentioned" in flags:
+        return "mentioned"
+    if msg.get("type") == "private":
+        return "direct message"
+
+    topic = (msg.get("subject") or "").strip()
+    prefix = topic.split(":", 1)[0].strip().casefold() if ":" in topic else ""
+    if prefix and prefix in {n.casefold() for n in settings.identity.bot_names}:
+        return "topic addressed to this seat"
+    return None
+
+
+def mention_from_event(site: str, event: dict, settings: Settings) -> Mention | None:
+    """Turn a Zulip message event into a stored mention, or None if not for us."""
     if event.get("type") != "message":
         return None
-    if "mentioned" not in (event.get("flags") or []):
-        return None
     msg = event["message"]
+    reason = addressed_to_seat(settings, msg, event.get("flags") or [])
+    if reason is None:
+        return None
     return Mention(
         id=msg["id"],
         sender=msg.get("sender_full_name") or msg.get("sender_email", "unknown"),
-        channel=msg.get("display_recipient") or "",
+        channel=msg.get("display_recipient") if isinstance(msg.get("display_recipient"), str) else "",
         topic=msg.get("subject") or "",
         content=msg.get("content") or "",
         timestamp=msg.get("timestamp", 0),
         permalink=_permalink(site, msg),
+        reason=reason,
     )
 
 
@@ -283,7 +315,7 @@ def run_daemon(
             continue
 
         for event in events:
-            mention = mention_from_event(credential.site, event)
+            mention = mention_from_event(credential.site, event, settings)
             if mention is None:
                 continue
             store.append(mention)
@@ -300,6 +332,8 @@ def _register(hub: Hub, store: Store) -> Registration:
     registration = hub.register_queue()
     for warning in registration.warnings:
         store.record("warn", warning)
+    for note in registration.notes:
+        store.record("info", note)
     store.save_position(registration.queue_id, registration.last_event_id)
     return registration
 

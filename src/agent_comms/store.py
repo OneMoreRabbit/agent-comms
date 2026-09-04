@@ -27,6 +27,9 @@ class Mention:
     timestamp: int
     permalink: str
     read: bool = False
+    #: Why this message was stored — mention, topic, or direct message. Shown in
+    #: the inbox so a seat can tell an explicit summons from a topic it owns.
+    reason: str = "mentioned"
 
     @property
     def when(self) -> str:

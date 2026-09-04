@@ -60,6 +60,8 @@ def doctor() -> None:
         click.echo(f"  {mark}  {name}")
         if detail:
             click.echo(f"        {detail}")
+    for note in report.notes:
+        click.echo(f"  note  {note}")
     for warning in report.warnings:
         click.secho(f"  WARN  {warning}", fg="yellow")
     if not report.ok:
@@ -77,7 +79,7 @@ def inbox(show_all: bool) -> None:
         return
     for m in rows:
         flag = " " if m.read else "*"
-        click.echo(f"{flag} {m.id:>8}  {m.when}  {m.sender}  [{m.topic}]")
+        click.echo(f"{flag} {m.id:>8}  {m.when}  {m.sender}  [{m.topic}]  ({m.reason})")
 
 
 @main.command()
@@ -88,6 +90,7 @@ def show(message_id: int) -> None:
     if m is None:
         raise click.ClickException(f"no message {message_id} in the local store")
     click.echo(f"from    {m.sender}\nwhen    {m.when}\nchannel {m.channel}\ntopic   {m.topic}")
+    click.echo(f"reached me by  {m.reason}")
     click.echo(f"cite    {m.permalink}\n\n{m.content}")
 
 

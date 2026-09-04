@@ -33,8 +33,17 @@ DEFAULT_LIFESPAN_SECS = 3600
 
 #: Zulip added the register-response echo of the queue lifespan
 #: (`idle_queue_timeout_secs`) at feature level 481 / Zulip 12.0. Below this the
-#: value cannot be read back at all — see `hub.register_queue`.
+#: value cannot be read back at all — see `hub.verify_lifespan`.
 LIFESPAN_ECHO_FEATURE_LEVEL = 481
+
+#: The feature level the estate verified **in the running server's source** —
+#: `zerver/tornado/event_queue.py` on hub-1, reported in
+#: `agent-comms-hub-response` 0.2: `lifespan_secs` is client-set per queue, with
+#: no server-side cap in the handler. On this exact server the lifespan is
+#: therefore honoured, and saying otherwise at every connect is noise rather than
+#: diligence. The estate pins the Zulip image and commits to announcing upgrades
+#: and re-verifying, which is what makes a pinned level safe to trust.
+SOURCE_VERIFIED_FEATURE_LEVEL = 372
 
 
 class Identity(BaseModel):
