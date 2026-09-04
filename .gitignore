@@ -1,4 +1,12 @@
 # seeded by the orchestrator (agent-comms seat, 2026-09-02); the component owns real entries.
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+
 # --- Atlas ---
 .atlas/
 .atlas-method/
