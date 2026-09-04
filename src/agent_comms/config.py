@@ -54,17 +54,28 @@ class Identity(BaseModel):
         return Path.home() / ".secrets" / f"zuliprc-{self.bot_name}"
 
     @property
-    def credential_candidates(self) -> list[Path]:
-        """The contracted path first, then the shapes the estate has actually used.
+    def bot_names(self) -> tuple[str, ...]:
+        """The names this seat's bot may legitimately carry, per ADR-0009 §7a.
 
-        The estate delivered `zuliprc-<seat>` rather than the contracted
-        `zuliprc-<project>-<seat>` (observed 2026-09-04). Refusing to start over
-        a filename would block the critical path for a naming difference, and
-        silently accepting it would let the divergence rot. So: accept, and say
-        so loudly — `load_credential` records a notice naming both paths.
+        §7a ruled that the requirement is **unambiguity in every channel the bot
+        appears in**, not the `<project>-<seat>` pattern. A component bot appears
+        only in its own project's channel, so the seat name alone is unambiguous
+        there; an arch bot appears in several, so it carries its project. Both
+        shapes are live in the estate, and both are correct.
+        """
+        return (self.seat, self.bot_name)
+
+    @property
+    def credential_candidates(self) -> list[Path]:
+        """Credential paths, in the order the estate actually delivers them.
+
+        `zuliprc-<seat>` first: that is what a component seat gets under §7a.
+        `zuliprc-<project>-<seat>` second, which is what an arch seat gets. This
+        client warned about the first as a divergence until §7a ruled it correct
+        — a warning that always fires is one nobody reads.
         """
         secrets = Path.home() / ".secrets"
-        return [self.credential_path, secrets / f"zuliprc-{self.seat}"]
+        return [secrets / f"zuliprc-{self.seat}", self.credential_path]
 
 
 class Settings(BaseModel):
@@ -245,13 +256,6 @@ def load_credential(identity: Identity) -> Credential:
         )
 
     notices: list[str] = []
-    if path != identity.credential_path:
-        notices.append(
-            f"credential found at {path}, not the contracted "
-            f"{identity.credential_path}. Accepted so the seat can work, but the paths "
-            f"should converge: the contract derives the path from <project>-<seat>, and a "
-            f"seat that guesses filenames is one rename away from a silent outage."
-        )
 
     try:
         raw = path.read_text(encoding="utf-8")

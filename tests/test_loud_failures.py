@@ -11,6 +11,7 @@ import pytest
 from agent_comms import operations
 from agent_comms.config import Settings, load_credential, load_settings
 from agent_comms.errors import (
+    DaemonAlreadyRunning,
     CommsDisabled,
     CredentialMissing,
     CredentialUnreadable,
@@ -232,17 +233,30 @@ def test_doctor_reports_every_check_not_just_the_first(seat):
 
 # -- attribution: the bot must be who the vault thinks it is -----------------
 
-def test_bot_name_divergence_is_reported_not_fatal(seat):
-    """A name is not a safety property; blocking the critical path over one is wrong.
-
-    But ADR-0009 §1a picked <project>-<seat> so a sender identifies its project,
-    and the estate minted 'agent-comms'. Report it.
-    """
+def test_component_bot_name_is_accepted_silently(seat):
+    """ADR-0009 §7a: a component bot appears only in its project's channel, so
+    the seat name alone is unambiguous there. Warning about it would be noise."""
     report = operations.preflight(
         transport_factory=lambda c: FakeTransport(full_name="agent-comms")
     )
     assert report.ok
-    assert any("not 'agent-eco-agent-comms'" in w for w in report.warnings)
+    assert not any("bot is named" in w for w in report.warnings)
+
+
+def test_arch_shaped_bot_name_is_also_accepted(seat):
+    """An arch bot carries its project because it appears in several channels."""
+    report = operations.preflight(
+        transport_factory=lambda c: FakeTransport(full_name="agent-eco-agent-comms")
+    )
+    assert not any("bot is named" in w for w in report.warnings)
+
+
+def test_unrecognisable_bot_name_is_reported(seat):
+    """§7a's requirement is unambiguity: a name that traces back to no seat fails it."""
+    report = operations.preflight(
+        transport_factory=lambda c: FakeTransport(full_name="zulip-bot-3")
+    )
+    assert any("does not identify the seat" in w for w in report.warnings)
 
 
 def test_human_account_credential_is_reported(seat):
@@ -252,23 +266,19 @@ def test_human_account_credential_is_reported(seat):
     assert any("human account" in w for w in report.warnings)
 
 
-def test_fallback_credential_path_is_accepted_and_reported(seat):
-    """The estate delivered zuliprc-<seat>; work, but say the paths diverged."""
+def test_seat_named_credential_is_the_primary_path(seat):
+    """What a component seat actually gets, per §7a — and it is not a divergence."""
     contracted = seat / ".secrets" / "zuliprc-agent-eco-agent-comms"
     fallback = seat / ".secrets" / "zuliprc-agent-comms"
     contracted.rename(fallback)
     fallback.chmod(0o600)
     cred = load_credential(load_settings().identity)
     assert cred.source == str(fallback)
-    assert any("not the contracted" in n for n in cred.notices)
+    assert cred.notices == []
 
 
-def test_contracted_path_wins_when_both_exist(seat):
-    fallback = seat / ".secrets" / "zuliprc-agent-comms"
-    fallback.write_text(
-        "[api]\nemail=x@y.z\nkey=k\nsite=https://agent.onemorerabbit.co.uk\n", encoding="utf-8"
-    )
-    fallback.chmod(0o600)
+def test_project_named_credential_still_works(seat):
+    """What an arch seat gets. Both shapes are live in the estate."""
     cred = load_credential(load_settings().identity)
     assert cred.source.endswith("zuliprc-agent-eco-agent-comms")
     assert cred.notices == []
@@ -397,3 +407,20 @@ def test_lock_is_released_when_the_holder_goes(seat):
     store = Store(seat / ".comms")
     store.acquire_daemon_lock().close()
     operations.run_daemon(transport_factory=lambda c: FakeTransport(), max_iterations=1)
+
+
+def test_already_running_has_its_own_exit_code(seat):
+    """An idempotent installer must be able to tell 'already up' from 'broken'."""
+    from click.testing import CliRunner
+
+    from agent_comms import cli
+    from agent_comms.store import Store
+
+    held = Store(seat / ".comms").acquire_daemon_lock()
+    try:
+        result = CliRunner().invoke(cli.main, ["daemon", "--once"], standalone_mode=False)
+        assert isinstance(result.exception, DaemonAlreadyRunning)
+        assert cli.EXIT_ALREADY_RUNNING == 4
+        assert cli.EXIT_ALREADY_RUNNING not in (cli.EXIT_OK, cli.EXIT_FAULT, cli.EXIT_DISABLED)
+    finally:
+        held.close()

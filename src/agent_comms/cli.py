@@ -7,11 +7,13 @@ import sys
 import click
 
 from . import __version__, operations
-from .errors import CommsDisabled, CommsError
+from .errors import CommsDisabled, CommsError, DaemonAlreadyRunning
 
 #: Exit codes, so a consumer's supervisor can tell these apart mechanically.
-#: 0 success, 1 fault, 3 "comms disabled" — a state, not a failure.
-EXIT_OK, EXIT_FAULT, EXIT_DISABLED = 0, 1, 3
+#: 0 success, 1 fault, 3 "comms disabled", 4 "a daemon is already running".
+#: 3 and 4 are states, not failures: an idempotent installer that starts the
+#: daemon should treat 4 as success, and must not read it as a broken install.
+EXIT_OK, EXIT_FAULT, EXIT_DISABLED, EXIT_ALREADY_RUNNING = 0, 1, 3, 4
 
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
@@ -126,6 +128,9 @@ def run() -> None:
     except CommsDisabled as exc:
         click.echo(f"comms: disabled\n\n{exc}")
         sys.exit(EXIT_DISABLED)
+    except DaemonAlreadyRunning as exc:
+        click.echo(f"comms: already running\n\n{exc}")
+        sys.exit(EXIT_ALREADY_RUNNING)
     except CommsError as exc:
         click.secho(f"comms: {exc.tag}", fg="red", bold=True, err=True)
         click.echo(str(exc), err=True)

@@ -84,27 +84,28 @@ class Hub:
     # -- attribution: is this bot who the vault thinks it is? --------------
 
     def verify_identity(self) -> list[str]:
-        """Check the bot's name against ADR-0009 §1a, and report divergence.
+        """Check the bot's name is one ADR-0009 §7a recognises.
 
         Attribution is the only thing making a topology breach visible, since
-        §1's hierarchy is convention rather than server-enforced. A bot whose
-        name does not identify its project weakens exactly that. Reported, not
-        refused: a name is not a safety property, and blocking the critical path
-        over one would be the wrong trade.
+        §1's hierarchy is convention rather than server-enforced. §7a ruled that
+        what the name must guarantee is **unambiguity in every channel the bot
+        appears in**, not a fixed pattern: a component bot may be `<seat>`, an
+        arch bot carries its project as `<project>-<seat>`. Either is correct;
+        anything else is reported, not refused.
         """
-        expected = self._settings.identity.bot_name
+        accepted = self._settings.identity.bot_names
         result = self._t.call_endpoint(url="users/me", method="GET")
         if result.get("result") != "success":
             return [f"could not read this bot's own identity ({result.get('msg') or result!r})"]
 
         notices: list[str] = []
         actual = result.get("full_name") or ""
-        if actual != expected:
+        if actual not in accepted:
             notices.append(
-                f"bot is named '{actual}', not '{expected}' as ADR-0009 §1a specifies "
-                f"(<project>-<seat>). Attribution still works within one channel, but the "
-                f"name does not identify the project — and it is the estate's other channels, "
-                f"where several projects meet, that the convention exists for."
+                f"bot is named '{actual}', which is neither '{accepted[0]}' nor "
+                f"'{accepted[1]}'. ADR-0009 §7a requires a bot's name to be unambiguous in "
+                "every channel it appears in, and this one does not identify the seat it "
+                "speaks for — so a message from it cannot be traced back by name alone."
             )
         if not result.get("is_bot"):
             notices.append(
