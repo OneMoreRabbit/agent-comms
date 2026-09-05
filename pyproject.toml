@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-comms"
-version = "0.4.1"
+version = "0.5.0"
 description = "Seat-side client for agent-to-agent comms over the estate Zulip hub"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -26,3 +26,5 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# so the suite runs the same way under `pytest` and `python -m pytest`
+pythonpath = ["."]

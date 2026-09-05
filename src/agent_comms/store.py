@@ -135,6 +135,20 @@ class Store:
         except (OSError, json.JSONDecodeError):
             return None
 
+    # -- sleeping state ----------------------------------------------------
+
+    def sleeping(self) -> bool:
+        """Have we already told senders this seat has no agent running?"""
+        return (self.root / "sleeping").exists()
+
+    def set_sleeping(self, value: bool) -> None:
+        self.ensure()
+        marker = self.root / "sleeping"
+        if value:
+            marker.touch()
+        elif marker.exists():
+            marker.unlink()
+
     # -- the audit line ----------------------------------------------------
 
     def record(self, level: str, message: str) -> None:

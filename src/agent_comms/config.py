@@ -94,6 +94,18 @@ class Settings(BaseModel):
     channel: str = Field(description="The project channel this seat watches.")
     lifespan_secs: int = DEFAULT_LIFESPAN_SECS
     state_dir: Path = Field(default_factory=lambda: Path.home() / ".comms")
+    wake: bool = Field(
+        default=False,
+        description=(
+            "Deliver each mention into the seat's running agent session (ADR-0009 §7b). "
+            "Off by default: turning a seat from receiving to acting is a consumer's "
+            "decision, not a package default."
+        ),
+    )
+    agent_commands: tuple[str, ...] = Field(
+        default=("claude", "codex"),
+        description="Pane commands that mean an agent is running. Empirical, so settable.",
+    )
     notify_command: str | None = Field(
         default=None,
         description=(
@@ -211,7 +223,13 @@ def load_settings(state_dir: Path | None = None, seat_manifest: Path | None = No
         lifespan_secs=int(file_cfg.get("lifespan_secs", DEFAULT_LIFESPAN_SECS)),
         state_dir=state_dir,
         notify_command=os.environ.get("AGENT_COMMS_NOTIFY") or file_cfg.get("notify_command"),
+        wake=_flag(os.environ.get("AGENT_COMMS_WAKE")) or bool(file_cfg.get("wake")),
+        agent_commands=tuple(file_cfg.get("agent_commands", ("claude", "codex"))),
     )
+
+
+def _flag(raw: str | None) -> bool:
+    return (raw or "").strip().lower() in ("1", "true", "yes")
 
 
 def _reject_insecure(values: dict, origin: str) -> None:

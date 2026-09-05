@@ -2,18 +2,22 @@
 
 from __future__ import annotations
 
+import json
 import sys
+from dataclasses import asdict
 
 import click
 
 from . import __version__, operations
 from .errors import CommsDisabled, CommsError, DaemonAlreadyRunning
+from .wake import WakeError
 
 #: Exit codes, so a consumer's supervisor can tell these apart mechanically.
 #: 0 success, 1 fault, 3 "comms disabled", 4 "a daemon is already running".
 #: 3 and 4 are states, not failures: an idempotent installer that starts the
 #: daemon should treat 4 as success, and must not read it as a broken install.
-EXIT_OK, EXIT_FAULT, EXIT_DISABLED, EXIT_ALREADY_RUNNING = 0, 1, 3, 4
+#: 5 = the message was queued because no agent is running. Normal, not a fault.
+EXIT_OK, EXIT_FAULT, EXIT_DISABLED, EXIT_ALREADY_RUNNING, EXIT_QUEUED = 0, 1, 3, 4, 5
 
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
@@ -113,6 +117,35 @@ def send(topic: str, content: str) -> None:
 
 
 @main.command()
+@click.option("--message-id", type=int, help="Wake with a message already in the store.")
+def wake(message_id: int | None) -> None:
+    """Deliver a message into this seat's running agent session.
+
+    Reads the mention as JSON on stdin, which is what `notify_command` provides,
+    or takes --message-id to replay one from the store.
+
+    Exit codes: 0 delivered, 5 queued (no agent running — normal, per ADR-0009
+    §7e, which says a message never starts an agent), 1 could not be delivered
+    and the sender was told.
+    """
+    if message_id is not None:
+        m = operations.show(message_id)
+        if m is None:
+            raise click.ClickException(f"no message {message_id} in the local store")
+        payload = asdict(m)
+    else:
+        raw = sys.stdin.read().strip()
+        if not raw:
+            raise click.ClickException("no mention on stdin (notify_command sends JSON)")
+        payload = json.loads(raw)
+
+    outcome = operations.wake_agent(payload)
+    click.echo(outcome)
+    if outcome.startswith("queued"):
+        sys.exit(EXIT_QUEUED)
+
+
+@main.command()
 @click.option("--once", is_flag=True, help="One poll cycle, then exit. For testing.")
 def daemon(once: bool) -> None:
     """Hold the outbound connection and record what arrives.
@@ -134,6 +167,10 @@ def run() -> None:
     except DaemonAlreadyRunning as exc:
         click.echo(f"comms: already running\n\n{exc}")
         sys.exit(EXIT_ALREADY_RUNNING)
+    except WakeError as exc:
+        click.secho("comms: wake failed", fg="red", bold=True, err=True)
+        click.echo(str(exc), err=True)
+        sys.exit(EXIT_FAULT)
     except CommsError as exc:
         click.secho(f"comms: {exc.tag}", fg="red", bold=True, err=True)
         click.echo(str(exc), err=True)

@@ -24,6 +24,7 @@ from .errors import (
     QueueGapError,
 )
 from .hub import Hub, Registration, Transport, build_transport
+from .wake import WakeError, wake
 from .store import Mention, Store
 
 
@@ -276,6 +277,67 @@ def reply(
     return result
 
 
+def wake_agent(
+    mention: dict,
+    transport_factory: Callable[[Credential], Transport] = build_transport,
+    **kw,
+) -> str:
+    """Deliver a mention to the running agent, reporting a failure to the sender.
+
+    §7b.5: a wake that fails is loud. A sender who is told nothing waits forever
+    on a seat that never woke — and under §7e "no session yet" is normal, so
+    silence is genuinely ambiguous between asleep and broken. Queuing announces
+    itself once and then stays quiet until the next successful delivery, because
+    a sleeping seat repeating itself is noise.
+    """
+    settings = load_settings(**kw)
+    store = Store(settings.state_dir)
+    store.ensure()
+
+    try:
+        outcome = wake(mention, settings.agent_commands)
+    except WakeError as exc:
+        store.record("warn", f"wake failed for message {mention.get('id')}: {exc}")
+        _tell_sender(settings, store, mention, f"could not deliver that to my agent: {exc}",
+                     transport_factory)
+        raise
+
+    queued = outcome.startswith("queued")
+    store.record("info" if not queued else "warn", f"wake: {outcome}")
+    if queued:
+        if not store.sleeping():
+            store.set_sleeping(True)
+            _tell_sender(
+                settings, store, mention,
+                "queued — no agent session is running on this seat, so nothing has read "
+                "this yet. It is stored and will be taken up when a session next starts "
+                "(ADR-0009 §7e: a message never starts an agent). Saying so once rather "
+                "than repeating it for every message while asleep.",
+                transport_factory,
+            )
+    else:
+        store.set_sleeping(False)
+    return outcome
+
+
+def _tell_sender(
+    settings: Settings,
+    store: Store,
+    mention: dict,
+    text: str,
+    transport_factory: Callable[[Credential], Transport],
+) -> None:
+    """Post back into the mention's own topic. Best effort, and logged if it fails."""
+    try:
+        credential = load_credential(settings.identity)
+        hub = Hub(transport_factory(credential), settings, credential)
+        hub.send(mention.get("channel") or settings.channel,
+                 mention.get("topic") or f"{settings.identity.seat}: comms", text)
+    except Exception as exc:
+        store.record("warn", f"could not tell the sender about message "
+                             f"{mention.get('id')}: {exc}")
+
+
 def run_daemon(
     transport_factory: Callable[[Credential], Transport] = build_transport,
     max_iterations: int | None = None,
@@ -333,6 +395,7 @@ def run_daemon(
                 continue
             store.append(mention)
             stored += 1
+            _deliver_to_agent(settings, store, mention, transport_factory)
             _notify(settings, store, mention)
             if on_mention is not None:
                 on_mention(mention)
@@ -372,6 +435,27 @@ def _resume_or_register(hub: Hub, store: Store) -> Registration:
         f"resuming queue {registration.queue_id} from event {registration.last_event_id}",
     )
     return registration
+
+
+def _deliver_to_agent(
+    settings: Settings,
+    store: Store,
+    mention: Mention,
+    transport_factory: Callable[[Credential], Transport],
+) -> None:
+    """Wake the seat's agent, if waking is turned on.
+
+    Off by default. ADR-0009 §7d gated wake-ups behind the governor; §7e then
+    removed that gate, because a message that cannot start an agent cannot run
+    up an unattended night. The default stays off regardless — turning a seat
+    from receiving to acting is a consumer's decision, not a package default.
+    """
+    if not settings.wake:
+        return
+    try:
+        wake_agent(asdict(mention), transport_factory, state_dir=settings.state_dir)
+    except WakeError:
+        pass  # already recorded and reported to the sender by wake_agent
 
 
 def _notify(settings: Settings, store: Store, mention: Mention) -> None:
