@@ -92,6 +92,22 @@ class Settings(BaseModel):
 
     identity: Identity
     channel: str = Field(description="The project channel this seat watches.")
+    model: str | None = Field(
+        default=None,
+        description=(
+            "The runtime this seat drives, declared by the estate in ~/.seat/seat.yml "
+            "(ADR-0009 §7g). A free string, so a future runtime needs no code change "
+            "here. Absent means the pane scan runs as a last resort."
+        ),
+    )
+    codex_thread: str | None = Field(
+        default=None,
+        description=(
+            "Which codex session hub turns go to — a session name or UUID for "
+            "`codex queue --thread`. Comms-specific, so it lives in comms config, "
+            "unlike `model` which is a property of the seat."
+        ),
+    )
     lifespan_secs: int = DEFAULT_LIFESPAN_SECS
     state_dir: Path = Field(default_factory=lambda: Path.home() / ".comms")
     wake: bool = Field(
@@ -168,7 +184,7 @@ def _seat_manifest(path: Path | None = None) -> dict[str, str]:
             continue
         key, _, value = line.partition(":")
         key = key.strip()
-        if key in ("project", "seat"):
+        if key in ("project", "seat", "model"):
             out[key] = value.strip().strip("'\"")
     return out
 
@@ -219,6 +235,8 @@ def load_settings(state_dir: Path | None = None, seat_manifest: Path | None = No
     identity = Identity(project=project, seat=seat)
     return Settings(
         identity=identity,
+        model=os.environ.get("AGENT_COMMS_MODEL") or manifest.get("model"),
+        codex_thread=os.environ.get("AGENT_COMMS_CODEX_THREAD") or file_cfg.get("codex_thread"),
         channel=os.environ.get("AGENT_COMMS_CHANNEL") or file_cfg.get("channel") or project,
         lifespan_secs=int(file_cfg.get("lifespan_secs", DEFAULT_LIFESPAN_SECS)),
         state_dir=state_dir,

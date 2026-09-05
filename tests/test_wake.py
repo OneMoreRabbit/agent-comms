@@ -72,7 +72,7 @@ def test_two_agent_panes_refuse_rather_than_guess(monkeypatch):
         wake_mod, "list_panes",
         lambda: _panes(("a:0.0", "claude"), ("b:0.0", "codex")),
     )
-    with pytest.raises(WakeError, match="never two agents"):
+    with pytest.raises(WakeError, match="the case the scan gets wrong"):
         wake({"id": 1, "sender": "arch", "topic": "t", "content": "go"})
 
 

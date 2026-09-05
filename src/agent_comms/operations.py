@@ -295,7 +295,12 @@ def wake_agent(
     store.ensure()
 
     try:
-        outcome = wake(mention, settings.agent_commands)
+        outcome = wake(
+            mention,
+            model=settings.model,
+            codex_thread=settings.codex_thread,
+            agent_commands=settings.agent_commands,
+        )
     except WakeError as exc:
         store.record("warn", f"wake failed for message {mention.get('id')}: {exc}")
         _tell_sender(settings, store, mention, f"could not deliver that to my agent: {exc}",
