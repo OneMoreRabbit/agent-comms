@@ -44,26 +44,59 @@ def test_declared_target_is_used_directly_without_searching(monkeypatch):
     assert calls[0][:3] == ("list-panes", "-t", "rc"), "existence check, not a search"
 
 
-def test_declared_target_that_is_absent_queues_rather_than_looking_elsewhere(monkeypatch):
-    """A declared answer is not second-guessed, even when it turns out to be empty."""
-    def missing(*a):
+def test_a_stale_declaration_loses_to_reality(monkeypatch):
+    """Someone started Claude somewhere else. Reality wins, and says why.
+
+    A declared session is a hint about runtime state, not a fact the estate owns
+    outright. Treating it as authoritative would queue messages forever while an
+    agent sat in another session — worse than the searching it replaced.
+    """
+    def tmux(*a):
         class R:
-            returncode = 1
-            stdout = ""
+            # the declared target does not exist; everything else works
+            returncode = 1 if a[0] == "list-panes" and "-t" in a else 0
+            stdout = "> "
             stderr = "can't find session"
         return R()
 
-    def boom():
-        raise AssertionError("must not fall back to searching")
+    monkeypatch.setattr(wake_mod, "list_panes", lambda: _panes(("work:0.0", "claude", 10)))
+    monkeypatch.setattr(wake_mod, "_tmux", tmux)
+    outcome = wake(MENTION, model="claude", session="rc")
+    assert "delivered to work:0.0" in outcome
+    assert "declared target 'rc' does not exist" in outcome
 
-    monkeypatch.setattr(wake_mod, "list_panes", boom)
-    monkeypatch.setattr(wake_mod, "_tmux", missing)
+
+def test_a_stale_declaration_with_nothing_running_still_queues(monkeypatch):
+    def tmux(*a):
+        class R:
+            returncode = 1
+            stdout = ""
+            stderr = "no"
+        return R()
+
+    monkeypatch.setattr(wake_mod, "list_panes", lambda: _panes(("rc:0.0", "bash", 10)))
+    monkeypatch.setattr(wake_mod, "_descendants", lambda pid, limit=200: [10])
+    monkeypatch.setattr(wake_mod, "_process_matches", lambda pid, rt: False)
+    monkeypatch.setattr(wake_mod, "_tmux", tmux)
     outcome = wake(MENTION, model="claude", session="rc")
     assert outcome.startswith("queued")
-    assert "not searched past" in outcome
 
 
-def test_undeclared_target_falls_back_to_search_and_labels_it(monkeypatch):
+def test_a_declaration_settles_what_a_search_cannot(monkeypatch):
+    """Two Claude sessions: the search refuses, the declaration decides."""
+    monkeypatch.setattr(
+        wake_mod, "list_panes",
+        lambda: _panes(("rc:0.0", "claude", 10), ("work:0.0", "claude", 20)),
+    )
+    monkeypatch.setattr(wake_mod, "_tmux", lambda *a: _Ok())
+
+    with pytest.raises(WakeError, match="no single answer"):
+        wake(MENTION, model="claude")
+
+    assert wake(MENTION, model="claude", session="rc").endswith("(claude, declared target)")
+
+
+def test_undeclared_target_searches_within_the_declared_runtime(monkeypatch):
     calls = []
     monkeypatch.setattr(wake_mod, "list_panes", lambda: _panes(("rc:0.0", "claude", 10)))
     monkeypatch.setattr(wake_mod, "_tmux", lambda *a: (calls.append(a), _Ok())[1])

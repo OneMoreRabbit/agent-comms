@@ -245,40 +245,48 @@ def tmux_target_exists(target: str) -> bool:
 
 
 def deliver_claude(mention: dict, session: str | None) -> str:
-    """Deliver to Claude, at the declared target where there is one.
+    """Deliver to Claude: the declared target if it is there, else find it.
 
-    **A declared target is authoritative and is never second-guessed.** If it is
-    declared and not there, the agent is not running and the message queues —
-    searching for some other Claude would be inferring past an answer the seat
-    already gave, which is the §7g failure in a new place.
+    **A declared session is a hint, not a contract, and the difference matters.**
+    The runtime a seat drives is configuration — stable, estate-owned, nobody
+    else can know it, so ADR-0009 §7g is right to have it declared. *Where a live
+    session happens to be* is not configuration; it is runtime state, created by
+    whoever started the agent and gone when they stop it. The estate can state it
+    only for sessions the estate launched.
 
-    `send-keys -t <session>` addresses that session's active pane, which is
-    defined tmux behaviour rather than a guess about which pane is interesting.
+    So a declaration is used first — it disambiguates when two sessions exist,
+    which is the case a search genuinely cannot resolve — but a declaration that
+    does not match reality loses to reality. Treating it as authoritative would
+    queue messages forever whenever someone started Claude somewhere else, which
+    is worse than the searching it was meant to replace.
     """
-    if session:
-        if not tmux_target_exists(session):
-            return (
-                f"queued: this seat declares Claude at tmux target {session!r} and no such "
-                "target exists, so no session is running there. Per ADR-0009 §7e a message "
-                "never starts an agent, and per §7g a declared target is not searched past "
-                "— this waits in the inbox."
-            )
+    if session and tmux_target_exists(session):
         blocked = pane_blocked_reason(session)
         if blocked is not None:
             raise WakeError(f"Claude session {session} is not ready for a turn: {blocked}")
         deliver_to_pane(session, compose_turn(mention))
         return f"delivered to {session} (claude, declared target)"
 
-    return _deliver_claude_by_search(mention, list_panes())
+    outcome = _deliver_claude_by_search(mention, list_panes())
+    if session:
+        return (
+            f"{outcome} [declared target {session!r} does not exist — a session was "
+            "started somewhere else, or the declaration is stale]"
+        )
+    return outcome
 
 
 def _deliver_claude_by_search(mention: dict, panes: list[Pane]) -> str:
-    """Fallback for a seat that declares `model` but not where the session is.
+    """Find the declared runtime's session on this seat.
 
-    Better than the pane-command scan it replaced — it finds a Claude hidden
-    behind a launcher wrapper — but it is still a search, and a search is a guess
-    that holds only while one answer is visible. Says so, so nobody mistakes it
-    for the declared path.
+    **This is a scoped search, and scope is what makes it defensible.** The scan
+    §7g retired asked "is any agent here?" and answered from a field that
+    describes how a process was launched. This asks "where is *claude*?" — a
+    question the seat has already answered the hard half of — and answers it from
+    the process tree, which describes what is running.
+
+    It still cannot resolve two sessions, and refuses rather than picking one.
+    That is the case a declared target exists to settle.
     """
     agents = find_runtime_panes(panes, "claude")
     if not agents:
@@ -343,8 +351,12 @@ def deliver_codex(mention: dict, session: str | None) -> str:
         raise WakeError(
             "this seat declares model 'codex' and a codex daemon is running, but no "
             "session is declared, so there is no way to say which conversation the "
-            "message is for. `codex queue` needs a session name or UUID. Declare it in "
-            "~/.seat/seat.yml. Not guessing, and not enumerating sessions to pick one."
+            "message is for. `codex queue` needs a session name or UUID. Declare "
+            "model_session in ~/.seat/seat.yml.\n\n"
+            "Unlike Claude, this is required rather than a hint: codex under remote "
+            "control has no pane, so there is nothing to search — the property that "
+            "made it invisible to the old scan also leaves no fallback. If codex gains "
+            "a scriptable way to list its sessions, this can become a hint too."
         )
     if shutil.which("codex") is None:
         raise WakeError("this seat declares model 'codex' but the codex CLI is not on PATH.")
