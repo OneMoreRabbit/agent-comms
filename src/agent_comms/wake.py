@@ -238,28 +238,72 @@ def deliver_to_pane(target: str, text: str) -> None:
         )
 
 
-def deliver_claude(mention: dict, panes: list[Pane]) -> str:
+def tmux_target_exists(target: str) -> bool:
+    """Does the declared tmux target exist? A plain name is a session; `a:0.0` a pane."""
+    probe = _tmux("list-panes", "-t", target, "-F", "#{pane_id}")
+    return probe.returncode == 0 and bool(probe.stdout.strip())
+
+
+def deliver_claude(mention: dict, session: str | None) -> str:
+    """Deliver to Claude, at the declared target where there is one.
+
+    **A declared target is authoritative and is never second-guessed.** If it is
+    declared and not there, the agent is not running and the message queues —
+    searching for some other Claude would be inferring past an answer the seat
+    already gave, which is the §7g failure in a new place.
+
+    `send-keys -t <session>` addresses that session's active pane, which is
+    defined tmux behaviour rather than a guess about which pane is interesting.
+    """
+    if session:
+        if not tmux_target_exists(session):
+            return (
+                f"queued: this seat declares Claude at tmux target {session!r} and no such "
+                "target exists, so no session is running there. Per ADR-0009 §7e a message "
+                "never starts an agent, and per §7g a declared target is not searched past "
+                "— this waits in the inbox."
+            )
+        blocked = pane_blocked_reason(session)
+        if blocked is not None:
+            raise WakeError(f"Claude session {session} is not ready for a turn: {blocked}")
+        deliver_to_pane(session, compose_turn(mention))
+        return f"delivered to {session} (claude, declared target)"
+
+    return _deliver_claude_by_search(mention, list_panes())
+
+
+def _deliver_claude_by_search(mention: dict, panes: list[Pane]) -> str:
+    """Fallback for a seat that declares `model` but not where the session is.
+
+    Better than the pane-command scan it replaced — it finds a Claude hidden
+    behind a launcher wrapper — but it is still a search, and a search is a guess
+    that holds only while one answer is visible. Says so, so nobody mistakes it
+    for the declared path.
+    """
     agents = find_runtime_panes(panes, "claude")
     if not agents:
         running = ", ".join(sorted({p.command for p in panes})) or "nothing"
         return (
-            f"queued: this seat declares model 'claude' but no Claude session is running "
+            f"queued: this seat declares model 'claude' but no Claude process was found "
             f"(panes: {running}). Per ADR-0009 §7e a message never starts an agent, so "
             "this waits in the inbox until a session next starts."
         )
     if len(agents) > 1:
         raise WakeError(
             "more than one Claude session is running on this seat "
-            f"({', '.join(p.target for p in agents)}), so there is no single answer to "
-            "which one this message is for. Delivering to a guess is the best-effort "
-            "send constitution §9 forbids. Not delivered."
+            f"({', '.join(p.target for p in agents)}) and this seat declares no target, so "
+            "there is no single answer to which one this message is for. Declare the "
+            "session in ~/.seat/seat.yml rather than leaving it to be searched for."
         )
     pane = agents[0]
     blocked = pane_blocked_reason(pane.target)
     if blocked is not None:
         raise WakeError(f"Claude session {pane.target} is not ready for a turn: {blocked}")
     deliver_to_pane(pane.target, compose_turn(mention))
-    return f"delivered to {pane.target} (claude)"
+    return (
+        f"delivered to {pane.target} (claude) BY SEARCH — no session declared for this "
+        "seat; declare it in ~/.seat/seat.yml so the target is stated, not inferred"
+    )
 
 
 def codex_daemon_running() -> bool:
@@ -283,7 +327,7 @@ def codex_daemon_running() -> bool:
     return True
 
 
-def deliver_codex(mention: dict, thread: str | None) -> str:
+def deliver_codex(mention: dict, session: str | None) -> str:
     """Inject a turn through codex's own channel — no tmux involved.
 
     `codex queue --thread <session name or uuid> --message <text>` is codex's
@@ -295,23 +339,23 @@ def deliver_codex(mention: dict, thread: str | None) -> str:
             "running. Per ADR-0009 §7e a message never starts an agent, so this waits in "
             "the inbox until a session next starts."
         )
-    if not thread:
+    if not session:
         raise WakeError(
             "this seat declares model 'codex' and a codex daemon is running, but no "
-            "codex_thread is configured, so there is no way to say which session the "
-            "message is for. `codex queue` needs a session name or UUID. Set "
-            "codex_thread in ~/.comms/config.toml. Not guessing at a session."
+            "session is declared, so there is no way to say which conversation the "
+            "message is for. `codex queue` needs a session name or UUID. Declare it in "
+            "~/.seat/seat.yml. Not guessing, and not enumerating sessions to pick one."
         )
     if shutil.which("codex") is None:
         raise WakeError("this seat declares model 'codex' but the codex CLI is not on PATH.")
 
-    result = _run(["codex", "queue", "--thread", thread, "--message", compose_turn(mention)])
+    result = _run(["codex", "queue", "--thread", session, "--message", compose_turn(mention)])
     if result.returncode != 0:
         raise WakeError(
-            f"codex queue failed for thread {thread!r} "
+            f"codex queue failed for session {session!r} "
             f"({(result.stderr or result.stdout or '').strip()[:400]})"
         )
-    return f"delivered to codex thread {thread}"
+    return f"delivered to codex session {session} (declared target)"
 
 
 def deliver_by_scan(mention: dict, panes: list[Pane], agent_commands: tuple[str, ...]) -> str:
@@ -352,24 +396,27 @@ def deliver_by_scan(mention: dict, panes: list[Pane], agent_commands: tuple[str,
 def wake(
     mention: dict,
     model: str | None = None,
-    codex_thread: str | None = None,
+    session: str | None = None,
     agent_commands: tuple[str, ...] = DEFAULT_AGENT_COMMANDS,
 ) -> str:
-    """Deliver a mention to this seat's declared runtime.
+    """Deliver a mention to this seat's declared runtime, at its declared target.
 
-    `model` is a **free string** by §7g, so a future runtime needs no code change
-    in the estate. An unrecognised value is therefore a real possibility, and it
-    is reported rather than quietly falling back to the pane scan — falling back
-    would resurrect exactly the guessing §7g removed, on a seat whose owner had
-    taken the trouble to declare the answer.
+    Two facts, both the seat's to state (ADR-0009 §7g, constitution §10):
+    **which runtime** it drives, and **where that runtime is** — a tmux target for
+    Claude, a session name or UUID for codex. Neither is inferred when declared.
+
+    `model` is a free string, so an unrecognised value is a real case rather than
+    a defensive branch. It is reported, never scanned around: falling back would
+    resurrect the guessing §7g removed, on a seat whose owner stated the answer.
     """
     declared = (model or "").strip()
+    target = (session or "").strip() or None
 
     if declared.casefold() == "codex":
-        return deliver_codex(mention, codex_thread)
+        return deliver_codex(mention, target)
 
     if declared.casefold() == "claude":
-        return deliver_claude(mention, list_panes())
+        return deliver_claude(mention, target)
 
     if declared:
         raise WakeError(

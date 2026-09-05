@@ -29,15 +29,50 @@ MENTION = {"id": 1, "sender": "arch", "topic": "t", "content": "go"}
 
 # -- claude: declared, and found despite a wrapper ---------------------------
 
-def test_declared_claude_delivers_via_tmux(monkeypatch):
+def test_declared_target_is_used_directly_without_searching(monkeypatch):
+    """The declared path: no list-panes, no process walk, no candidates."""
+    calls = []
+
+    def boom():
+        raise AssertionError("a declared target must not trigger a search")
+
+    monkeypatch.setattr(wake_mod, "list_panes", boom)
+    monkeypatch.setattr(wake_mod, "_tmux", lambda *a: (calls.append(a), _Ok())[1])
+    outcome = wake(MENTION, model="claude", session="rc")
+    assert outcome == "delivered to rc (claude, declared target)"
+    assert [c[0] for c in calls] == ["list-panes", "capture-pane", "send-keys", "send-keys"]
+    assert calls[0][:3] == ("list-panes", "-t", "rc"), "existence check, not a search"
+
+
+def test_declared_target_that_is_absent_queues_rather_than_looking_elsewhere(monkeypatch):
+    """A declared answer is not second-guessed, even when it turns out to be empty."""
+    def missing(*a):
+        class R:
+            returncode = 1
+            stdout = ""
+            stderr = "can't find session"
+        return R()
+
+    def boom():
+        raise AssertionError("must not fall back to searching")
+
+    monkeypatch.setattr(wake_mod, "list_panes", boom)
+    monkeypatch.setattr(wake_mod, "_tmux", missing)
+    outcome = wake(MENTION, model="claude", session="rc")
+    assert outcome.startswith("queued")
+    assert "not searched past" in outcome
+
+
+def test_undeclared_target_falls_back_to_search_and_labels_it(monkeypatch):
     calls = []
     monkeypatch.setattr(wake_mod, "list_panes", lambda: _panes(("rc:0.0", "claude", 10)))
     monkeypatch.setattr(wake_mod, "_tmux", lambda *a: (calls.append(a), _Ok())[1])
-    assert wake(MENTION, model="claude") == "delivered to rc:0.0 (claude)"
-    assert [c[0] for c in calls] == ["capture-pane", "send-keys", "send-keys"]
+    outcome = wake(MENTION, model="claude")
+    assert "BY SEARCH" in outcome
+    assert "declare it in ~/.seat/seat.yml" in outcome
 
 
-def test_claude_behind_a_wrapper_is_still_found(monkeypatch):
+def test_claude_behind_a_wrapper_is_still_found_by_the_fallback(monkeypatch):
     """The blocks/service failure: pane reports bash, claude is a descendant.
 
     `pane_current_command` is a property of how the agent was launched. The
@@ -48,6 +83,7 @@ def test_claude_behind_a_wrapper_is_still_found(monkeypatch):
     monkeypatch.setattr(wake_mod, "_process_matches", lambda pid, rt: pid == 11 and rt == "claude")
     monkeypatch.setattr(wake_mod, "_tmux", lambda *a: _Ok())
     assert wake(MENTION, model="claude").startswith("delivered to rc:0.0")
+    # the fallback, not the declared path — see the label
 
 
 def test_declared_claude_with_none_running_queues(monkeypatch):
@@ -73,22 +109,22 @@ def test_declared_codex_never_touches_tmux(monkeypatch):
 
     ran = []
     monkeypatch.setattr(wake_mod, "_run", lambda cmd: (ran.append(cmd), _Ok())[1])
-    assert wake(MENTION, model="codex", codex_thread="blocks-arch") == (
-        "delivered to codex thread blocks-arch"
+    assert wake(MENTION, model="codex", session="blocks-arch") == (
+        "delivered to codex session blocks-arch (declared target)"
     )
     assert ran[0][:5] == ["codex", "queue", "--thread", "blocks-arch", "--message"]
 
 
 def test_codex_with_no_daemon_queues(monkeypatch):
     monkeypatch.setattr(wake_mod, "codex_daemon_running", lambda: False)
-    outcome = wake(MENTION, model="codex", codex_thread="x")
+    outcome = wake(MENTION, model="codex", session="x")
     assert outcome.startswith("queued")
     assert "never starts an agent" in outcome
 
 
-def test_codex_without_a_thread_refuses_rather_than_guessing(monkeypatch):
+def test_codex_without_a_declared_session_refuses_rather_than_guessing(monkeypatch):
     monkeypatch.setattr(wake_mod, "codex_daemon_running", lambda: True)
-    with pytest.raises(WakeError, match="no way to say which session"):
+    with pytest.raises(WakeError, match="no way to say which conversation"):
         wake(MENTION, model="codex")
 
 
@@ -103,7 +139,7 @@ def test_codex_queue_failure_is_reported(monkeypatch):
 
     monkeypatch.setattr(wake_mod, "_run", lambda cmd: Bad())
     with pytest.raises(WakeError, match="codex queue failed"):
-        wake(MENTION, model="codex", codex_thread="ghost")
+        wake(MENTION, model="codex", session="ghost")
 
 
 # -- an unknown model: report, never fall back -------------------------------

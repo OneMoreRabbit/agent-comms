@@ -100,12 +100,13 @@ class Settings(BaseModel):
             "here. Absent means the pane scan runs as a last resort."
         ),
     )
-    codex_thread: str | None = Field(
+    model_session: str | None = Field(
         default=None,
         description=(
-            "Which codex session hub turns go to — a session name or UUID for "
-            "`codex queue --thread`. Comms-specific, so it lives in comms config, "
-            "unlike `model` which is a property of the seat."
+            "Where the seat's runtime is: a tmux target for Claude, a session name or "
+            "UUID for codex. Declared beside `model` in ~/.seat/seat.yml, because where "
+            "a seat's agent runs is a property of the seat — the estate launches it. "
+            "Absent, the target is searched for and the log line says so."
         ),
     )
     lifespan_secs: int = DEFAULT_LIFESPAN_SECS
@@ -184,7 +185,7 @@ def _seat_manifest(path: Path | None = None) -> dict[str, str]:
             continue
         key, _, value = line.partition(":")
         key = key.strip()
-        if key in ("project", "seat", "model"):
+        if key in ("project", "seat", "model", "model_session"):
             out[key] = value.strip().strip("'\"")
     return out
 
@@ -236,7 +237,7 @@ def load_settings(state_dir: Path | None = None, seat_manifest: Path | None = No
     return Settings(
         identity=identity,
         model=os.environ.get("AGENT_COMMS_MODEL") or manifest.get("model"),
-        codex_thread=os.environ.get("AGENT_COMMS_CODEX_THREAD") or file_cfg.get("codex_thread"),
+        model_session=os.environ.get("AGENT_COMMS_SESSION") or manifest.get("model_session"),
         channel=os.environ.get("AGENT_COMMS_CHANNEL") or file_cfg.get("channel") or project,
         lifespan_secs=int(file_cfg.get("lifespan_secs", DEFAULT_LIFESPAN_SECS)),
         state_dir=state_dir,

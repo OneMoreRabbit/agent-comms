@@ -298,7 +298,7 @@ def wake_agent(
         outcome = wake(
             mention,
             model=settings.model,
-            codex_thread=settings.codex_thread,
+            session=settings.model_session,
             agent_commands=settings.agent_commands,
         )
     except WakeError as exc:
