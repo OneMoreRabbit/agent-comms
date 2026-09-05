@@ -497,3 +497,27 @@ def test_direct_message_reaches_the_seat(seat):
     ]}])
     assert operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1) == 1
     assert operations.inbox()[0].reason == "direct message"
+
+
+def test_a_seat_never_stores_its_own_messages(seat):
+    """Observed live: this seat's store held its own smoke test.
+
+    A seat posts to a topic named after itself, so the topic rule would return
+    every one of its own messages — it would read its own words back as an ask.
+    """
+    own = {"id": 601, "type": "message", "flags": ["mentioned"], "message": {
+        "id": 601, "sender_full_name": "agent-comms",
+        "sender_email": "agent-eco-agent-comms-bot@example.com",
+        "display_recipient": "agent-eco", "subject": "agent-comms: my own post",
+        "content": "something I said", "timestamp": 1, "stream_id": 7, "type": "stream"}}
+    transport = FakeTransport(event_batches=[{"result": "success", "events": [own]}])
+    assert operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1) == 0
+
+
+def test_someone_else_in_our_topic_still_reaches_us(seat):
+    other = {"id": 602, "type": "message", "flags": [], "message": {
+        "id": 602, "sender_full_name": "Oliver Blakeman", "sender_email": "ojblakeman@gmail.com",
+        "display_recipient": "agent-eco", "subject": "agent-comms: a real ask",
+        "content": "please look at this", "timestamp": 1, "stream_id": 7, "type": "stream"}}
+    transport = FakeTransport(event_batches=[{"result": "success", "events": [other]}])
+    assert operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1) == 1

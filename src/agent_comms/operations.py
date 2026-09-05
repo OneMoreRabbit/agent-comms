@@ -165,8 +165,15 @@ def _permalink(site: str, event_msg: dict) -> str:
     return f"{site}/#narrow/channel/{stream_id}-{slug}/topic/{quoted}/near/{event_msg['id']}"
 
 
-def addressed_to_seat(settings: Settings, msg: dict, flags: list[str]) -> str | None:
+def addressed_to_seat(
+    settings: Settings, msg: dict, flags: list[str], own_email: str | None = None
+) -> str | None:
     """Is this message for this seat? Returns why, or None.
+
+    **Our own messages are never for us.** A seat posts to a topic named after
+    itself, so without this it stores everything it says and reads its own words
+    back as an ask. Observed live: this seat's store contained its own smoke
+    test. Under the topic rule below it would have applied to every post.
 
     Three ways to reach a seat, and the middle one was missing until 0.4:
 
@@ -184,6 +191,10 @@ def addressed_to_seat(settings: Settings, msg: dict, flags: list[str]) -> str | 
     stored: with one channel per project, matching everything would wake every
     seat on every message.
     """
+    sender = (msg.get("sender_email") or "").casefold()
+    if own_email and sender == own_email.casefold():
+        return None
+
     if "mentioned" in flags:
         return "mentioned"
     if msg.get("type") == "private":
@@ -196,12 +207,14 @@ def addressed_to_seat(settings: Settings, msg: dict, flags: list[str]) -> str | 
     return None
 
 
-def mention_from_event(site: str, event: dict, settings: Settings) -> Mention | None:
+def mention_from_event(
+    site: str, event: dict, settings: Settings, own_email: str | None = None
+) -> Mention | None:
     """Turn a Zulip message event into a stored mention, or None if not for us."""
     if event.get("type") != "message":
         return None
     msg = event["message"]
-    reason = addressed_to_seat(settings, msg, event.get("flags") or [])
+    reason = addressed_to_seat(settings, msg, event.get("flags") or [], own_email)
     if reason is None:
         return None
     return Mention(
@@ -315,7 +328,7 @@ def run_daemon(
             continue
 
         for event in events:
-            mention = mention_from_event(credential.site, event, settings)
+            mention = mention_from_event(credential.site, event, settings, credential.email)
             if mention is None:
                 continue
             store.append(mention)
