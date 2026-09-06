@@ -364,12 +364,20 @@ def codex_lock_threads() -> list[str]:
     is writing to, so the directory is a live list maintained by the runtime
     itself — not something this client infers.
 
-    **This is what actually works.** `thread/loaded/list` is the better answer in
-    principle and is in codex's published schema, but on 0.153.4 it returns
-    nothing: verified 2026-09-06 against a *healthy* app-server with a session
-    loaded, through `codex app-server proxy` under both line-delimited and LSP
-    framing, and against the control socket directly. The lock directory was
-    verified the same day — the id it yielded was the one `codex queue` accepted.
+    **What a lock actually means, corrected 2026-09-06:** *a client opened this
+    thread*, not *a client is attached now*. A lock was observed surviving the
+    death of its client, with only the app-server left running. So this is not a
+    liveness signal and must not be described as one.
+
+    That turns out not to matter, and the reason is the important part:
+    **`codex queue` works whether or not anything is attached.** A message queued
+    to a thread with no client alive was delivered as the first turn when a client
+    later resumed it (verified the same day). So targeting a "stale" thread is
+    correct rather than a hazard — the queue is the delivery guarantee, not the
+    client.
+
+    `thread/loaded/list` remains the better answer in principle and returns
+    nothing on 0.153.4, by any transport tried against a healthy app-server.
     """
     lock_dir = os.path.join(_codex_home(), "thread-writer-locks")
     try:
@@ -447,10 +455,16 @@ def deliver_codex(mention: dict, session: str | None) -> str:
     `codex queue --thread <session> --message <text>` reaches the app-server
     directly. Verified against a live remote-control session by the orchestrator.
 
-    A declared session wins; otherwise the live one is **discovered** from the
-    app-server. A codex session id changes every session, so it is not something
-    an owner can declare — a config field would be stale the moment it was
-    written, with nothing to say so.
+    A declared session wins; otherwise a thread is discovered.
+
+    **A declared session is strongly preferred, and the earlier reasoning against
+    it was wrong.** This docstring used to say a codex session id changes every
+    session so no owner could declare one. That is only true if new threads keep
+    being started. A thread is a durable record: `codex queue` reaches it with
+    nothing attached, and `codex resume <id>` rejoins it rather than creating a
+    second. So a seat that has *one* designated thread has a stable id — which is
+    exactly the operator's requirement in ADR-0009 §7h, one session per seat that
+    humans join rather than duplicate.
     """
     if not codex_daemon_running():
         return (
