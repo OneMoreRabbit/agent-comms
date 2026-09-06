@@ -25,6 +25,7 @@ from .errors import (
     QueueGapError,
 )
 from .hub import Hub, Registration, Transport, build_transport
+from .session import SessionState, ensure, status as _session_status
 from .wake import WakeError, wake
 from .store import Mention, Store
 
@@ -276,6 +277,16 @@ def reply(
     result = hub.send(target.channel or settings.channel, target.topic, content)
     store.mark_read(message_id)
     return result
+
+
+def session_status(**kw) -> SessionState:
+    """Is this seat's one agent session live? Never starts anything."""
+    return _session_status(load_settings(**kw))
+
+
+def session_ensure(workdir: str | None = None, **kw) -> str:
+    """Start this seat's session if it has none — for a supervisor, not delivery."""
+    return ensure(load_settings(**kw), workdir=workdir)
 
 
 def wake_agent(
