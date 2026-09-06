@@ -16,6 +16,7 @@ The pane scan survives only where `model` is absent, and says so when it runs.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -314,20 +315,41 @@ def _deliver_claude_by_search(mention: dict, panes: list[Pane]) -> str:
     )
 
 
+def _codex_home() -> str:
+    return os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+
+
 def codex_daemon_running() -> bool:
     """Is a codex app-server daemon alive on this seat?
 
     Codex under remote control has **no tmux pane** — its app-server persists on
-    its own, which is precisely why the pane scan could not see it. The daemon's
-    pid file is the signal instead.
+    its own, which is why the pane scan could not see it. The daemon's pid file
+    is the signal instead.
+
+    **The file is JSON**, not a bare integer:
+    `{"pid":255176,"processStartTime":"..."}`. Reading it as an int made this
+    return False while the daemon was alive, so every codex delivery queued with
+    a plausible-sounding "no daemon running" — a liveness gate that failed closed
+    and explained itself convincingly, which is why nothing looked wrong. The
+    bare-int branch is kept for version skew in either direction.
     """
-    home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
-    pid_file = os.path.join(home, "app-server-daemon", "app-server.pid")
+    pid_file = os.path.join(_codex_home(), "app-server-daemon", "app-server.pid")
     try:
-        first = open(pid_file, encoding="utf-8").read().split()[0]
-        pid = int(first)
-    except (OSError, ValueError, IndexError):
+        raw = open(pid_file, encoding="utf-8").read().strip()
+    except OSError:
         return False
+    if not raw:
+        return False
+
+    pid = None
+    try:
+        pid = int(json.loads(raw)["pid"])
+    except (ValueError, KeyError, TypeError):
+        try:
+            pid = int(raw.split()[0])
+        except (ValueError, IndexError):
+            return False
+
     try:
         os.kill(pid, 0)
     except OSError:
@@ -335,11 +357,63 @@ def codex_daemon_running() -> bool:
     return True
 
 
+def codex_loaded_threads(timeout: int = 20) -> list[str]:
+    """Ask the app-server which sessions are live, over its own protocol.
+
+    `thread/loaded/list` returns *"thread ids for sessions currently loaded in
+    memory"* — the authoritative answer to "where is this seat's codex session",
+    from the only party that actually knows.
+
+    This is why a codex session id is discovered rather than declared: it changes
+    every session, so a config field would be stale the moment it was written and
+    nothing would say so.
+    """
+    request = json.dumps({
+        "id": 1, "jsonrpc": "2.0", "method": "thread/loaded/list", "params": {},
+    })
+    try:
+        result = subprocess.run(
+            ["codex", "app-server", "proxy"],
+            input=request + "\n", text=True, capture_output=True,
+            timeout=timeout, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise WakeError(f"could not reach the codex app-server to list sessions: {exc}") from exc
+
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            payload = json.loads(line)
+        except ValueError:
+            continue
+        if payload.get("id") != 1:
+            continue
+        if "error" in payload:
+            raise WakeError(
+                f"the codex app-server refused thread/loaded/list: {payload['error']}"
+            )
+        data = (payload.get("result") or {}).get("data")
+        if isinstance(data, list):
+            return [t for t in data if isinstance(t, str)]
+
+    raise WakeError(
+        "the codex app-server did not answer thread/loaded/list "
+        f"({(result.stderr or '').strip()[:300] or 'no response'})"
+    )
+
+
 def deliver_codex(mention: dict, session: str | None) -> str:
     """Inject a turn through codex's own channel — no tmux involved.
 
-    `codex queue --thread <session name or uuid> --message <text>` is codex's
-    equivalent of `send-keys`, and it reaches the app-server directly.
+    `codex queue --thread <session> --message <text>` reaches the app-server
+    directly. Verified against a live remote-control session by the orchestrator.
+
+    A declared session wins; otherwise the live one is **discovered** from the
+    app-server. A codex session id changes every session, so it is not something
+    an owner can declare — a config field would be stale the moment it was
+    written, with nothing to say so.
     """
     if not codex_daemon_running():
         return (
@@ -347,27 +421,46 @@ def deliver_codex(mention: dict, session: str | None) -> str:
             "running. Per ADR-0009 §7e a message never starts an agent, so this waits in "
             "the inbox until a session next starts."
         )
-    if not session:
-        raise WakeError(
-            "this seat declares model 'codex' and a codex daemon is running, but no "
-            "session is declared, so there is no way to say which conversation the "
-            "message is for. `codex queue` needs a session name or UUID. Declare "
-            "model_session in ~/.seat/seat.yml.\n\n"
-            "Unlike Claude, this is required rather than a hint: codex under remote "
-            "control has no pane, so there is nothing to search — the property that "
-            "made it invisible to the old scan also leaves no fallback. If codex gains "
-            "a scriptable way to list its sessions, this can become a hint too."
-        )
     if shutil.which("codex") is None:
         raise WakeError("this seat declares model 'codex' but the codex CLI is not on PATH.")
 
-    result = _run(["codex", "queue", "--thread", session, "--message", compose_turn(mention)])
+    target, how = session, "declared target"
+    if not target:
+        try:
+            loaded = codex_loaded_threads()
+        except WakeError as exc:
+            # Discovery is the preferred path but not a dependency. If the
+            # app-server will not answer, fall back to the behaviour that was
+            # already correct — say what is missing — rather than surfacing a
+            # protocol error the reader cannot act on.
+            raise WakeError(
+                "no session is declared for this seat and the codex app-server would not "
+                f"list its live sessions ({exc}). Declare model_session in "
+                "~/.seat/seat.yml, or leave exactly one codex session loaded once "
+                "discovery works. Not guessing at a session."
+            ) from exc
+        if not loaded:
+            return (
+                "queued: a codex app-server is running on this seat but no session is "
+                "loaded in it, so there is nothing to deliver to. Per ADR-0009 §7e a "
+                "message never starts an agent — this waits in the inbox."
+            )
+        if len(loaded) > 1:
+            raise WakeError(
+                f"{len(loaded)} codex sessions are loaded on this seat "
+                f"({', '.join(loaded[:4])}{'…' if len(loaded) > 4 else ''}) and none is "
+                "declared, so there is no single answer to which one this message is for. "
+                "Declare model_session in ~/.seat/seat.yml, or leave one session loaded."
+            )
+        target, how = loaded[0], "discovered from the app-server"
+
+    result = _run(["codex", "queue", "--thread", target, "--message", compose_turn(mention)])
     if result.returncode != 0:
         raise WakeError(
-            f"codex queue failed for session {session!r} "
+            f"codex queue failed for session {target!r} "
             f"({(result.stderr or result.stdout or '').strip()[:400]})"
         )
-    return f"delivered to codex session {session} (declared target)"
+    return f"delivered to codex session {target} ({how})"
 
 
 def deliver_by_scan(mention: dict, panes: list[Pane], agent_commands: tuple[str, ...]) -> str:

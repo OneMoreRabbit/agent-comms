@@ -155,10 +155,49 @@ def test_codex_with_no_daemon_queues(monkeypatch):
     assert "never starts an agent" in outcome
 
 
-def test_codex_without_a_declared_session_refuses_rather_than_guessing(monkeypatch):
+def test_codex_discovers_the_live_session_when_none_is_declared(monkeypatch):
+    """A codex session id changes every session, so it is discovered, not declared.
+
+    `thread/loaded/list` is the app-server's own answer to which sessions are
+    live — authoritative, and self-healing when the session changes.
+    """
     monkeypatch.setattr(wake_mod, "codex_daemon_running", lambda: True)
-    with pytest.raises(WakeError, match="no way to say which conversation"):
+    monkeypatch.setattr(wake_mod.shutil, "which", lambda n: "/usr/bin/codex")
+    monkeypatch.setattr(wake_mod, "codex_loaded_threads", lambda: ["01a0739b"])
+    ran = []
+    monkeypatch.setattr(wake_mod, "_run", lambda cmd: (ran.append(cmd), _Ok())[1])
+    assert wake(MENTION, model="codex").endswith("(discovered from the app-server)")
+    assert ran[0][3] == "01a0739b"
+
+
+def test_codex_with_no_loaded_session_queues(monkeypatch):
+    monkeypatch.setattr(wake_mod, "codex_daemon_running", lambda: True)
+    monkeypatch.setattr(wake_mod.shutil, "which", lambda n: "/usr/bin/codex")
+    monkeypatch.setattr(wake_mod, "codex_loaded_threads", lambda: [])
+    outcome = wake(MENTION, model="codex")
+    assert outcome.startswith("queued")
+    assert "never starts an agent" in outcome
+
+
+def test_codex_with_several_loaded_sessions_refuses(monkeypatch):
+    """Same rule as Claude: two answers means no answer, so do not pick one."""
+    monkeypatch.setattr(wake_mod, "codex_daemon_running", lambda: True)
+    monkeypatch.setattr(wake_mod.shutil, "which", lambda n: "/usr/bin/codex")
+    monkeypatch.setattr(wake_mod, "codex_loaded_threads", lambda: ["a", "b"])
+    with pytest.raises(WakeError, match="no single answer"):
         wake(MENTION, model="codex")
+
+
+def test_a_declared_codex_session_wins_over_discovery(monkeypatch):
+    monkeypatch.setattr(wake_mod, "codex_daemon_running", lambda: True)
+    monkeypatch.setattr(wake_mod.shutil, "which", lambda n: "/usr/bin/codex")
+
+    def boom():
+        raise AssertionError("a declared session must not trigger discovery")
+
+    monkeypatch.setattr(wake_mod, "codex_loaded_threads", boom)
+    monkeypatch.setattr(wake_mod, "_run", lambda cmd: _Ok())
+    assert wake(MENTION, model="codex", session="pinned").endswith("(declared target)")
 
 
 def test_codex_queue_failure_is_reported(monkeypatch):
@@ -203,3 +242,20 @@ def test_absent_model_with_nothing_running_says_to_declare(monkeypatch):
     outcome = wake(MENTION, model=None)
     assert outcome.startswith("queued")
     assert "Declare `model`" in outcome
+
+
+def test_discovery_failure_degrades_to_the_clear_refusal(monkeypatch):
+    """Discovery is preferred, not depended on.
+
+    If the app-server will not answer, the reader needs to know what to do —
+    not a protocol error they cannot act on.
+    """
+    monkeypatch.setattr(wake_mod, "codex_daemon_running", lambda: True)
+    monkeypatch.setattr(wake_mod.shutil, "which", lambda n: "/usr/bin/codex")
+
+    def refuses():
+        raise WakeError("broken pipe")
+
+    monkeypatch.setattr(wake_mod, "codex_loaded_threads", refuses)
+    with pytest.raises(WakeError, match="Declare model_session"):
+        wake(MENTION, model="codex")

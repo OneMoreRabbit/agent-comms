@@ -6,11 +6,14 @@ between coordination and a message typed at a shell prompt nobody reads.
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from agent_comms import operations
 from agent_comms import wake as wake_mod
 from agent_comms.wake import Pane, WakeError, compose_turn, find_agent_panes, wake
+from tests.conftest import FakeTransport
 
 
 def _panes(*specs):
@@ -175,3 +178,70 @@ def test_a_sleeping_seat_says_so_once(seat, monkeypatch):
         )
     assert len(sent) == 1, "a sleeping seat must not repeat itself for every message"
     assert "queued" in sent[0]["content"]
+
+
+# -- the liveness gate that failed closed and sounded plausible ---------------
+
+def test_json_pid_file_is_read_correctly(seat, monkeypatch):
+    """codex 0.153.4 writes JSON. Reading it as an int queued every codex
+    delivery with a convincing 'no daemon running', so nothing looked wrong."""
+    import agent_comms.wake as w
+
+    home = seat / "codex"
+    (home / "app-server-daemon").mkdir(parents=True)
+    (home / "app-server-daemon" / "app-server.pid").write_text(
+        '{"pid":%d,"processStartTime":"Sat Sep  5 01:22:58 2026"}' % os.getpid(),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    assert w.codex_daemon_running() is True
+
+
+def test_bare_int_pid_file_still_works(seat, monkeypatch):
+    """Kept for version skew in either direction."""
+    import agent_comms.wake as w
+
+    home = seat / "codex"
+    (home / "app-server-daemon").mkdir(parents=True)
+    (home / "app-server-daemon" / "app-server.pid").write_text(
+        str(os.getpid()), encoding="utf-8"
+    )
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    assert w.codex_daemon_running() is True
+
+
+def test_a_dead_pid_is_not_alive(seat, monkeypatch):
+    import agent_comms.wake as w
+
+    home = seat / "codex"
+    (home / "app-server-daemon").mkdir(parents=True)
+    (home / "app-server-daemon" / "app-server.pid").write_text(
+        '{"pid":999999}', encoding="utf-8"
+    )
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    assert w.codex_daemon_running() is False
+
+
+# -- one canonical wake trigger ----------------------------------------------
+
+def test_both_wake_triggers_set_refuses_to_start(seat):
+    """Silent duplication is worse than a refusal — the flock argument again."""
+    from agent_comms.errors import ConflictingWakeTriggers
+
+    (seat / ".comms" / "config.toml").write_text(
+        'enabled = true\nwake = true\nnotify_command = "comms wake"\n', encoding="utf-8"
+    )
+    with pytest.raises(ConflictingWakeTriggers, match="notify_command` is canonical"):
+        operations.run_daemon(
+            transport_factory=lambda c: FakeTransport(), max_iterations=1
+        )
+
+
+def test_either_trigger_alone_is_fine(seat):
+    for line in ('wake = true\n', 'notify_command = "true"\n'):
+        (seat / ".comms" / "config.toml").write_text(
+            f"enabled = true\n{line}", encoding="utf-8"
+        )
+        operations.run_daemon(
+            transport_factory=lambda c: FakeTransport(), max_iterations=1
+        )

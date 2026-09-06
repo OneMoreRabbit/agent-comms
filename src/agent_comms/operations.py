@@ -20,6 +20,7 @@ from .config import Credential, Settings, load_credential, load_settings
 from .errors import (
     CommsDisabled,
     CommsError,
+    ConflictingWakeTriggers,
     CredentialMissing,
     QueueGapError,
 )
@@ -360,6 +361,7 @@ def run_daemon(
     not decide *how* a seat surfaces a mention, only that it is not mid-task.
     """
     settings = load_settings(**kw)
+    check_wake_triggers(settings)
     credential = load_credential(settings.identity)
     store = Store(settings.state_dir)
     store.ensure()
@@ -440,6 +442,28 @@ def _resume_or_register(hub: Hub, store: Store) -> Registration:
         f"resuming queue {registration.queue_id} from event {registration.last_event_id}",
     )
     return registration
+
+
+def check_wake_triggers(settings: Settings) -> None:
+    """Refuse to start with both wake triggers armed.
+
+    `notify_command = "comms wake"` is canonical — it is what ADR-0009 §7b
+    describes, what the estate has deployed, and the hook a consumer can point
+    anywhere. `wake = true` is the built-in shorthand for the same delivery.
+
+    Set together they would each deliver the mention. Silent duplication is worse
+    than a refusal — the same argument that put an flock on the daemon — and a
+    seat answering every message twice presents as a hub fault, which is where it
+    would be looked for.
+    """
+    if settings.wake and settings.notify_command:
+        raise ConflictingWakeTriggers(
+            "both wake triggers are set: notify_command="
+            f"{settings.notify_command!r} and wake=true. Each delivers the mention, so "
+            "together they deliver it twice. `notify_command` is canonical — unset "
+            "`wake` in ~/.comms/config.toml (or unset notify_command if you meant to use "
+            "the built-in). Refusing to start rather than answering every message twice."
+        )
 
 
 def _deliver_to_agent(
