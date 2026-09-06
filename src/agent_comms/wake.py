@@ -366,18 +366,18 @@ def codex_loaded_threads(timeout: int = 6) -> list[str]:
     than declared: it changes every session, so a config field would be stale the
     moment it was written with nothing to say so.
 
-    **This does not work on codex 0.153.4, and the code is kept deliberately.**
-    Tested on a signed-in seat with a live `app-server --remote-control` daemon,
-    2026-09-06: `codex app-server proxy` returns nothing to this request under
-    either line-delimited or LSP framing, and connecting to
-    `app-server-control.sock` directly accepts the connection and closes without
-    replying. So the control socket is not the protocol endpoint for clients, and
-    the right entry point is not yet known.
+    **Untested, and the attempt to test it was inconclusive.** On this seat
+    (2026-09-06) it returned nothing through `codex app-server proxy` under either
+    framing, and the control socket accepted a connection then closed. That looked
+    like a protocol answer until codex's own TUI failed on the same seat with
+    *"remote app-server worker channel is closed"* — so the app-server was
+    unhealthy and **nothing was learned about the protocol.** A broken daemon
+    answers nothing regardless of whether the request was right.
 
-    The method is in codex's own published schema, so this is a wiring question
-    rather than a missing feature — kept, with a short timeout, so it starts
-    working the day the endpoint is known. Until then every codex seat must
-    declare `model_session`, and the failure below says exactly that.
+    So: the method is in codex's published schema, this code may well be correct,
+    and it has never had a fair test. It is kept with a short timeout, and its
+    failure degrades to "declare `model_session`" — the behaviour that was already
+    correct — so a codex seat is never worse off while the question is open.
     """
     request = json.dumps({
         "id": 1, "jsonrpc": "2.0", "method": "thread/loaded/list", "params": {},
