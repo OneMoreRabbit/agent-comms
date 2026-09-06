@@ -163,17 +163,17 @@ def test_codex_discovers_the_live_session_when_none_is_declared(monkeypatch):
     """
     monkeypatch.setattr(wake_mod, "codex_daemon_running", lambda: True)
     monkeypatch.setattr(wake_mod.shutil, "which", lambda n: "/usr/bin/codex")
-    monkeypatch.setattr(wake_mod, "codex_loaded_threads", lambda: ["01a0739b"])
+    monkeypatch.setattr(wake_mod, "codex_live_threads", lambda: (["01a0739b"], "writer locks"))
     ran = []
     monkeypatch.setattr(wake_mod, "_run", lambda cmd: (ran.append(cmd), _Ok())[1])
-    assert wake(MENTION, model="codex").endswith("(discovered from the app-server)")
+    assert wake(MENTION, model="codex").endswith("(discovered via writer locks)")
     assert ran[0][3] == "01a0739b"
 
 
 def test_codex_with_no_loaded_session_queues(monkeypatch):
     monkeypatch.setattr(wake_mod, "codex_daemon_running", lambda: True)
     monkeypatch.setattr(wake_mod.shutil, "which", lambda n: "/usr/bin/codex")
-    monkeypatch.setattr(wake_mod, "codex_loaded_threads", lambda: [])
+    monkeypatch.setattr(wake_mod, "codex_live_threads", lambda: ([], "writer locks"))
     outcome = wake(MENTION, model="codex")
     assert outcome.startswith("queued")
     assert "never starts an agent" in outcome
@@ -183,7 +183,7 @@ def test_codex_with_several_loaded_sessions_refuses(monkeypatch):
     """Same rule as Claude: two answers means no answer, so do not pick one."""
     monkeypatch.setattr(wake_mod, "codex_daemon_running", lambda: True)
     monkeypatch.setattr(wake_mod.shutil, "which", lambda n: "/usr/bin/codex")
-    monkeypatch.setattr(wake_mod, "codex_loaded_threads", lambda: ["a", "b"])
+    monkeypatch.setattr(wake_mod, "codex_live_threads", lambda: (["a", "b"], "writer locks"))
     with pytest.raises(WakeError, match="no single answer"):
         wake(MENTION, model="codex")
 
@@ -244,18 +244,15 @@ def test_absent_model_with_nothing_running_says_to_declare(monkeypatch):
     assert "Declare `model`" in outcome
 
 
-def test_discovery_failure_degrades_to_the_clear_refusal(monkeypatch):
+def test_an_unreachable_app_server_queues_rather_than_erroring(monkeypatch):
     """Discovery is preferred, not depended on.
 
-    If the app-server will not answer, the reader needs to know what to do —
-    not a protocol error they cannot act on.
+    Superseded the old behaviour: discovery used to raise when the app-server
+    would not answer. It now falls through to the writer locks, and an empty
+    result is a quiet queue rather than an error the reader cannot act on.
     """
     monkeypatch.setattr(wake_mod, "codex_daemon_running", lambda: True)
     monkeypatch.setattr(wake_mod.shutil, "which", lambda n: "/usr/bin/codex")
-
-    def refuses():
-        raise WakeError("broken pipe")
-
-    monkeypatch.setattr(wake_mod, "codex_loaded_threads", refuses)
-    with pytest.raises(WakeError, match="Declare model_session"):
-        wake(MENTION, model="codex")
+    monkeypatch.setattr(wake_mod, "codex_live_threads", lambda: ([], "writer locks"))
+    outcome = wake(MENTION, model="codex")
+    assert outcome.startswith("queued")

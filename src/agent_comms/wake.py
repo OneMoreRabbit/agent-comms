@@ -357,27 +357,42 @@ def codex_daemon_running() -> bool:
     return True
 
 
+def codex_lock_threads() -> list[str]:
+    """Live codex thread ids, from the writer locks the runtime maintains.
+
+    codex holds `~/.codex/thread-writer-locks/<thread-id>.lock` for each thread it
+    is writing to, so the directory is a live list maintained by the runtime
+    itself — not something this client infers.
+
+    **This is what actually works.** `thread/loaded/list` is the better answer in
+    principle and is in codex's published schema, but on 0.153.4 it returns
+    nothing: verified 2026-09-06 against a *healthy* app-server with a session
+    loaded, through `codex app-server proxy` under both line-delimited and LSP
+    framing, and against the control socket directly. The lock directory was
+    verified the same day — the id it yielded was the one `codex queue` accepted.
+    """
+    lock_dir = os.path.join(_codex_home(), "thread-writer-locks")
+    try:
+        names = os.listdir(lock_dir)
+    except OSError:
+        return []
+    threads = []
+    for name in names:
+        if name.startswith(".") or not name.endswith(".lock"):
+            continue
+        stem = name[: -len(".lock")]
+        if stem:
+            threads.append(stem)
+    return threads
+
+
 def codex_loaded_threads(timeout: int = 6) -> list[str]:
     """Ask the app-server which sessions are live, over its own protocol.
 
     `thread/loaded/list` returns *"thread ids for sessions currently loaded in
-    memory"* — the authoritative answer to "where is this seat's codex session",
-    from the only party that knows. That is why a session id is discovered rather
-    than declared: it changes every session, so a config field would be stale the
-    moment it was written with nothing to say so.
-
-    **Untested, and the attempt to test it was inconclusive.** On this seat
-    (2026-09-06) it returned nothing through `codex app-server proxy` under either
-    framing, and the control socket accepted a connection then closed. That looked
-    like a protocol answer until codex's own TUI failed on the same seat with
-    *"remote app-server worker channel is closed"* — so the app-server was
-    unhealthy and **nothing was learned about the protocol.** A broken daemon
-    answers nothing regardless of whether the request was right.
-
-    So: the method is in codex's published schema, this code may well be correct,
-    and it has never had a fair test. It is kept with a short timeout, and its
-    failure degrades to "declare `model_session`" — the behaviour that was already
-    correct — so a codex seat is never worse off while the question is open.
+    memory"* — authoritative, and the right answer if it ever responds. It does
+    not on 0.153.4 (see `codex_lock_threads`), so this is tried only when the
+    lock directory is empty, and its failure is not fatal.
     """
     request = json.dumps({
         "id": 1, "jsonrpc": "2.0", "method": "thread/loaded/list", "params": {},
@@ -415,6 +430,17 @@ def codex_loaded_threads(timeout: int = 6) -> list[str]:
     )
 
 
+def codex_live_threads() -> tuple[list[str], str]:
+    """Live codex threads, and which route found them."""
+    locks = codex_lock_threads()
+    if locks:
+        return locks, "writer locks"
+    try:
+        return codex_loaded_threads(), "app-server"
+    except WakeError:
+        return [], "writer locks"
+
+
 def deliver_codex(mention: dict, session: str | None) -> str:
     """Inject a turn through codex's own channel — no tmux involved.
 
@@ -437,19 +463,7 @@ def deliver_codex(mention: dict, session: str | None) -> str:
 
     target, how = session, "declared target"
     if not target:
-        try:
-            loaded = codex_loaded_threads()
-        except WakeError as exc:
-            # Discovery is the preferred path but not a dependency. If the
-            # app-server will not answer, fall back to the behaviour that was
-            # already correct — say what is missing — rather than surfacing a
-            # protocol error the reader cannot act on.
-            raise WakeError(
-                "no session is declared for this seat and the codex app-server would not "
-                f"list its live sessions ({exc}). Declare model_session in "
-                "~/.seat/seat.yml, or leave exactly one codex session loaded once "
-                "discovery works. Not guessing at a session."
-            ) from exc
+        loaded, route = codex_live_threads()
         if not loaded:
             return (
                 "queued: a codex app-server is running on this seat but no session is "
@@ -463,7 +477,7 @@ def deliver_codex(mention: dict, session: str | None) -> str:
                 "declared, so there is no single answer to which one this message is for. "
                 "Declare model_session in ~/.seat/seat.yml, or leave one session loaded."
             )
-        target, how = loaded[0], "discovered from the app-server"
+        target, how = loaded[0], f"discovered via {route}"
 
     result = _run(["codex", "queue", "--thread", target, "--message", compose_turn(mention)])
     if result.returncode != 0:
