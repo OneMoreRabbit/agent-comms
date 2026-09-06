@@ -357,16 +357,27 @@ def codex_daemon_running() -> bool:
     return True
 
 
-def codex_loaded_threads(timeout: int = 20) -> list[str]:
+def codex_loaded_threads(timeout: int = 6) -> list[str]:
     """Ask the app-server which sessions are live, over its own protocol.
 
     `thread/loaded/list` returns *"thread ids for sessions currently loaded in
     memory"* — the authoritative answer to "where is this seat's codex session",
-    from the only party that actually knows.
+    from the only party that knows. That is why a session id is discovered rather
+    than declared: it changes every session, so a config field would be stale the
+    moment it was written with nothing to say so.
 
-    This is why a codex session id is discovered rather than declared: it changes
-    every session, so a config field would be stale the moment it was written and
-    nothing would say so.
+    **This does not work on codex 0.153.4, and the code is kept deliberately.**
+    Tested on a signed-in seat with a live `app-server --remote-control` daemon,
+    2026-09-06: `codex app-server proxy` returns nothing to this request under
+    either line-delimited or LSP framing, and connecting to
+    `app-server-control.sock` directly accepts the connection and closes without
+    replying. So the control socket is not the protocol endpoint for clients, and
+    the right entry point is not yet known.
+
+    The method is in codex's own published schema, so this is a wiring question
+    rather than a missing feature — kept, with a short timeout, so it starts
+    working the day the endpoint is known. Until then every codex seat must
+    declare `model_session`, and the failure below says exactly that.
     """
     request = json.dumps({
         "id": 1, "jsonrpc": "2.0", "method": "thread/loaded/list", "params": {},
