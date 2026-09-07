@@ -139,6 +139,7 @@ def test_declared_codex_never_touches_tmux(monkeypatch):
     monkeypatch.setattr(wake_mod, "_tmux", boom)
     monkeypatch.setattr(wake_mod, "codex_daemon_running", lambda: True)
     monkeypatch.setattr(wake_mod.shutil, "which", lambda n: "/usr/bin/codex")
+    monkeypatch.setattr(wake_mod, "codex_lock_threads", lambda: ["blocks-arch"])
 
     ran = []
     monkeypatch.setattr(wake_mod, "_run", lambda cmd: (ran.append(cmd), _Ok())[1])
@@ -152,7 +153,7 @@ def test_codex_with_no_daemon_queues(monkeypatch):
     monkeypatch.setattr(wake_mod, "codex_daemon_running", lambda: False)
     outcome = wake(MENTION, model="codex", session="x")
     assert outcome.startswith("queued")
-    assert "never starts an agent" in outcome
+    assert "would strand" in outcome
 
 
 def test_codex_discovers_the_live_session_when_none_is_declared(monkeypatch):
@@ -164,6 +165,7 @@ def test_codex_discovers_the_live_session_when_none_is_declared(monkeypatch):
     monkeypatch.setattr(wake_mod, "codex_daemon_running", lambda: True)
     monkeypatch.setattr(wake_mod.shutil, "which", lambda n: "/usr/bin/codex")
     monkeypatch.setattr(wake_mod, "codex_live_threads", lambda: (["01a0739b"], "writer locks"))
+    monkeypatch.setattr(wake_mod, "codex_lock_threads", lambda: ["01a0739b"])
     ran = []
     monkeypatch.setattr(wake_mod, "_run", lambda cmd: (ran.append(cmd), _Ok())[1])
     assert wake(MENTION, model="codex").endswith("(discovered via writer locks)")
@@ -195,7 +197,8 @@ def test_a_declared_codex_session_wins_over_discovery(monkeypatch):
     def boom():
         raise AssertionError("a declared session must not trigger discovery")
 
-    monkeypatch.setattr(wake_mod, "codex_loaded_threads", boom)
+    monkeypatch.setattr(wake_mod, "codex_live_threads", boom)
+    monkeypatch.setattr(wake_mod, "codex_lock_threads", lambda: ["pinned"])
     monkeypatch.setattr(wake_mod, "_run", lambda cmd: _Ok())
     assert wake(MENTION, model="codex", session="pinned").endswith("(declared target)")
 
@@ -209,6 +212,7 @@ def test_codex_queue_failure_is_reported(monkeypatch):
         stderr = "no such thread"
         stdout = ""
 
+    monkeypatch.setattr(wake_mod, "codex_lock_threads", lambda: ["ghost"])
     monkeypatch.setattr(wake_mod, "_run", lambda cmd: Bad())
     with pytest.raises(WakeError, match="codex queue failed"):
         wake(MENTION, model="codex", session="ghost")
@@ -256,3 +260,20 @@ def test_an_unreachable_app_server_queues_rather_than_erroring(monkeypatch):
     monkeypatch.setattr(wake_mod, "codex_live_threads", lambda: ([], "writer locks"))
     outcome = wake(MENTION, model="codex")
     assert outcome.startswith("queued")
+
+
+def test_an_unloaded_thread_is_not_handed_to_codex_queue(monkeypatch):
+    """Verified 2026-09-07: a message queued to an unloaded thread is not
+    delivered even on resume. It strands. Our inbox is recoverable; that is not.
+    """
+    monkeypatch.setattr(wake_mod, "codex_daemon_running", lambda: True)
+    monkeypatch.setattr(wake_mod.shutil, "which", lambda n: "/usr/bin/codex")
+    monkeypatch.setattr(wake_mod, "codex_lock_threads", lambda: [])
+
+    def boom(cmd):
+        raise AssertionError("must not queue into an unloaded thread")
+
+    monkeypatch.setattr(wake_mod, "_run", boom)
+    outcome = wake(MENTION, model="codex", session="cold-thread")
+    assert outcome.startswith("queued")
+    assert "strands" in outcome

@@ -469,8 +469,8 @@ def deliver_codex(mention: dict, session: str | None) -> str:
     if not codex_daemon_running():
         return (
             "queued: this seat declares model 'codex' but no codex app-server daemon is "
-            "running. Per ADR-0009 §7e a message never starts an agent, so this waits in "
-            "the inbox until a session next starts."
+            "running, so a message handed to `codex queue` would strand. Held in the comms "
+            "inbox instead, where it can still be read."
         )
     if shutil.which("codex") is None:
         raise WakeError("this seat declares model 'codex' but the codex CLI is not on PATH.")
@@ -492,6 +492,21 @@ def deliver_codex(mention: dict, session: str | None) -> str:
                 "Declare model_session in ~/.seat/seat.yml, or leave one session loaded."
             )
         target, how = loaded[0], f"discovered via {route}"
+
+    # Only hand a message to `codex queue` if the thread is actually LOADED.
+    #
+    # Verified 2026-09-07: a message queued to an unloaded thread sits in codex's
+    # queue and is **not delivered even when the thread is later resumed** — it
+    # is stranded, not deferred. Our own inbox is recoverable; codex's queue, in
+    # that state, is not. So an unloaded thread must fall back rather than
+    # "succeed" into a hole.
+    if target not in codex_lock_threads():
+        return (
+            f"queued: codex thread {target} is not loaded, and a message queued to an "
+            "unloaded thread is not delivered even on resume — it strands. Held in the "
+            "comms inbox instead. Keep a client on the designated thread "
+            "(`comms session ensure`) to make this seat deliverable."
+        )
 
     result = _run(["codex", "queue", "--thread", target, "--message", compose_turn(mention)])
     if result.returncode != 0:
