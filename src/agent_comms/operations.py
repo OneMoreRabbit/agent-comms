@@ -7,9 +7,12 @@ raises. `cli.py` is the only module that formats for a human.
 
 from __future__ import annotations
 
+import json
 import re
+import subprocess
+import time
 import urllib.parse
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable
 
@@ -17,10 +20,13 @@ from .config import Credential, Settings, load_credential, load_settings
 from .errors import (
     CommsDisabled,
     CommsError,
+    ConflictingWakeTriggers,
     CredentialMissing,
     QueueGapError,
 )
 from .hub import Hub, Registration, Transport, build_transport
+from .session import SessionState, ensure, status as _session_status
+from .wake import WakeError, wake
 from .store import Mention, Store
 
 
@@ -84,6 +90,8 @@ class Preflight:
     disabled: bool = False
     checks: list[tuple[str, bool, str]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    #: Recorded, not raised. Kept separate so a note never dilutes a warning.
+    notes: list[str] = field(default_factory=list)
 
     def add(self, name: str, passed: bool, detail: str = "") -> None:
         self.checks.append((name, passed, detail))
@@ -118,8 +126,13 @@ def preflight(
         report.add("credential", False, str(exc))
         return report
     report.add("credential", True, f"{credential.source} → {credential.site}")
+    report.warnings.extend(credential.notices)
 
     hub = Hub(transport_factory(credential), settings, credential)
+    identity_notices = hub.verify_identity()
+    report.add("identity", True, f"expected bot '{settings.identity.bot_name}'")
+    report.warnings.extend(identity_notices)
+
     try:
         hub.verify_subscription()
         report.add("subscription", True, f"subscribed to '{settings.channel}'")
@@ -138,7 +151,14 @@ def preflight(
         True,
         f"registered {registration.queue_id} at lifespan_secs={settings.lifespan_secs}",
     )
+
+    # Deliverability is a separate question from connectivity, and the one that
+    # went unnoticed for 21 minutes in the live incident.
+    from .session import status as _sess
+    sess = _sess(settings)
+    report.add("deliverable", sess.live, sess.detail)
     report.warnings.extend(registration.warnings)
+    report.notes.extend(registration.notes)
     return report
 
 
@@ -154,25 +174,67 @@ def _permalink(site: str, event_msg: dict) -> str:
     return f"{site}/#narrow/channel/{stream_id}-{slug}/topic/{quoted}/near/{event_msg['id']}"
 
 
-def mention_from_event(site: str, event: dict) -> Mention | None:
-    """Turn a Zulip message event into a stored mention, or None if not for us.
+def addressed_to_seat(
+    settings: Settings, msg: dict, flags: list[str], own_email: str | None = None
+) -> str | None:
+    """Is this message for this seat? Returns why, or None.
 
-    Only messages flagged `mentioned` are ours. A channel carries every
-    conversation in the project; without this filter a seat would store the lot.
+    **Our own messages are never for us.** A seat posts to a topic named after
+    itself, so without this it stores everything it says and reads its own words
+    back as an ask. Observed live: this seat's store contained its own smoke
+    test. Under the topic rule below it would have applied to every post.
+
+    Three ways to reach a seat, and the middle one was missing until 0.4:
+
+    1. **An explicit `@`-mention.** Unambiguous, always works.
+    2. **The topic convention.** ADR-0009 §1 puts one channel per project and
+       *"one topic per arch ↔ component conversation"*, and R1 agreed the naming
+       `<component>: <ask>` precisely *"so a seat can filter its own
+       conversations without relying on permissions"*. The topic **is** the
+       addressing. 0.1–0.3 matched only on mentions, which contradicted this
+       client's own contract §2a and made every message to a seat require an
+       `@`-mention — including replies in a topic already named for it.
+    3. **A direct message** to the bot.
+
+    Everything else in the channel is other people's conversation, and is not
+    stored: with one channel per project, matching everything would wake every
+    seat on every message.
     """
+    sender = (msg.get("sender_email") or "").casefold()
+    if own_email and sender == own_email.casefold():
+        return None
+
+    if "mentioned" in flags:
+        return "mentioned"
+    if msg.get("type") == "private":
+        return "direct message"
+
+    topic = (msg.get("subject") or "").strip()
+    prefix = topic.split(":", 1)[0].strip().casefold() if ":" in topic else ""
+    if prefix and prefix in {n.casefold() for n in settings.identity.bot_names}:
+        return "topic addressed to this seat"
+    return None
+
+
+def mention_from_event(
+    site: str, event: dict, settings: Settings, own_email: str | None = None
+) -> Mention | None:
+    """Turn a Zulip message event into a stored mention, or None if not for us."""
     if event.get("type") != "message":
         return None
-    if "mentioned" not in (event.get("flags") or []):
-        return None
     msg = event["message"]
+    reason = addressed_to_seat(settings, msg, event.get("flags") or [], own_email)
+    if reason is None:
+        return None
     return Mention(
         id=msg["id"],
         sender=msg.get("sender_full_name") or msg.get("sender_email", "unknown"),
-        channel=msg.get("display_recipient") or "",
+        channel=msg.get("display_recipient") if isinstance(msg.get("display_recipient"), str) else "",
         topic=msg.get("subject") or "",
         content=msg.get("content") or "",
         timestamp=msg.get("timestamp", 0),
         permalink=_permalink(site, msg),
+        reason=reason,
     )
 
 
@@ -223,6 +285,132 @@ def reply(
     return result
 
 
+def session_status(**kw) -> SessionState:
+    """Is this seat's one agent session live? Never starts anything."""
+    return _session_status(load_settings(**kw))
+
+
+def session_ensure(workdir: str | None = None, **kw) -> str:
+    """Start this seat's session if it has none — for a supervisor, not delivery."""
+    return ensure(load_settings(**kw), workdir=workdir)
+
+
+def wake_agent(
+    mention: dict,
+    transport_factory: Callable[[Credential], Transport] = build_transport,
+    **kw,
+) -> str:
+    """Deliver a mention to the running agent, reporting a failure to the sender.
+
+    §7b.5: a wake that fails is loud. A sender who is told nothing waits forever
+    on a seat that never woke — and under §7e "no session yet" is normal, so
+    silence is genuinely ambiguous between asleep and broken. Queuing announces
+    itself once and then stays quiet until the next successful delivery, because
+    a sleeping seat repeating itself is noise.
+    """
+    settings = load_settings(**kw)
+    store = Store(settings.state_dir)
+    store.ensure()
+
+    try:
+        outcome = wake(
+            mention,
+            model=settings.model,
+            session=settings.model_session,
+            agent_commands=settings.agent_commands,
+            selection=settings.codex_thread_selection,
+        )
+    except WakeError as exc:
+        store.record("warn", f"wake failed for message {mention.get('id')}: {exc}")
+        _tell_sender(settings, store, mention, f"could not deliver that to my agent: {exc}",
+                     transport_factory)
+        if "UNREACHABLE" in str(exc):
+            _announce_unreachable(settings, store, str(exc), transport_factory)
+        raise
+
+    store.set_unreachable(False)
+    queued = outcome.startswith("queued")
+    store.record("info" if not queued else "warn", f"wake: {outcome}")
+    if queued:
+        if not store.sleeping():
+            store.set_sleeping(True)
+            _tell_sender(
+                settings, store, mention,
+                "queued — no agent session is running on this seat, so nothing has read "
+                "this yet. It is stored and will be taken up when a session next starts "
+                "(ADR-0009 §7e: a message never starts an agent). Saying so once rather "
+                "than repeating it for every message while asleep.",
+                transport_factory,
+            )
+    else:
+        store.set_sleeping(False)
+    return outcome
+
+
+def _announce_unreachable(
+    settings: Settings,
+    store: Store,
+    report: str,
+    transport_factory: Callable[[Credential], Transport],
+) -> None:
+    """Say on the channel that this seat cannot be reached, and how to fix it.
+
+    Arch's position, 2026-09-08: the refusal is right, its **silence** is the
+    defect. A seat was unreachable for 21 minutes because the sender saw a
+    refusal and nobody watching the seat learned it was offline. This posts to a
+    findable topic of the seat's own so anyone looking at the project sees it,
+    not only whoever happened to message.
+
+    Announced once per outage and cleared on the next success, because a seat
+    repeating "I am unreachable" every message is the noise that gets skipped.
+    """
+    if store.unreachable():
+        return
+    store.set_unreachable(True)
+    seat = settings.identity.seat
+    _post(
+        settings, store, settings.channel, f"{seat}: unreachable",
+        f"**{seat} cannot receive messages.**\n\n{report}\n\n"
+        "Messages are held in this seat's inbox meanwhile — nothing is lost, but "
+        "nothing is being read either.",
+        transport_factory,
+    )
+
+
+def _post(
+    settings: Settings,
+    store: Store,
+    channel: str,
+    topic: str,
+    text: str,
+    transport_factory: Callable[[Credential], Transport],
+) -> None:
+    try:
+        credential = load_credential(settings.identity)
+        hub = Hub(transport_factory(credential), settings, credential)
+        hub.send(channel, topic, text)
+    except Exception as exc:
+        store.record("warn", f"could not post to {topic!r}: {exc}")
+
+
+def _tell_sender(
+    settings: Settings,
+    store: Store,
+    mention: dict,
+    text: str,
+    transport_factory: Callable[[Credential], Transport],
+) -> None:
+    """Post back into the mention's own topic. Best effort, and logged if it fails."""
+    try:
+        credential = load_credential(settings.identity)
+        hub = Hub(transport_factory(credential), settings, credential)
+        hub.send(mention.get("channel") or settings.channel,
+                 mention.get("topic") or f"{settings.identity.seat}: comms", text)
+    except Exception as exc:
+        store.record("warn", f"could not tell the sender about message "
+                             f"{mention.get('id')}: {exc}")
+
+
 def run_daemon(
     transport_factory: Callable[[Credential], Transport] = build_transport,
     max_iterations: int | None = None,
@@ -232,43 +420,159 @@ def run_daemon(
     """Hold the outbound connection and record what arrives.
 
     Returns the number of mentions stored. `max_iterations` bounds the loop for
-    tests; in a seat it runs unbounded.
+    tests; in a seat it runs unbounded until interrupted.
 
-    This never touches the working session. Mentions land in the store and the
-    consumer's designated comms conversation reads them from there — contract §3
-    'Non-invasive', and the one term that does not flex.
+    This never touches the working session. Mentions land in the store, and the
+    seat's designated comms conversation is reached through `notify_command` —
+    contract §3 'Non-invasive', the one term that does not flex. The client does
+    not decide *how* a seat surfaces a mention, only that it is not mid-task.
     """
     settings = load_settings(**kw)
+    check_wake_triggers(settings)
     credential = load_credential(settings.identity)
     store = Store(settings.state_dir)
     store.ensure()
+    lock = store.acquire_daemon_lock()  # released by the OS when this process ends
+
+    for notice in credential.notices:
+        store.record("warn", notice)
 
     hub = Hub(transport_factory(credential), settings, credential)
+    for notice in hub.verify_identity():
+        store.record("warn", notice)
     hub.verify_subscription()
-    registration = hub.register_queue()
-    for warning in registration.warnings:
-        store.record("warn", warning)
 
-    stored, iterations = 0, 0
+    registration = _resume_or_register(hub, store)
+
+    stored, iterations, backoff = 0, 0, 1
     while max_iterations is None or iterations < max_iterations:
         iterations += 1
         try:
             events = hub.get_events(registration)
+            backoff = 1
         except QueueGapError as exc:
             store.record("warn", f"{exc} Re-registering.")
-            registration = hub.register_queue()
-            for warning in registration.warnings:
-                store.record("warn", warning)
+            registration = _register(hub, store)
+            continue
+        except KeyboardInterrupt:  # pragma: no cover - operator stop
+            store.record("info", "daemon stopped by operator")
+            break
+        except Exception as exc:  # transport hiccup, not a contract failure
+            store.record("warn", f"event fetch failed ({exc}); retrying in {backoff}s")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)
             continue
 
         for event in events:
-            mention = mention_from_event(credential.site, event)
+            mention = mention_from_event(credential.site, event, settings, credential.email)
             if mention is None:
                 continue
             store.append(mention)
             stored += 1
+            _deliver_to_agent(settings, store, mention, transport_factory)
+            _notify(settings, store, mention)
             if on_mention is not None:
                 on_mention(mention)
         store.save_position(registration.queue_id, registration.last_event_id)
 
     return stored
+
+
+def _register(hub: Hub, store: Store) -> Registration:
+    registration = hub.register_queue()
+    for warning in registration.warnings:
+        store.record("warn", warning)
+    for note in registration.notes:
+        store.record("info", note)
+    store.save_position(registration.queue_id, registration.last_event_id)
+    return registration
+
+
+def _resume_or_register(hub: Hub, store: Store) -> Registration:
+    """Resume a stored queue if one exists; otherwise register a fresh one.
+
+    Re-registering when a usable queue was already held silently forfeits
+    anything that arrived while the daemon was down — which is the gap §3 asks
+    us to report, not to create.
+    """
+    saved = store.load_position()
+    if not saved or not saved.get("queue_id"):
+        return _register(hub, store)
+
+    # Resume optimistically and let the main loop discover a dead queue. Probing
+    # with a get_events call here would fetch real events and discard them,
+    # advancing last_event_id past messages nobody ever saw. That is the silent
+    # loss §3 exists to prevent, so the probe is deliberately absent.
+    registration = hub.resume(saved["queue_id"], int(saved.get("last_event_id", 0)))
+    store.record(
+        "info",
+        f"resuming queue {registration.queue_id} from event {registration.last_event_id}",
+    )
+    return registration
+
+
+def check_wake_triggers(settings: Settings) -> None:
+    """Refuse to start with both wake triggers armed.
+
+    `notify_command = "comms wake"` is canonical — it is what ADR-0009 §7b
+    describes, what the estate has deployed, and the hook a consumer can point
+    anywhere. `wake = true` is the built-in shorthand for the same delivery.
+
+    Set together they would each deliver the mention. Silent duplication is worse
+    than a refusal — the same argument that put an flock on the daemon — and a
+    seat answering every message twice presents as a hub fault, which is where it
+    would be looked for.
+    """
+    if settings.wake and settings.notify_command:
+        raise ConflictingWakeTriggers(
+            "both wake triggers are set: notify_command="
+            f"{settings.notify_command!r} and wake=true. Each delivers the mention, so "
+            "together they deliver it twice. `notify_command` is canonical — unset "
+            "`wake` in ~/.comms/config.toml (or unset notify_command if you meant to use "
+            "the built-in). Refusing to start rather than answering every message twice."
+        )
+
+
+def _deliver_to_agent(
+    settings: Settings,
+    store: Store,
+    mention: Mention,
+    transport_factory: Callable[[Credential], Transport],
+) -> None:
+    """Wake the seat's agent, if waking is turned on.
+
+    Off by default. ADR-0009 §7d gated wake-ups behind the governor; §7e then
+    removed that gate, because a message that cannot start an agent cannot run
+    up an unattended night. The default stays off regardless — turning a seat
+    from receiving to acting is a consumer's decision, not a package default.
+    """
+    if not settings.wake:
+        return
+    try:
+        wake_agent(asdict(mention), transport_factory, state_dir=settings.state_dir)
+    except WakeError:
+        pass  # already recorded and reported to the sender by wake_agent
+
+
+def _notify(settings: Settings, store: Store, mention: Mention) -> None:
+    """Hand a mention to the seat's comms conversation, if one is configured."""
+    if not settings.notify_command:
+        return
+    payload = json.dumps(asdict(mention), ensure_ascii=False)
+    try:
+        completed = subprocess.run(
+            settings.notify_command,
+            shell=True,
+            input=payload,
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        if completed.returncode != 0:
+            store.record(
+                "warn",
+                f"notify_command exited {completed.returncode} for message {mention.id}: "
+                f"{(completed.stderr or '').strip()[:400]}",
+            )
+    except Exception as exc:
+        store.record("warn", f"notify_command failed for message {mention.id}: {exc}")

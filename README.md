@@ -79,6 +79,19 @@ does not pretend.
 Warnings reach `~/.comms/events.log` as well as stderr, because a daemon's
 stderr is nobody's inbox.
 
+## Status
+
+**Works end to end** as of 2026-09-04, against the live hub
+(`agent.onemorerabbit.co.uk`, Zulip 10.4): registers an event queue, receives a
+mention, stores it with a citable permalink, replies in the mention's own topic,
+and marks it read. Contract version `0.2`.
+
+Two divergences from the contract are reported at every connect rather than
+normalised away — the credential arrived at `~/.secrets/zuliprc-<seat>` rather
+than the contracted `zuliprc-<project>-<seat>`, and the bot is named
+`agent-comms` rather than `<project>-<seat>` (ADR-0009 §1a). Both are accepted so
+the seat works; both are raised with the estate.
+
 ## Development
 
 ```sh

@@ -11,6 +11,7 @@ import pytest
 from agent_comms import operations
 from agent_comms.config import Settings, load_credential, load_settings
 from agent_comms.errors import (
+    DaemonAlreadyRunning,
     CommsDisabled,
     CredentialMissing,
     CredentialUnreadable,
@@ -132,14 +133,29 @@ def test_lifespan_is_requested_at_3600(seat):
     assert transport.register_calls[0]["lifespan_secs"] == 3600
 
 
-def test_old_server_reports_lifespan_unverifiable(seat):
-    """Zulip 10.4 (level 372) cannot echo it. Say so; never imply we checked."""
+def test_estates_pinned_server_does_not_warn(seat):
+    """Zulip 10.4 cannot echo the lifespan, but the estate source-verified it.
+
+    Warning here fired on every connect on every seat and could not be acted on —
+    the exact noise §3 exists to prevent, produced by §3's own machinery.
+    """
     settings = load_settings()
     credential = load_credential(settings.identity)
     reg = Hub(FakeTransport(), settings, credential).register_queue()
-    assert len(reg.warnings) == 1
-    assert "lifespan unverified" in reg.warnings[0]
-    assert "feature level 372" in reg.warnings[0]
+    assert reg.warnings == []
+    assert any("Honoured" in n for n in reg.notes)
+
+
+def test_unknown_old_server_still_warns(seat):
+    """A server nobody has checked is the case the warning is actually for."""
+    settings = load_settings()
+    credential = load_credential(settings.identity)
+    transport = FakeTransport(register_result={
+        "result": "success", "queue_id": "q1", "last_event_id": 0,
+        "zulip_version": "9.1", "zulip_feature_level": 300,
+    })
+    reg = Hub(transport, settings, credential).register_queue()
+    assert any("Nobody has checked this combination" in w for w in reg.warnings)
 
 
 def test_new_server_mismatch_warns(seat):
@@ -204,11 +220,11 @@ def test_daemon_reregisters_and_records_the_gap(seat):
     assert len(transport.register_calls) == 2
 
 
-def test_connect_warnings_reach_the_durable_log(seat):
-    """A warning that only ever hit a daemon's stderr is the silence §3 forbids."""
+def test_connect_findings_reach_the_durable_log(seat):
+    """A finding that only ever hit a daemon's stderr is the silence §3 forbids."""
     operations.run_daemon(transport_factory=lambda c: FakeTransport(), max_iterations=1)
     log = (seat / ".comms" / "events.log").read_text(encoding="utf-8")
-    assert "lifespan unverified" in log
+    assert "Honoured" in log
 
 
 # -- doctor must not report the resting state as a failure -------------------
@@ -225,6 +241,284 @@ def test_doctor_reports_every_check_not_just_the_first(seat):
     """An operator debugging a seat wants the whole picture."""
     report = operations.preflight(transport_factory=lambda c: FakeTransport())
     names = [n for n, _, _ in report.checks]
-    assert names == ["enabled", "credential", "subscription", "event queue"]
+    assert names == ["enabled", "credential", "identity", "subscription",
+                     "event queue", "deliverable"]
     assert report.ok
-    assert any("lifespan unverified" in w for w in report.warnings)
+    assert report.warnings == []
+    assert any("Honoured" in n for n in report.notes)
+
+
+# -- attribution: the bot must be who the vault thinks it is -----------------
+
+def test_component_bot_name_is_accepted_silently(seat):
+    """ADR-0009 §7a: a component bot appears only in its project's channel, so
+    the seat name alone is unambiguous there. Warning about it would be noise."""
+    report = operations.preflight(
+        transport_factory=lambda c: FakeTransport(full_name="agent-comms")
+    )
+    assert report.ok
+    assert not any("bot is named" in w for w in report.warnings)
+
+
+def test_arch_shaped_bot_name_is_also_accepted(seat):
+    """An arch bot carries its project because it appears in several channels."""
+    report = operations.preflight(
+        transport_factory=lambda c: FakeTransport(full_name="agent-eco-agent-comms")
+    )
+    assert not any("bot is named" in w for w in report.warnings)
+
+
+def test_unrecognisable_bot_name_is_reported(seat):
+    """§7a's requirement is unambiguity: a name that traces back to no seat fails it."""
+    report = operations.preflight(
+        transport_factory=lambda c: FakeTransport(full_name="zulip-bot-3")
+    )
+    assert any("does not identify the seat" in w for w in report.warnings)
+
+
+def test_human_account_credential_is_reported(seat):
+    report = operations.preflight(
+        transport_factory=lambda c: FakeTransport(is_bot=False)
+    )
+    assert any("human account" in w for w in report.warnings)
+
+
+def test_seat_named_credential_is_the_primary_path(seat):
+    """What a component seat actually gets, per §7a — and it is not a divergence."""
+    contracted = seat / ".secrets" / "zuliprc-agent-eco-agent-comms"
+    fallback = seat / ".secrets" / "zuliprc-agent-comms"
+    contracted.rename(fallback)
+    fallback.chmod(0o600)
+    cred = load_credential(load_settings().identity)
+    assert cred.source == str(fallback)
+    assert cred.notices == []
+
+
+def test_project_named_credential_still_works(seat):
+    """What an arch seat gets. Both shapes are live in the estate."""
+    cred = load_credential(load_settings().identity)
+    assert cred.source.endswith("zuliprc-agent-eco-agent-comms")
+    assert cred.notices == []
+
+
+# -- the daemon ---------------------------------------------------------------
+
+def test_daemon_resumes_a_stored_queue_rather_than_re_registering(seat):
+    """Re-registering when a queue was held silently forfeits the gap."""
+    from agent_comms.store import Store
+    store = Store(seat / ".comms")
+    store.save_position("q-existing", 42)
+    transport = FakeTransport()
+    operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
+    assert transport.register_calls == []
+    assert "resuming queue q-existing" in (seat / ".comms" / "events.log").read_text()
+
+
+def test_resume_does_not_discard_events(seat):
+    """A resume probe that fetched and dropped events would lose them silently."""
+    from agent_comms.store import Store
+    Store(seat / ".comms").save_position("q-existing", 42)
+    transport = FakeTransport(event_batches=[{"result": "success", "events": [
+        {"id": 43, "type": "message", "flags": ["mentioned"], "message": {
+            "id": 401, "sender_full_name": "arch", "display_recipient": "agent-eco",
+            "subject": "t", "content": "must not be dropped",
+            "timestamp": 1, "stream_id": 7}},
+    ]}])
+    stored = operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
+    assert stored == 1, "the first batch after a resume must reach the store"
+
+
+def test_dead_stored_queue_falls_back_to_registering(seat):
+    from agent_comms.store import Store
+    Store(seat / ".comms").save_position("q-dead", 1)
+    transport = FakeTransport(event_batches=[
+        {"result": "error", "code": "BAD_EVENT_QUEUE_ID", "queue_id": "q-dead"},
+        {"result": "success", "events": []},
+    ])
+    operations.run_daemon(transport_factory=lambda c: transport, max_iterations=2)
+    assert len(transport.register_calls) == 1
+    assert "garbage-collected" in (seat / ".comms" / "events.log").read_text()
+
+
+def test_daemon_stores_only_mentions(seat):
+    """A project channel carries every conversation; only ours is ours."""
+    transport = FakeTransport(event_batches=[{"result": "success", "events": [
+        {"id": 1, "type": "message", "flags": ["mentioned"], "message": {
+            "id": 101, "sender_full_name": "arch", "display_recipient": "agent-eco",
+            "subject": "agent-comms: build it", "content": "please proceed",
+            "timestamp": 1756900000, "stream_id": 7}},
+        {"id": 2, "type": "message", "flags": [], "message": {
+            "id": 102, "sender_full_name": "someone", "display_recipient": "agent-eco",
+            "subject": "other", "content": "chatter", "timestamp": 1756900001, "stream_id": 7}},
+    ]}])
+    stored = operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
+    assert stored == 1
+    rows = operations.inbox()
+    assert len(rows) == 1 and rows[0].id == 101
+    assert "/#narrow/channel/7-agent-eco/topic/" in rows[0].permalink
+
+
+def test_notify_command_receives_the_mention(seat, tmp_path):
+    """The hand-off to the comms conversation — never the working session."""
+    out = tmp_path / "notified.json"
+    (seat / ".comms" / "config.toml").write_text(
+        f'enabled = true\nnotify_command = "cat > {out}"\n', encoding="utf-8"
+    )
+    transport = FakeTransport(event_batches=[{"result": "success", "events": [
+        {"id": 1, "type": "message", "flags": ["mentioned"], "message": {
+            "id": 201, "sender_full_name": "arch", "display_recipient": "agent-eco",
+            "subject": "agent-comms: ping", "content": "hello",
+            "timestamp": 1756900000, "stream_id": 7}},
+    ]}])
+    operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
+    assert '"id": 201' in out.read_text(encoding="utf-8")
+
+
+def test_failing_notify_command_is_recorded_not_swallowed(seat):
+    (seat / ".comms" / "config.toml").write_text(
+        'enabled = true\nnotify_command = "exit 7"\n', encoding="utf-8"
+    )
+    transport = FakeTransport(event_batches=[{"result": "success", "events": [
+        {"id": 1, "type": "message", "flags": ["mentioned"], "message": {
+            "id": 202, "sender_full_name": "arch", "display_recipient": "agent-eco",
+            "subject": "t", "content": "c", "timestamp": 1, "stream_id": 7}},
+    ]}])
+    operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
+    assert "notify_command exited 7" in (seat / ".comms" / "events.log").read_text()
+
+
+def test_reply_goes_to_the_mentions_own_topic(seat):
+    transport = FakeTransport(event_batches=[{"result": "success", "events": [
+        {"id": 1, "type": "message", "flags": ["mentioned"], "message": {
+            "id": 301, "sender_full_name": "arch", "display_recipient": "agent-eco",
+            "subject": "agent-comms: a question", "content": "?",
+            "timestamp": 1, "stream_id": 7}},
+    ]}])
+    operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
+    operations.reply(301, "answered", transport_factory=lambda c: transport)
+    assert transport.sent[-1]["topic"] == "agent-comms: a question"
+    assert operations.inbox() == []
+
+
+# -- one daemon per seat ------------------------------------------------------
+
+def test_second_daemon_refuses_to_start(seat):
+    """Two daemons on one bot means every mention is processed twice."""
+    from agent_comms.errors import DaemonAlreadyRunning
+    from agent_comms.store import Store
+
+    held = Store(seat / ".comms").acquire_daemon_lock()
+    try:
+        with pytest.raises(DaemonAlreadyRunning, match="two event queues"):
+            operations.run_daemon(
+                transport_factory=lambda c: FakeTransport(), max_iterations=1
+            )
+    finally:
+        held.close()
+
+
+def test_lock_is_released_when_the_holder_goes(seat):
+    """An flock dies with the process, so a killed daemon leaves nothing to clear."""
+    from agent_comms.store import Store
+
+    store = Store(seat / ".comms")
+    store.acquire_daemon_lock().close()
+    operations.run_daemon(transport_factory=lambda c: FakeTransport(), max_iterations=1)
+
+
+def test_already_running_has_its_own_exit_code(seat):
+    """An idempotent installer must be able to tell 'already up' from 'broken'."""
+    from click.testing import CliRunner
+
+    from agent_comms import cli
+    from agent_comms.store import Store
+
+    held = Store(seat / ".comms").acquire_daemon_lock()
+    try:
+        result = CliRunner().invoke(cli.main, ["daemon", "--once"], standalone_mode=False)
+        assert isinstance(result.exception, DaemonAlreadyRunning)
+        assert cli.EXIT_ALREADY_RUNNING == 4
+        assert cli.EXIT_ALREADY_RUNNING not in (cli.EXIT_OK, cli.EXIT_FAULT, cli.EXIT_DISABLED)
+    finally:
+        held.close()
+
+
+# -- who a message is for (0.4) ----------------------------------------------
+
+def _event(msg_id, topic, flags=None, mtype="stream"):
+    return {"id": msg_id, "type": "message", "flags": flags or [], "message": {
+        "id": msg_id, "sender_full_name": "Oliver Blakeman", "display_recipient": "agent-eco",
+        "subject": topic, "content": "hello", "timestamp": 1, "stream_id": 7, "type": mtype}}
+
+
+def test_topic_named_for_the_seat_reaches_it_without_a_mention(seat):
+    """ADR-0009 §1: one topic per arch↔component conversation. The topic addresses."""
+    transport = FakeTransport(event_batches=[{"result": "success", "events": [
+        _event(501, "agent-comms: please finish the client"),
+    ]}])
+    stored = operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
+    assert stored == 1
+    assert operations.inbox()[0].reason == "topic addressed to this seat"
+
+
+def test_project_shaped_topic_prefix_also_matches(seat):
+    transport = FakeTransport(event_batches=[{"result": "success", "events": [
+        _event(502, "agent-eco-agent-comms: a question"),
+    ]}])
+    assert operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1) == 1
+
+
+def test_topic_prefix_is_case_insensitive_and_space_tolerant(seat):
+    transport = FakeTransport(event_batches=[{"result": "success", "events": [
+        _event(503, "Agent-Comms : mixed case"),
+    ]}])
+    assert operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1) == 1
+
+
+def test_another_seats_topic_is_not_ours(seat):
+    """One channel per project: matching everything would wake every seat."""
+    transport = FakeTransport(event_batches=[{"result": "success", "events": [
+        _event(504, "dprox: something for someone else"),
+        _event(505, "general chatter"),
+    ]}])
+    assert operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1) == 0
+
+
+def test_explicit_mention_still_wins_in_any_topic(seat):
+    transport = FakeTransport(event_batches=[{"result": "success", "events": [
+        _event(506, "dprox: but they tagged us", flags=["mentioned"]),
+    ]}])
+    assert operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1) == 1
+    assert operations.inbox()[0].reason == "mentioned"
+
+
+def test_direct_message_reaches_the_seat(seat):
+    transport = FakeTransport(event_batches=[{"result": "success", "events": [
+        _event(507, "", mtype="private"),
+    ]}])
+    assert operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1) == 1
+    assert operations.inbox()[0].reason == "direct message"
+
+
+def test_a_seat_never_stores_its_own_messages(seat):
+    """Observed live: this seat's store held its own smoke test.
+
+    A seat posts to a topic named after itself, so the topic rule would return
+    every one of its own messages — it would read its own words back as an ask.
+    """
+    own = {"id": 601, "type": "message", "flags": ["mentioned"], "message": {
+        "id": 601, "sender_full_name": "agent-comms",
+        "sender_email": "agent-eco-agent-comms-bot@example.com",
+        "display_recipient": "agent-eco", "subject": "agent-comms: my own post",
+        "content": "something I said", "timestamp": 1, "stream_id": 7, "type": "stream"}}
+    transport = FakeTransport(event_batches=[{"result": "success", "events": [own]}])
+    assert operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1) == 0
+
+
+def test_someone_else_in_our_topic_still_reaches_us(seat):
+    other = {"id": 602, "type": "message", "flags": [], "message": {
+        "id": 602, "sender_full_name": "Oliver Blakeman", "sender_email": "ojblakeman@gmail.com",
+        "display_recipient": "agent-eco", "subject": "agent-comms: a real ask",
+        "content": "please look at this", "timestamp": 1, "stream_id": 7, "type": "stream"}}
+    transport = FakeTransport(event_batches=[{"result": "success", "events": [other]}])
+    assert operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1) == 1

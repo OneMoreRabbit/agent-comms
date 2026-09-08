@@ -13,14 +13,25 @@ class FakeTransport:
         subscriptions: list[str] | None = None,
         register_result: dict | None = None,
         event_batches: list[dict] | None = None,
+        full_name: str = "agent-eco-agent-comms",
+        is_bot: bool = True,
     ) -> None:
         self.subscriptions = subscriptions if subscriptions is not None else ["agent-eco"]
+        self.full_name = full_name
+        self.is_bot = is_bot
         self.register_result = register_result
         self.event_batches = list(event_batches or [])
         self.register_calls: list[dict] = []
         self.sent: list[dict] = []
 
     def call_endpoint(self, url: str, method: str = "GET", request: dict | None = None) -> dict:
+        if url == "users/me":
+            return {
+                "result": "success",
+                "full_name": self.full_name,
+                "email": "agent-eco-agent-comms-bot@example.com",
+                "is_bot": self.is_bot,
+            }
         if url == "users/me/subscriptions":
             return {
                 "result": "success",

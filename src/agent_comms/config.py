@@ -33,8 +33,17 @@ DEFAULT_LIFESPAN_SECS = 3600
 
 #: Zulip added the register-response echo of the queue lifespan
 #: (`idle_queue_timeout_secs`) at feature level 481 / Zulip 12.0. Below this the
-#: value cannot be read back at all — see `hub.register_queue`.
+#: value cannot be read back at all — see `hub.verify_lifespan`.
 LIFESPAN_ECHO_FEATURE_LEVEL = 481
+
+#: The feature level the estate verified **in the running server's source** —
+#: `zerver/tornado/event_queue.py` on hub-1, reported in
+#: `agent-comms-hub-response` 0.2: `lifespan_secs` is client-set per queue, with
+#: no server-side cap in the handler. On this exact server the lifespan is
+#: therefore honoured, and saying otherwise at every connect is noise rather than
+#: diligence. The estate pins the Zulip image and commits to announcing upgrades
+#: and re-verifying, which is what makes a pinned level safe to trust.
+SOURCE_VERIFIED_FEATURE_LEVEL = 372
 
 
 class Identity(BaseModel):
@@ -53,14 +62,104 @@ class Identity(BaseModel):
         """`~/.secrets/zuliprc-<project>-<seat>`, per the hub interface response."""
         return Path.home() / ".secrets" / f"zuliprc-{self.bot_name}"
 
+    def canonical_names(self, role: str = "component") -> tuple[str, ...]:
+        """Names this seat's bot may carry, per ADR-0009 §7a — by ROLE, not pattern.
+
+        §7a's requirement is **unambiguity in every channel the bot appears in**.
+        The canonical form follows from where a bot appears, so it is conditional
+        on role rather than a flat pattern — and mistaking the pattern for the
+        requirement produces `blocks-blocks-service`, which is worse at the job.
+
+        - **component** — appears only in its own project's channel, where the
+          project is implied, so `<seat>` is unambiguous. `<project>-<seat>` is
+          also unambiguous, just verbose, so it is accepted rather than warned on.
+        - **arch** — appears in several channels, so it **must** carry its
+          project. A bare `<seat>` genuinely is ambiguous there, and is warned on.
+        """
+        if role == "arch":
+            return (self.bot_name,)
+        return (self.seat, self.bot_name)
+
+    @property
+    def bot_names(self) -> tuple[str, ...]:
+        return self.canonical_names()
+
+    @property
+    def credential_candidates(self) -> list[Path]:
+        """Credential paths, in the order the estate actually delivers them.
+
+        `zuliprc-<seat>` first: that is what a component seat gets under §7a.
+        `zuliprc-<project>-<seat>` second, which is what an arch seat gets. This
+        client warned about the first as a divergence until §7a ruled it correct
+        — a warning that always fires is one nobody reads.
+        """
+        secrets = Path.home() / ".secrets"
+        return [secrets / f"zuliprc-{self.seat}", self.credential_path]
+
 
 class Settings(BaseModel):
     """Everything the client needs once comms is on."""
 
     identity: Identity
     channel: str = Field(description="The project channel this seat watches.")
+    role: str = Field(
+        default="component",
+        description=(
+            "component | arch | estate. Decides the canonical bot name under "
+            "ADR-0009 §7a: a component bot appears only in its own channel so the "
+            "seat name alone is unambiguous; an arch bot appears in several so it "
+            "must carry its project."
+        ),
+    )
+    model: str | None = Field(
+        default=None,
+        description=(
+            "The runtime this seat drives, declared by the estate in ~/.seat/seat.yml "
+            "(ADR-0009 §7g). A free string, so a future runtime needs no code change "
+            "here. Absent means the pane scan runs as a last resort."
+        ),
+    )
+    codex_thread_selection: str | None = Field(
+        default=None,
+        description=(
+            "Opt-in tie-break when several codex threads are loaded. Only "
+            "'most-recent' is understood, and it must be DECLARED — inferring it "
+            "silently is ADR-0009 §7g's failure one layer down (arch, 2026-09-08). "
+            "Absent, several loaded threads is a refusal, reported loudly."
+        ),
+    )
+    model_session: str | None = Field(
+        default=None,
+        description=(
+            "Where the seat's runtime is: a tmux target for Claude, a session name or "
+            "UUID for codex. Declared beside `model` in ~/.seat/seat.yml, because where "
+            "a seat's agent runs is a property of the seat — the estate launches it. "
+            "Absent, the target is searched for and the log line says so."
+        ),
+    )
     lifespan_secs: int = DEFAULT_LIFESPAN_SECS
     state_dir: Path = Field(default_factory=lambda: Path.home() / ".comms")
+    wake: bool = Field(
+        default=False,
+        description=(
+            "Deliver each mention into the seat's running agent session (ADR-0009 §7b). "
+            "Off by default: turning a seat from receiving to acting is a consumer's "
+            "decision, not a package default."
+        ),
+    )
+    agent_commands: tuple[str, ...] = Field(
+        default=("claude", "codex"),
+        description="Pane commands that mean an agent is running. Empirical, so settable.",
+    )
+    notify_command: str | None = Field(
+        default=None,
+        description=(
+            "Optional command run once per mention, with the mention as JSON on stdin. "
+            "This is the hand-off to the seat's comms conversation. The client does not "
+            "decide how a seat surfaces a mention — only that it is never the working "
+            "session (contract §3, 'Non-invasive')."
+        ),
+    )
 
     @field_validator("lifespan_secs")
     @classmethod
@@ -77,6 +176,13 @@ class Credential(BaseModel):
     key: str
     site: str
     source: str = Field(description="Where it came from, for `comms doctor` output.")
+    #: Non-fatal divergences found while loading. Surfaced, never swallowed.
+    notices: list[str] = Field(default_factory=list)
+
+    def __repr__(self) -> str:  # pragma: no cover - defensive
+        return f"Credential(email={self.email!r}, site={self.site!r}, source={self.source!r})"
+
+    __str__ = __repr__
 
     @field_validator("site")
     @classmethod
@@ -107,7 +213,8 @@ def _seat_manifest(path: Path | None = None) -> dict[str, str]:
             continue
         key, _, value = line.partition(":")
         key = key.strip()
-        if key in ("project", "seat"):
+        if key in ("project", "seat", "model", "model_session",
+                   "codex_thread_selection", "role"):
             out[key] = value.strip().strip("'\"")
     return out
 
@@ -158,10 +265,21 @@ def load_settings(state_dir: Path | None = None, seat_manifest: Path | None = No
     identity = Identity(project=project, seat=seat)
     return Settings(
         identity=identity,
+        model=os.environ.get("AGENT_COMMS_MODEL") or manifest.get("model"),
+        model_session=os.environ.get("AGENT_COMMS_SESSION") or manifest.get("model_session"),
+        codex_thread_selection=manifest.get("codex_thread_selection"),
+        role=manifest.get("role") or ("arch" if seat == "arch" or seat.endswith("-arch") else "component"),
         channel=os.environ.get("AGENT_COMMS_CHANNEL") or file_cfg.get("channel") or project,
         lifespan_secs=int(file_cfg.get("lifespan_secs", DEFAULT_LIFESPAN_SECS)),
         state_dir=state_dir,
+        notify_command=os.environ.get("AGENT_COMMS_NOTIFY") or file_cfg.get("notify_command"),
+        wake=_flag(os.environ.get("AGENT_COMMS_WAKE")) or bool(file_cfg.get("wake")),
+        agent_commands=tuple(file_cfg.get("agent_commands", ("claude", "codex"))),
     )
+
+
+def _flag(raw: str | None) -> bool:
+    return (raw or "").strip().lower() in ("1", "true", "yes")
 
 
 def _reject_insecure(values: dict, origin: str) -> None:
@@ -204,14 +322,17 @@ def load_credential(identity: Identity) -> Credential:
             )
         return Credential(email=env_email, key=env_key, site=site, source="environment")
 
-    path = identity.credential_path
-    if not path.exists():
+    candidates = identity.credential_candidates
+    path = next((p for p in candidates if p.exists()), None)
+    if path is None:
         raise CredentialMissing(
-            f"comms is enabled but no credential exists at {path}. The estate mints the "
-            f"bot '{identity.bot_name}' and delivers this file; until it does, this seat "
+            f"comms is enabled but no credential exists at {candidates[0]}. The estate mints "
+            f"the bot '{identity.bot_name}' and delivers this file; until it does, this seat "
             "cannot connect. This is reported as broken rather than quiet precisely "
             "because it is indistinguishable from 'comms disabled' on disk."
         )
+
+    notices: list[str] = []
 
     try:
         raw = path.read_text(encoding="utf-8")
@@ -248,5 +369,9 @@ def load_credential(identity: Identity) -> Credential:
         )
 
     return Credential(
-        email=values["email"], key=values["key"], site=values["site"], source=str(path)
+        email=values["email"],
+        key=values["key"],
+        site=values["site"],
+        source=str(path),
+        notices=notices,
     )

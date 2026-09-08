@@ -84,3 +84,26 @@ class QueueGapError(CommsError):
     """The event queue was garbage-collected and events in the gap are lost."""
 
     tag = "queue-gap"
+
+
+class DaemonAlreadyRunning(CommsError):
+    """Another daemon already holds this seat's lock.
+
+    Two daemons on one bot means two event queues, so every mention is
+    processed twice — including handed twice to `notify_command`. Silent
+    duplication is worse than a refusal to start, so this refuses.
+    """
+
+    tag = "daemon-running"
+
+
+class ConflictingWakeTriggers(CommsError):
+    """Both wake triggers are configured, and each would deliver the message.
+
+    `notify_command` is canonical. `wake = true` is the built-in shorthand for
+    the same thing. Set together they fire twice, and a seat that answers every
+    mention twice looks like a hub bug and gets diagnosed as one — so this
+    refuses at startup rather than delivering double.
+    """
+
+    tag = "conflicting-wake-triggers"

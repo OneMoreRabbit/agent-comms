@@ -7,7 +7,9 @@ so a partially-written file costs one line rather than the history.
 
 from __future__ import annotations
 
+import fcntl
 import json
+import os
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,6 +27,9 @@ class Mention:
     timestamp: int
     permalink: str
     read: bool = False
+    #: Why this message was stored — mention, topic, or direct message. Shown in
+    #: the inbox so a seat can tell an explicit summons from a topic it owns.
+    reason: str = "mentioned"
 
     @property
     def when(self) -> str:
@@ -40,6 +45,31 @@ class Store:
 
     def ensure(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+    def acquire_daemon_lock(self):
+        """Take the single-daemon lock, or raise `DaemonAlreadyRunning`.
+
+        An advisory `flock` on a file in the state directory. The OS releases it
+        when the process ends however it ends, so a killed daemon leaves no stale
+        lock to clear by hand — which a PID file would.
+        """
+        from .errors import DaemonAlreadyRunning
+
+        self.ensure()
+        lock_path = self.root / "daemon.lock"
+        handle = lock_path.open("w", encoding="utf-8")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            handle.close()
+            raise DaemonAlreadyRunning(
+                f"another comms daemon already holds {lock_path}. Two daemons on one bot "
+                "means two event queues, so every mention would be stored and handed to "
+                "notify_command twice. Stop the running one first."
+            ) from None
+        handle.write(str(os.getpid()))
+        handle.flush()
+        return handle
 
     # -- messages ----------------------------------------------------------
 
@@ -104,6 +134,31 @@ class Store:
             return json.loads(self.state.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return None
+
+    # -- sleeping state ----------------------------------------------------
+
+    def sleeping(self) -> bool:
+        """Have we already told senders this seat has no agent running?"""
+        return (self.root / "sleeping").exists()
+
+    def set_sleeping(self, value: bool) -> None:
+        self.ensure()
+        marker = self.root / "sleeping"
+        if value:
+            marker.touch()
+        elif marker.exists():
+            marker.unlink()
+
+    def unreachable(self) -> bool:
+        return (self.root / "unreachable").exists()
+
+    def set_unreachable(self, value: bool) -> None:
+        self.ensure()
+        marker = self.root / "unreachable"
+        if value:
+            marker.touch()
+        elif marker.exists():
+            marker.unlink()
 
     # -- the audit line ----------------------------------------------------
 
