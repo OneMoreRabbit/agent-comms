@@ -151,6 +151,12 @@ def preflight(
         True,
         f"registered {registration.queue_id} at lifespan_secs={settings.lifespan_secs}",
     )
+
+    # Deliverability is a separate question from connectivity, and the one that
+    # went unnoticed for 21 minutes in the live incident.
+    from .session import status as _sess
+    sess = _sess(settings)
+    report.add("deliverable", sess.live, sess.detail)
     report.warnings.extend(registration.warnings)
     report.notes.extend(registration.notes)
     return report
@@ -312,13 +318,17 @@ def wake_agent(
             model=settings.model,
             session=settings.model_session,
             agent_commands=settings.agent_commands,
+            selection=settings.codex_thread_selection,
         )
     except WakeError as exc:
         store.record("warn", f"wake failed for message {mention.get('id')}: {exc}")
         _tell_sender(settings, store, mention, f"could not deliver that to my agent: {exc}",
                      transport_factory)
+        if "UNREACHABLE" in str(exc):
+            _announce_unreachable(settings, store, str(exc), transport_factory)
         raise
 
+    store.set_unreachable(False)
     queued = outcome.startswith("queued")
     store.record("info" if not queued else "warn", f"wake: {outcome}")
     if queued:
@@ -335,6 +345,52 @@ def wake_agent(
     else:
         store.set_sleeping(False)
     return outcome
+
+
+def _announce_unreachable(
+    settings: Settings,
+    store: Store,
+    report: str,
+    transport_factory: Callable[[Credential], Transport],
+) -> None:
+    """Say on the channel that this seat cannot be reached, and how to fix it.
+
+    Arch's position, 2026-09-08: the refusal is right, its **silence** is the
+    defect. A seat was unreachable for 21 minutes because the sender saw a
+    refusal and nobody watching the seat learned it was offline. This posts to a
+    findable topic of the seat's own so anyone looking at the project sees it,
+    not only whoever happened to message.
+
+    Announced once per outage and cleared on the next success, because a seat
+    repeating "I am unreachable" every message is the noise that gets skipped.
+    """
+    if store.unreachable():
+        return
+    store.set_unreachable(True)
+    seat = settings.identity.seat
+    _post(
+        settings, store, settings.channel, f"{seat}: unreachable",
+        f"**{seat} cannot receive messages.**\n\n{report}\n\n"
+        "Messages are held in this seat's inbox meanwhile — nothing is lost, but "
+        "nothing is being read either.",
+        transport_factory,
+    )
+
+
+def _post(
+    settings: Settings,
+    store: Store,
+    channel: str,
+    topic: str,
+    text: str,
+    transport_factory: Callable[[Credential], Transport],
+) -> None:
+    try:
+        credential = load_credential(settings.identity)
+        hub = Hub(transport_factory(credential), settings, credential)
+        hub.send(channel, topic, text)
+    except Exception as exc:
+        store.record("warn", f"could not post to {topic!r}: {exc}")
 
 
 def _tell_sender(

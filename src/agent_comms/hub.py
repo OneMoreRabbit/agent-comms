@@ -102,7 +102,7 @@ class Hub:
         arch bot carries its project as `<project>-<seat>`. Either is correct;
         anything else is reported, not refused.
         """
-        accepted = self._settings.identity.bot_names
+        accepted = self._settings.identity.canonical_names(self._settings.role)
         result = self._t.call_endpoint(url="users/me", method="GET")
         if result.get("result") != "success":
             return [f"could not read this bot's own identity ({result.get('msg') or result!r})"]
@@ -110,11 +110,12 @@ class Hub:
         notices: list[str] = []
         actual = result.get("full_name") or ""
         if actual not in accepted:
+            expected = " or ".join(f"'{n}'" for n in accepted)
             notices.append(
-                f"bot is named '{actual}', which is neither '{accepted[0]}' nor "
-                f"'{accepted[1]}'. ADR-0009 §7a requires a bot's name to be unambiguous in "
-                "every channel it appears in, and this one does not identify the seat it "
-                "speaks for — so a message from it cannot be traced back by name alone."
+                f"bot is named '{actual}', and this {self._settings.role} seat's canonical "
+                f"name is {expected}. ADR-0009 §7a requires a bot's name to be unambiguous "
+                "in every channel it appears in; this one does not identify the seat it "
+                "speaks for, so a message from it cannot be traced back by name alone."
             )
         if not result.get("is_bot"):
             notices.append(

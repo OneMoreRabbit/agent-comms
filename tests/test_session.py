@@ -159,3 +159,53 @@ def test_wake_still_cannot_start_a_session(monkeypatch):
         {"id": 1, "sender": "arch", "topic": "t", "content": "go"}, model="claude"
     )
     assert outcome.startswith("queued")
+
+
+# -- deliverability is visible, not just refused ------------------------------
+
+def test_doctor_reports_deliverability_separately_from_connectivity(seat, monkeypatch):
+    """The 21-minute outage was invisible because nothing checked this.
+
+    A seat can be perfectly connected to the hub and still unable to receive.
+    """
+    from tests.conftest import FakeTransport
+
+    from agent_comms import operations
+
+    monkeypatch.setattr(session_mod, "tmux_available", lambda: True)
+    monkeypatch.setattr(session_mod, "list_panes", lambda: [])
+    monkeypatch.setattr(session_mod, "find_runtime_panes", lambda p, r: [])
+    report = operations.preflight(transport_factory=lambda c: FakeTransport())
+    names = [n for n, _, _ in report.checks]
+    assert "deliverable" in names
+    assert report.ok is False, "a connected but undeliverable seat must not read as fine"
+
+
+def test_an_unreachable_seat_announces_itself_once(seat, monkeypatch):
+    """Announced on the channel so watchers learn it, not only the sender —
+    and once, because a seat repeating itself is the noise that gets skipped."""
+    from agent_comms import operations
+    from agent_comms import wake as wake_mod
+
+    def refuse(*a, **k):
+        raise wake_mod.WakeError("UNREACHABLE: 2 codex threads are loaded")
+
+    monkeypatch.setattr(operations, "wake", refuse)
+    posted = []
+
+    class T:
+        def call_endpoint(self, url, method="GET", request=None):
+            posted.append(request)
+            return {"result": "success", "id": 1}
+
+    for i in (1, 2, 3):
+        with pytest.raises(wake_mod.WakeError):
+            operations.wake_agent(
+                {"id": i, "sender": "arch", "topic": "t", "content": "go",
+                 "channel": "agent-eco"},
+                lambda c: T(),
+            )
+
+    topics = [p["topic"] for p in posted]
+    assert topics.count("agent-comms: unreachable") == 1, "announced once per outage"
+    assert any("cannot receive messages" in p["content"] for p in posted)

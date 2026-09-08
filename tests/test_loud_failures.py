@@ -241,7 +241,8 @@ def test_doctor_reports_every_check_not_just_the_first(seat):
     """An operator debugging a seat wants the whole picture."""
     report = operations.preflight(transport_factory=lambda c: FakeTransport())
     names = [n for n, _, _ in report.checks]
-    assert names == ["enabled", "credential", "identity", "subscription", "event queue"]
+    assert names == ["enabled", "credential", "identity", "subscription",
+                     "event queue", "deliverable"]
     assert report.ok
     assert report.warnings == []
     assert any("Honoured" in n for n in report.notes)

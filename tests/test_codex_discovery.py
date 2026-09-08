@@ -111,7 +111,7 @@ def test_two_live_threads_refuse_rather_than_pick(codex_home, monkeypatch):
     _lock(codex_home, "two")
     monkeypatch.setattr(wake_mod, "codex_daemon_running", lambda: True)
     monkeypatch.setattr(wake_mod.shutil, "which", lambda n: "/usr/bin/codex")
-    with pytest.raises(WakeError, match="no single answer"):
+    with pytest.raises(WakeError, match="UNREACHABLE"):
         wake(MENTION, model="codex")
 
 
@@ -122,3 +122,43 @@ def test_no_live_thread_queues(codex_home, monkeypatch):
     outcome = wake(MENTION, model="codex")
     assert outcome.startswith("queued")
     assert "never starts an agent" in outcome
+
+
+# -- P1: the refusal must be loud, and never a guess --------------------------
+
+def test_the_refusal_names_the_threads_their_age_and_the_remedy(codex_home, monkeypatch):
+    """§9: the refusal was right; its silence was the defect. A seat was
+    unreachable for 21 minutes because nobody watching it learned that."""
+    _lock(codex_home, "aaa")
+    _lock(codex_home, "bbb")
+    monkeypatch.setattr(wake_mod, "codex_daemon_running", lambda: True)
+    monkeypatch.setattr(wake_mod.shutil, "which", lambda n: "/usr/bin/codex")
+    with pytest.raises(WakeError) as exc:
+        wake(MENTION, model="codex")
+    text = str(exc.value)
+    assert "UNREACHABLE" in text
+    assert "aaa" in text and "bbb" in text
+    assert "last active" in text
+    assert "codex archive" in text
+
+
+def test_most_recent_is_only_used_when_declared(codex_home, monkeypatch):
+    """Declared, not inferred. §7g one layer down is still §7g."""
+    import os
+    import time
+
+    _lock(codex_home, "older")
+    time.sleep(0.02)
+    _lock(codex_home, "newer")
+    os.utime(codex_home / "thread-writer-locks" / "newer.lock", (time.time(), time.time()))
+
+    monkeypatch.setattr(wake_mod, "codex_daemon_running", lambda: True)
+    monkeypatch.setattr(wake_mod.shutil, "which", lambda n: "/usr/bin/codex")
+    monkeypatch.setattr(wake_mod, "codex_lock_threads", lambda: ["older", "newer"])
+    ran = []
+    monkeypatch.setattr(wake_mod, "_run", lambda cmd: (ran.append(cmd), _Ok())[1])
+
+    outcome = wake(MENTION, model="codex", selection="most-recent")
+    assert "CHOSE most-recent" in outcome
+    assert "was a choice, not a lookup" in outcome
+    assert ran[0][3] == "newer"

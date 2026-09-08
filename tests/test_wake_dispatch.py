@@ -186,7 +186,7 @@ def test_codex_with_several_loaded_sessions_refuses(monkeypatch):
     monkeypatch.setattr(wake_mod, "codex_daemon_running", lambda: True)
     monkeypatch.setattr(wake_mod.shutil, "which", lambda n: "/usr/bin/codex")
     monkeypatch.setattr(wake_mod, "codex_live_threads", lambda: (["a", "b"], "writer locks"))
-    with pytest.raises(WakeError, match="no single answer"):
+    with pytest.raises(WakeError, match="UNREACHABLE"):
         wake(MENTION, model="codex")
 
 

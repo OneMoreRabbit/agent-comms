@@ -62,17 +62,27 @@ class Identity(BaseModel):
         """`~/.secrets/zuliprc-<project>-<seat>`, per the hub interface response."""
         return Path.home() / ".secrets" / f"zuliprc-{self.bot_name}"
 
+    def canonical_names(self, role: str = "component") -> tuple[str, ...]:
+        """Names this seat's bot may carry, per ADR-0009 §7a — by ROLE, not pattern.
+
+        §7a's requirement is **unambiguity in every channel the bot appears in**.
+        The canonical form follows from where a bot appears, so it is conditional
+        on role rather than a flat pattern — and mistaking the pattern for the
+        requirement produces `blocks-blocks-service`, which is worse at the job.
+
+        - **component** — appears only in its own project's channel, where the
+          project is implied, so `<seat>` is unambiguous. `<project>-<seat>` is
+          also unambiguous, just verbose, so it is accepted rather than warned on.
+        - **arch** — appears in several channels, so it **must** carry its
+          project. A bare `<seat>` genuinely is ambiguous there, and is warned on.
+        """
+        if role == "arch":
+            return (self.bot_name,)
+        return (self.seat, self.bot_name)
+
     @property
     def bot_names(self) -> tuple[str, ...]:
-        """The names this seat's bot may legitimately carry, per ADR-0009 §7a.
-
-        §7a ruled that the requirement is **unambiguity in every channel the bot
-        appears in**, not the `<project>-<seat>` pattern. A component bot appears
-        only in its own project's channel, so the seat name alone is unambiguous
-        there; an arch bot appears in several, so it carries its project. Both
-        shapes are live in the estate, and both are correct.
-        """
-        return (self.seat, self.bot_name)
+        return self.canonical_names()
 
     @property
     def credential_candidates(self) -> list[Path]:
@@ -92,12 +102,30 @@ class Settings(BaseModel):
 
     identity: Identity
     channel: str = Field(description="The project channel this seat watches.")
+    role: str = Field(
+        default="component",
+        description=(
+            "component | arch | estate. Decides the canonical bot name under "
+            "ADR-0009 §7a: a component bot appears only in its own channel so the "
+            "seat name alone is unambiguous; an arch bot appears in several so it "
+            "must carry its project."
+        ),
+    )
     model: str | None = Field(
         default=None,
         description=(
             "The runtime this seat drives, declared by the estate in ~/.seat/seat.yml "
             "(ADR-0009 §7g). A free string, so a future runtime needs no code change "
             "here. Absent means the pane scan runs as a last resort."
+        ),
+    )
+    codex_thread_selection: str | None = Field(
+        default=None,
+        description=(
+            "Opt-in tie-break when several codex threads are loaded. Only "
+            "'most-recent' is understood, and it must be DECLARED — inferring it "
+            "silently is ADR-0009 §7g's failure one layer down (arch, 2026-09-08). "
+            "Absent, several loaded threads is a refusal, reported loudly."
         ),
     )
     model_session: str | None = Field(
@@ -185,7 +213,8 @@ def _seat_manifest(path: Path | None = None) -> dict[str, str]:
             continue
         key, _, value = line.partition(":")
         key = key.strip()
-        if key in ("project", "seat", "model", "model_session"):
+        if key in ("project", "seat", "model", "model_session",
+                   "codex_thread_selection", "role"):
             out[key] = value.strip().strip("'\"")
     return out
 
@@ -238,6 +267,8 @@ def load_settings(state_dir: Path | None = None, seat_manifest: Path | None = No
         identity=identity,
         model=os.environ.get("AGENT_COMMS_MODEL") or manifest.get("model"),
         model_session=os.environ.get("AGENT_COMMS_SESSION") or manifest.get("model_session"),
+        codex_thread_selection=manifest.get("codex_thread_selection"),
+        role=manifest.get("role") or ("arch" if seat == "arch" or seat.endswith("-arch") else "component"),
         channel=os.environ.get("AGENT_COMMS_CHANNEL") or file_cfg.get("channel") or project,
         lifespan_secs=int(file_cfg.get("lifespan_secs", DEFAULT_LIFESPAN_SECS)),
         state_dir=state_dir,

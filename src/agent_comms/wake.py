@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -357,6 +358,36 @@ def codex_daemon_running() -> bool:
     return True
 
 
+def codex_lock_details() -> list[tuple[str, float]]:
+    """Live codex thread ids with their lock mtimes, newest first.
+
+    The mtimes are for **reporting**, never for choosing. ADR-0009 §7g is
+    declared-not-scanned, and picking the most recent of several would be the
+    pane scan reproduced one layer down: right until a seat has two, which is
+    exactly when it matters. In the live incident the second thread was a
+    `codex fork` of the operator's session, so the "obvious" choice would have
+    delivered an arch instruction into a divergent context, silently.
+    """
+    lock_dir = os.path.join(_codex_home(), "thread-writer-locks")
+    out = []
+    try:
+        names = os.listdir(lock_dir)
+    except OSError:
+        return out
+    for name in names:
+        if name.startswith(".") or not name.endswith(".lock"):
+            continue
+        stem = name[: -len(".lock")]
+        if not stem:
+            continue
+        try:
+            mtime = os.path.getmtime(os.path.join(lock_dir, name))
+        except OSError:
+            mtime = 0.0
+        out.append((stem, mtime))
+    return sorted(out, key=lambda p: p[1], reverse=True)
+
+
 def codex_lock_threads() -> list[str]:
     """Live codex thread ids, from the writer locks the runtime maintains.
 
@@ -449,7 +480,36 @@ def codex_live_threads() -> tuple[list[str], str]:
         return [], "writer locks"
 
 
-def deliver_codex(mention: dict, session: str | None) -> str:
+def unreachable_report(loaded: list[str]) -> str:
+    """Why this seat cannot be delivered to, and the one action that fixes it.
+
+    §9's first failure is silence where there should be speech. In the live
+    incident a seat was unreachable for 21 minutes and nothing said so — the
+    sender saw a refusal, nobody watching the seat learned it was offline. The
+    refusal was right; its silence was the defect. So this names the competing
+    threads, their ages, and the remedy, and callers surface it beyond the sender.
+    """
+    details = {t: m for t, m in codex_lock_details()}
+    lines = []
+    for thread in sorted(loaded, key=lambda t: details.get(t, 0.0), reverse=True):
+        mtime = details.get(thread)
+        age = f"{(time.time() - mtime) / 60:.0f} min ago" if mtime else "unknown"
+        lines.append(f"  - {thread}  (last active {age})")
+    return (
+        f"UNREACHABLE: {len(loaded)} codex threads are loaded on this seat, and the "
+        "operator's standing requirement is one live session per seat — so this is a "
+        "broken invariant, not an ambiguity to resolve by guessing.\n"
+        + "\n".join(lines)
+        + "\n\nNothing is delivered while this holds: choosing between them would risk "
+        "delivering into a forked or divergent session, and a wrong delivery is worse "
+        "than a refused one.\n"
+        "Remedy (one action): close the extra session, or `codex archive <thread-id>` "
+        "the fork, leaving exactly one loaded. Alternatively declare "
+        "`model_session` in ~/.seat/seat.yml to name the one that should receive."
+    )
+
+
+def deliver_codex(mention: dict, session: str | None, selection: str | None = None) -> str:
     """Inject a turn through codex's own channel — no tmux involved.
 
     `codex queue --thread <session> --message <text>` reaches the app-server
@@ -485,13 +545,19 @@ def deliver_codex(mention: dict, session: str | None) -> str:
                 "message never starts an agent — this waits in the inbox."
             )
         if len(loaded) > 1:
-            raise WakeError(
-                f"{len(loaded)} codex sessions are loaded on this seat "
-                f"({', '.join(loaded[:4])}{'…' if len(loaded) > 4 else ''}) and none is "
-                "declared, so there is no single answer to which one this message is for. "
-                "Declare model_session in ~/.seat/seat.yml, or leave one session loaded."
-            )
-        target, how = loaded[0], f"discovered via {route}"
+            if selection == "most-recent":
+                # Declared, not inferred (arch position, 2026-09-08). The seat owner
+                # opted into this knowingly; the outcome says it was a choice so the
+                # risk is visible in the log rather than silent.
+                chosen = codex_lock_details()[0][0]
+                target, how = chosen, (
+                    f"CHOSE most-recent of {len(loaded)} loaded threads, per declared "
+                    "codex_thread_selection — this was a choice, not a lookup"
+                )
+            else:
+                raise WakeError(unreachable_report(loaded))
+        else:
+            target, how = loaded[0], f"discovered via {route}"
 
     # Only hand a message to `codex queue` if the thread is actually LOADED.
     #
@@ -557,6 +623,7 @@ def wake(
     model: str | None = None,
     session: str | None = None,
     agent_commands: tuple[str, ...] = DEFAULT_AGENT_COMMANDS,
+    selection: str | None = None,
 ) -> str:
     """Deliver a mention to this seat's declared runtime, at its declared target.
 
@@ -572,7 +639,7 @@ def wake(
     target = (session or "").strip() or None
 
     if declared.casefold() == "codex":
-        return deliver_codex(mention, target)
+        return deliver_codex(mention, target, selection)
 
     if declared.casefold() == "claude":
         return deliver_claude(mention, target)

@@ -149,6 +149,17 @@ class Store:
         elif marker.exists():
             marker.unlink()
 
+    def unreachable(self) -> bool:
+        return (self.root / "unreachable").exists()
+
+    def set_unreachable(self, value: bool) -> None:
+        self.ensure()
+        marker = self.root / "unreachable"
+        if value:
+            marker.touch()
+        elif marker.exists():
+            marker.unlink()
+
     # -- the audit line ----------------------------------------------------
 
     def record(self, level: str, message: str) -> None:
