@@ -30,6 +30,10 @@ class Mention:
     #: Why this message was stored — mention, topic, or direct message. Shown in
     #: the inbox so a seat can tell an explicit summons from a topic it owns.
     reason: str = "mentioned"
+    #: Is the sender one this seat accepts direction from (ADR-0009 §9)?
+    #: An unauthorised message is still stored and shown — the agent must be able
+    #: to report it — but it is never presented as an instruction.
+    authorised: bool = True
 
     @property
     def when(self) -> str:

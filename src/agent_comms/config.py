@@ -119,6 +119,17 @@ class Settings(BaseModel):
             "here. Absent means the pane scan runs as a last resort."
         ),
     )
+    authority: tuple[str, ...] = Field(
+        default=(),
+        description=(
+            "Bots this seat accepts DIRECTION from (ADR-0009 §9). Declared by the "
+            "estate, never by the seat: a seat widening its own accepted-sender list "
+            "is the one edit no boundary should permit. Read from ~/.seat/seat.yml, "
+            "which is deployer-owned and never hand-edited on the seat — not from "
+            "comms config, which is closer to the seat's own hand. Empty means the "
+            "default: this seat's own arch bot."
+        ),
+    )
     codex_thread_selection: str | None = Field(
         default=None,
         description=(
@@ -214,7 +225,7 @@ def _seat_manifest(path: Path | None = None) -> dict[str, str]:
         key, _, value = line.partition(":")
         key = key.strip()
         if key in ("project", "seat", "model", "model_session",
-                   "codex_thread_selection", "role"):
+                   "codex_thread_selection", "role", "comms_authority"):
             out[key] = value.strip().strip("'\"")
     return out
 
@@ -268,6 +279,7 @@ def load_settings(state_dir: Path | None = None, seat_manifest: Path | None = No
         model=os.environ.get("AGENT_COMMS_MODEL") or manifest.get("model"),
         model_session=os.environ.get("AGENT_COMMS_SESSION") or manifest.get("model_session"),
         codex_thread_selection=manifest.get("codex_thread_selection"),
+        authority=_authority(manifest.get("comms_authority"), project),
         role=manifest.get("role") or ("arch" if seat == "arch" or seat.endswith("-arch") else "component"),
         channel=os.environ.get("AGENT_COMMS_CHANNEL") or file_cfg.get("channel") or project,
         lifespan_secs=int(file_cfg.get("lifespan_secs", DEFAULT_LIFESPAN_SECS)),
@@ -276,6 +288,28 @@ def load_settings(state_dir: Path | None = None, seat_manifest: Path | None = No
         wake=_flag(os.environ.get("AGENT_COMMS_WAKE")) or bool(file_cfg.get("wake")),
         agent_commands=tuple(file_cfg.get("agent_commands", ("claude", "codex"))),
     )
+
+
+def _authority(raw: str | None, project: str) -> tuple[str, ...]:
+    """Who this seat accepts direction from, defaulting to its own arch bot.
+
+    ADR-0009 §9: the default is unchanged from §1a — a seat accepts direction
+    from its own arch seat, and anything else is one line per link added
+    deliberately by the estate.
+
+    The field name and site are **provisional**: §9 leaves "whether the mesh
+    table exists in the deployed `09devagents` today, and what the delivery
+    mechanism to seats is" open and owned by `ansible-platform`. `seat.yml`
+    alongside `model` is the leading candidate and the one this reads, because
+    it is deployer-owned and never hand-edited on the seat — which is the
+    property §9 actually requires. If the estate delivers it elsewhere, only
+    this function changes.
+    """
+    if raw:
+        names = tuple(n.strip() for n in raw.replace(",", " ").split() if n.strip())
+        if names:
+            return names
+    return (f"{project}-arch",)
 
 
 def _flag(raw: str | None) -> bool:

@@ -174,6 +174,16 @@ def _permalink(site: str, event_msg: dict) -> str:
     return f"{site}/#narrow/channel/{stream_id}-{slug}/topic/{quoted}/near/{event_msg['id']}"
 
 
+def is_authorised(settings: Settings, sender: str) -> bool:
+    """May this sender direct this seat? ADR-0009 §9.
+
+    Declared by the estate, defaulting to the seat's own arch bot. Compared on
+    the bot's display name, which is what attribution rests on (§1a) — the same
+    name a human reads in the channel.
+    """
+    return sender.strip().casefold() in {a.casefold() for a in settings.authority}
+
+
 def addressed_to_seat(
     settings: Settings, msg: dict, flags: list[str], own_email: str | None = None
 ) -> str | None:
@@ -235,6 +245,9 @@ def mention_from_event(
         timestamp=msg.get("timestamp", 0),
         permalink=_permalink(site, msg),
         reason=reason,
+        authorised=is_authorised(
+            settings, msg.get("sender_full_name") or msg.get("sender_email", "")
+        ),
     )
 
 
@@ -345,6 +358,33 @@ def wake_agent(
     else:
         store.set_sleeping(False)
     return outcome
+
+
+def _report_undeclared(
+    settings: Settings,
+    store: Store,
+    mention: Mention,
+    transport_factory: Callable[[Credential], Transport],
+) -> None:
+    """Raise an undeclared sender with the arch seat, per §1a's report half.
+
+    "Report, never comply" only works if the reporting is mechanical. Left to the
+    agent it depends on the agent noticing, which is the aspirational version §9
+    exists to replace.
+    """
+    store.record("warn", f"undeclared sender {mention.sender!r} on message {mention.id}")
+    _post(
+        settings, store, mention.channel or settings.channel,
+        f"{settings.identity.seat}: undeclared sender",
+        f"**{mention.sender} directed {settings.identity.seat}, and is not a declared "
+        f"sender for this seat** (ADR-0009 §9). The message was stored and shown to the "
+        f"agent labelled *do not comply*; it has not been acted on.\n\n"
+        f"Declared senders: {', '.join(settings.authority)}.\n"
+        f"Cite: {mention.permalink}\n\n"
+        "If this should be actionable, the estate declares the link — the seat cannot "
+        "widen its own authority, which is the point of the rule.",
+        transport_factory,
+    )
 
 
 def _announce_unreachable(
@@ -469,6 +509,8 @@ def run_daemon(
                 continue
             store.append(mention)
             stored += 1
+            if not mention.authorised:
+                _report_undeclared(settings, store, mention, transport_factory)
             _deliver_to_agent(settings, store, mention, transport_factory)
             _notify(settings, store, mention)
             if on_mention is not None:
