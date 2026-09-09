@@ -10,7 +10,6 @@ import click
 
 from . import __version__, operations
 from .errors import CommsDisabled, CommsError, DaemonAlreadyRunning
-from .session import SessionError
 from .wake import WakeError
 
 #: Exit codes, so a consumer's supervisor can tell these apart mechanically.
@@ -117,33 +116,6 @@ def send(topic: str, content: str) -> None:
     click.echo("sent")
 
 
-@main.group()
-def session() -> None:
-    """The seat's one agent session — the thing a message is delivered into.
-
-    `comms wake` never starts a session (ADR-0009 §7e). These commands do, when a
-    supervisor calls them, on a standing policy with no reference to any message.
-    Both have to stay true together.
-    """
-
-
-@session.command("status")
-def session_status_cmd() -> None:
-    """Is this seat's one agent session live?"""
-    st = operations.session_status()
-    mark = click.style("live", fg="green") if st.live else click.style("not live", fg="yellow")
-    click.echo(f"session: {mark}\n  {st.detail}")
-    if not st.live:
-        sys.exit(EXIT_QUEUED)
-
-
-@session.command("ensure")
-@click.option("--workdir", default=None, help="Directory to start the session in.")
-def session_ensure_cmd(workdir: str | None) -> None:
-    """Start this seat's session if it has none. Idempotent; for a supervisor."""
-    click.echo(operations.session_ensure(workdir=workdir))
-
-
 @main.command()
 @click.option("--message-id", type=int, help="Wake with a message already in the store.")
 def wake(message_id: int | None) -> None:
@@ -195,10 +167,6 @@ def run() -> None:
     except DaemonAlreadyRunning as exc:
         click.echo(f"comms: already running\n\n{exc}")
         sys.exit(EXIT_ALREADY_RUNNING)
-    except SessionError as exc:
-        click.secho("comms: session", fg="red", bold=True, err=True)
-        click.echo(str(exc), err=True)
-        sys.exit(EXIT_FAULT)
     except WakeError as exc:
         click.secho("comms: wake failed", fg="red", bold=True, err=True)
         click.echo(str(exc), err=True)

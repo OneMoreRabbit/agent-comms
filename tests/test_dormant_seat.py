@@ -15,6 +15,7 @@ import pytest
 
 from agent_comms import operations
 from agent_comms import wake as wake_mod
+from agent_comms.seat import SeatStatus
 from tests.conftest import FakeTransport
 
 
@@ -33,22 +34,30 @@ def _wake_on(seat_dir):
 
 
 def _dormant(monkeypatch):
-    """No agent session anywhere."""
-    monkeypatch.setattr(wake_mod, "list_panes", lambda: [])
-    monkeypatch.setattr(wake_mod, "find_runtime_panes", lambda p, r: [])
+    """The seat says it cannot be spoken to."""
+    monkeypatch.setattr(
+        operations, "seat_status_now",
+        lambda: SeatStatus(verdict="not-addressable", reason="no live session",
+                           runtime="claude"),
+    )
+
+
+def _asleep(monkeypatch):
+    """Addressable but not attending — held, per the operator's ruling."""
+    monkeypatch.setattr(
+        operations, "seat_status_now",
+        lambda: SeatStatus(verdict="addressable", runtime="claude",
+                           target="rc:0.0", awake=False),
+    )
 
 
 def _awake(monkeypatch, delivered):
-    """A live, typeable session that records what it receives."""
+    """The seat says it can be spoken to, and we record what is typed into it."""
     monkeypatch.setattr(
-        wake_mod, "list_panes",
-        lambda: [wake_mod.Pane(target="rc:0.0", command="claude", path="/w", pid=1)],
+        operations, "seat_status_now",
+        lambda: SeatStatus(verdict="addressable", runtime="claude",
+                           target="rc:0.0", awake=True),
     )
-    monkeypatch.setattr(
-        wake_mod, "find_runtime_panes",
-        lambda p, r: [wake_mod.Pane(target="rc:0.0", command="claude", path="/w", pid=1)],
-    )
-    monkeypatch.setattr(wake_mod, "pane_blocked_reason", lambda t: None)
 
     def fake_tmux(*args):
         if args[0] == "send-keys" and "-l" in args:
@@ -62,6 +71,7 @@ def _awake(monkeypatch, delivered):
         return R()
 
     monkeypatch.setattr(wake_mod, "_tmux", fake_tmux)
+    monkeypatch.setattr(wake_mod.shutil, "which", lambda n: f"/usr/bin/{n}")
 
 
 # -- dormant: hold, do not lose ----------------------------------------------
@@ -193,3 +203,48 @@ def test_nothing_is_flushed_when_wake_is_off(seat, monkeypatch):
                                               "events": [_event(1001)]}])
     operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
     assert delivered == []
+
+
+def test_an_asleep_seat_holds_until_it_wakes(seat, monkeypatch):
+    """Operator ruling 2026-09-09: addressable + awake:false means hold.
+
+    We told skeleton in review that we would deliver here. That was wrong, and
+    this is the test that keeps it wrong-proof.
+    """
+    _wake_on(seat)
+    _asleep(monkeypatch)
+    transport = FakeTransport(event_batches=[{"result": "success",
+                                              "events": [_event(2001)]}])
+    operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
+
+    from agent_comms.store import Store
+    pending = Store(seat / ".comms").undelivered()
+    assert [m.id for m in pending] == [2001]
+
+    delivered = []
+    _awake(monkeypatch, delivered)
+    operations.run_daemon(
+        transport_factory=lambda c: FakeTransport(
+            event_batches=[{"result": "success", "events": []}]),
+        max_iterations=1,
+    )
+    assert len(delivered) == 1
+
+
+def test_a_seat_with_no_seat_command_holds_and_says_so(seat, monkeypatch):
+    """No legacy path: an un-updated seat holds visibly rather than guessing."""
+    from agent_comms.seat import SeatUnavailable
+
+    _wake_on(seat)
+
+    def unavailable():
+        raise SeatUnavailable("this seat has no `seat` command")
+
+    monkeypatch.setattr(operations, "seat_status_now", unavailable)
+    transport = FakeTransport(event_batches=[{"result": "success",
+                                              "events": [_event(2002)]}])
+    operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
+
+    from agent_comms.store import Store
+    assert [m.id for m in Store(seat / ".comms").undelivered()] == [2002]
+    assert "no `seat` command" in (seat / ".comms" / "events.log").read_text()
