@@ -13,7 +13,7 @@ import pytest
 
 from agent_comms import seat as seat_mod
 from agent_comms import wake as wake_mod
-from agent_comms.seat import SeatStatus, SeatUnavailable
+from agent_comms.seat import Awake, SeatStatus, SeatUnavailable
 from agent_comms.wake import WakeError, wake
 
 MENTION = {"id": 1, "sender": "arch", "topic": "t", "content": "go"}
@@ -87,16 +87,53 @@ def test_no_seat_command_raises_rather_than_guessing(monkeypatch):
 # -- awake: the operator's hold ruling ---------------------------------------
 
 def test_asleep_holds_even_though_addressable():
-    st = SeatStatus(verdict="addressable", runtime="claude", target="rc:0.0", awake=False)
-    outcome = wake(MENTION, st)
+    """Wakefulness comes from `seat awake`, its own command."""
+    st = SeatStatus(verdict="addressable", runtime="claude", target="rc:0.0")
+    outcome = wake(MENTION, st, Awake(state=False, reason="no live session"))
     assert outcome.startswith("queued")
-    assert "asleep" in outcome
+    assert "asleep" in outcome and "no live session" in outcome
 
 
-def test_awake_unstated_delivers():
-    """`awake: null` means the seat did not say — deliver on the verdict alone."""
-    st = SeatStatus(verdict="addressable", runtime="claude", target="rc:0.0", awake=None)
-    assert st.deliverable
+def test_cannot_tell_holds_like_a_no():
+    """`seat awake` exit 2. Undetermined is never treated as fine."""
+    st = SeatStatus(verdict="addressable", runtime="claude", target="rc:0.0")
+    outcome = wake(MENTION, st, Awake(state=None, reason="could not query"))
+    assert outcome.startswith("queued")
+    assert "unknown wakefulness" in outcome
+
+
+def test_awake_yes_delivers(monkeypatch):
+    calls = []
+
+    class Ok:
+        returncode = 0
+        stderr = ""
+        stdout = ""
+
+    monkeypatch.setattr(wake_mod, "_tmux", lambda *a: (calls.append(a), Ok())[1])
+    monkeypatch.setattr(wake_mod.shutil, "which", lambda n: f"/usr/bin/{n}")
+    st = SeatStatus(verdict="addressable", runtime="claude", target="rc:0.0")
+    assert wake(MENTION, st, Awake(state=True)) == "delivered to rc:0.0 (claude)"
+
+
+def test_wakefulness_is_not_read_off_status(monkeypatch):
+    """`seat status`'s awake field is not consulted — that was the bug.
+
+    On codex it is set by a branch that never reaches the app-server query, so a
+    live thread read asleep and every codex seat looked undeliverable.
+    """
+    calls = []
+
+    class Ok:
+        returncode = 0
+        stderr = ""
+        stdout = ""
+
+    monkeypatch.setattr(wake_mod, "_tmux", lambda *a: (calls.append(a), Ok())[1])
+    monkeypatch.setattr(wake_mod.shutil, "which", lambda n: f"/usr/bin/{n}")
+    # status says asleep; the dedicated command says awake. The command wins.
+    st = SeatStatus(verdict="addressable", runtime="claude", target="rc:0.0", awake=False)
+    assert wake(MENTION, st, Awake(state=True)).startswith("delivered")
 
 
 # -- sending: one mechanism per runtime, chosen by the seat -------------------
@@ -225,3 +262,24 @@ def test_landing_check_reads_the_thread_record(tmp_path, monkeypatch):
     assert wake_mod.codex_landed("thread-xyz", "LANDED-MARKER", wait=0) is True
     assert wake_mod.codex_landed("thread-xyz", "ABSENT-MARKER", wait=0) is False
     assert wake_mod.codex_landed("no-such-thread", "x", wait=0) is False
+
+
+def test_seat_awake_is_parsed(monkeypatch):
+    monkeypatch.setattr(seat_mod, "seat_available", lambda: True)
+    monkeypatch.setattr(seat_mod.subprocess, "run", lambda *a, **k: _reply({
+        "awake": True, "runtime": "codex",
+        "reason": "the app-server reports thread 01a0 loaded"}))
+    aw = seat_mod.awake()
+    assert aw.state is True and not aw.holds
+
+
+def test_seat_awake_unreadable_is_cannot_tell(monkeypatch):
+    class R:
+        returncode = 2
+        stdout = ""
+        stderr = "boom"
+
+    monkeypatch.setattr(seat_mod, "seat_available", lambda: True)
+    monkeypatch.setattr(seat_mod.subprocess, "run", lambda *a, **k: R())
+    aw = seat_mod.awake()
+    assert aw.state is None and aw.holds, "cannot tell must hold, like undetermined"

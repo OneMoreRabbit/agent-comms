@@ -26,6 +26,7 @@ from .errors import (
 )
 from .hub import Hub, Registration, Transport, build_transport
 from .seat import SeatStatus, SeatUnavailable
+from .seat import awake as seat_awake_now
 from .seat import status as seat_status_now
 from .wake import WakeError, wake
 from .store import Mention, Store
@@ -159,10 +160,13 @@ def preflight(
     # one source for the fact rather than two that can disagree.
     try:
         sess = seat_status_now()
-        report.add("deliverable", sess.deliverable,
-                   f"seat says {sess.verdict}"
-                   + (f" — {sess.reason}" if sess.reason else "")
-                   + (f" (awake={sess.awake})" if sess.awake is not None else ""))
+        detail = f"seat status: {sess.verdict}" + (f" — {sess.reason}" if sess.reason else "")
+        ok = sess.addressable
+        if sess.addressable:
+            aw = seat_awake_now()
+            ok = not aw.holds
+            detail += f" | seat awake: {aw.state}" + (f" — {aw.reason}" if aw.reason else "")
+        report.add("deliverable", ok, detail)
     except SeatUnavailable as exc:
         report.add("deliverable", False, str(exc))
     report.warnings.extend(registration.warnings)
@@ -345,11 +349,12 @@ def wake_agent(
 
     try:
         status = seat_status_now()
+        awake = seat_awake_now() if status.addressable else None
     except SeatUnavailable as exc:
         outcome = f"queued: {exc}"
     else:
         try:
-            outcome = wake(mention, status)
+            outcome = wake(mention, status, awake)
         except WakeError as exc:
             store.record("warn", f"delivery failed for message {mention.get('id')}: {exc}")
             _tell_sender(settings, store, mention,

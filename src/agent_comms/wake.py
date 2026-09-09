@@ -28,7 +28,7 @@ import shutil
 import subprocess
 import time
 
-from .seat import SeatStatus
+from .seat import Awake, SeatStatus
 
 #: How much of a message is sent inline before it is pointed at instead.
 INLINE_LIMIT = 1200
@@ -176,15 +176,32 @@ SENDERS = {"claude": send_claude, "codex": send_codex}
 # dispatch
 # ---------------------------------------------------------------------------
 
-def wake(mention: dict, status: SeatStatus) -> str:
+def wake(mention: dict, status: SeatStatus, awake: Awake | None = None) -> str:
     """Deliver a mention, or say why it is being held.
 
-    Returns a description of what happened. A returned string starting `queued:`
-    means held — the message stays in the store and is retried when the seat
-    next reports itself deliverable.
+    Two questions, two commands, each answered by the seat:
+
+    - `seat status` — can this seat be spoken to, and where?
+    - `seat awake`  — is its agent actually attending?
+
+    They are asked separately because they *are* separate, and because only the
+    dedicated command asks the runtime. Taking wakefulness off `status` was our
+    error: on codex that field is set by a branch that never reaches the
+    app-server, so a live thread read asleep.
+
+    A returned string starting `queued:` means held — the message stays in the
+    store and is retried when the seat next reports itself deliverable.
     """
-    if not status.deliverable:
+    if not status.addressable:
         return f"queued: {status.hold_reason()}"
+
+    if awake is not None and awake.holds:
+        state = "asleep" if awake.state is False else "of unknown wakefulness"
+        detail = f" — {awake.reason}" if awake.reason else ""
+        return (
+            f"queued: the seat is addressable but its agent is {state}{detail}. "
+            "Held until it wakes; waking is the operator's (ADR-0009 §7e)."
+        )
 
     runtime = (status.runtime or "").strip().casefold()
     sender = SENDERS.get(runtime)
