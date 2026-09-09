@@ -32,6 +32,25 @@ DEFAULT_AGENT_COMMANDS = ("claude", "codex")
 #: new fullscreen renderer?" reported `pane_current_command=claude` while
 #: consuming keystrokes as menu navigation. The orchestrator hit the same class
 #: independently with codex's per-directory trust prompt.
+#: Text that means a pane holds a live agent PROMPT, ready for a turn.
+#: Positive evidence, deliberately: the old check looked only for known blockers
+#: and treated "no blocker" as ready, which reported `delivered` into a
+#: remote-control pane showing nothing but reconnect lines.
+PROMPT_MARKERS = (
+    "for shortcuts",          # Claude idle hint
+    "auto mode on",           # Claude status line
+    "esc to interrupt",       # Claude, mid-turn — still a live session
+    "Ask Codex to do anything",
+    "/rc active",
+)
+
+#: Text that means a pane holds a remote-control CLIENT rather than an agent —
+#: observed on this seat: `[HH:MM:SS] Reconnected after 2s`, endlessly.
+NON_PROMPT_MARKERS = (
+    "Reconnected after",
+    "Resuming session",
+)
+
 BLOCKING_MARKERS = (
     "Enter to confirm",
     "Esc to cancel",
@@ -224,13 +243,36 @@ def pane_blocked_reason(target: str) -> str | None:
             f"could not read the pane to check it is ready for input "
             f"({(captured.stderr or '').strip()})"
         )
+    text = captured.stdout
     for marker in BLOCKING_MARKERS:
-        if marker in captured.stdout:
+        if marker in text:
             return (
                 f"the session is showing a prompt that captures keystrokes "
                 f"({marker!r}), so a message would be consumed as menu input rather "
                 "than read as a turn. Someone needs to answer it in the session first."
             )
+
+    # Positive confirmation, not merely the absence of a known blocker.
+    #
+    # This is the correction to the defect that cost two afternoons of roll
+    # calls: a pane running a remote-control client shows only reconnect lines,
+    # has no prompt, and swallows keystrokes — while this client reported
+    # `delivered`. A false `delivered` is worse than a refusal, because a queued
+    # message is visible and recoverable and a "delivered" one is neither.
+    for marker in NON_PROMPT_MARKERS:
+        if marker in text:
+            return (
+                f"the pane holds a remote-control client, not an agent prompt "
+                f"(showing {marker!r}). Keystrokes sent here reach no prompt. The agent "
+                "may be alive and reachable through its own UI — this seat simply has "
+                "no typeable session, which usually means no pinned conversation."
+            )
+    if not any(marker in text for marker in PROMPT_MARKERS):
+        return (
+            "no agent prompt is visible in this pane, so there is nothing to type "
+            "into. Refusing rather than reporting a delivery that cannot be confirmed "
+            "— a queued message is recoverable, a falsely 'delivered' one is not."
+        )
     return None
 
 

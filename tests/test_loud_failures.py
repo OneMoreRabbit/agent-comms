@@ -237,7 +237,8 @@ def test_doctor_treats_disabled_as_a_state_not_a_failure(seat):
     assert all(passed for _, passed, _ in report.checks)
 
 
-def test_doctor_reports_every_check_not_just_the_first(seat):
+def test_doctor_reports_every_check_not_just_the_first(seat, monkeypatch):
+    monkeypatch.setattr("agent_comms.session.pane_blocked_reason", lambda t: None)
     """An operator debugging a seat wants the whole picture."""
     report = operations.preflight(transport_factory=lambda c: FakeTransport())
     names = [n for n, _, _ in report.checks]
@@ -250,7 +251,8 @@ def test_doctor_reports_every_check_not_just_the_first(seat):
 
 # -- attribution: the bot must be who the vault thinks it is -----------------
 
-def test_component_bot_name_is_accepted_silently(seat):
+def test_component_bot_name_is_accepted_silently(seat, monkeypatch):
+    monkeypatch.setattr("agent_comms.session.pane_blocked_reason", lambda t: None)
     """ADR-0009 §7a: a component bot appears only in its project's channel, so
     the seat name alone is unambiguous there. Warning about it would be noise."""
     report = operations.preflight(

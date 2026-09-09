@@ -12,6 +12,10 @@ over automatically if it ever starts answering.
 
 from __future__ import annotations
 
+#: A pane holding a live, idle agent prompt. Anything without a prompt marker
+#: is refused since 0.13 — see wake.PROMPT_MARKERS.
+IDLE_PANE = "\u23f5\u23f5 auto mode on (shift+tab to cycle)\n> "
+
 import pytest
 
 from agent_comms import wake as wake_mod
@@ -26,7 +30,7 @@ from agent_comms.wake import (
 class _Ok:
     returncode = 0
     stderr = ""
-    stdout = "> "
+    stdout = IDLE_PANE
 
 
 MENTION = {"id": 1, "sender": "arch", "topic": "t", "content": "go"}

@@ -6,6 +6,10 @@ between coordination and a message typed at a shell prompt nobody reads.
 
 from __future__ import annotations
 
+#: A pane holding a live, idle agent prompt. Anything without a prompt marker
+#: is refused since 0.13 — see wake.PROMPT_MARKERS.
+IDLE_PANE = "\u23f5\u23f5 auto mode on (shift+tab to cycle)\n> "
+
 import os
 
 import pytest
@@ -25,7 +29,7 @@ class _Ok:
 
     returncode = 0
     stderr = ""
-    stdout = "> "
+    stdout = IDLE_PANE
 
 
 # -- the guard: never talk to a shell ----------------------------------------
@@ -123,7 +127,7 @@ def test_enter_failing_is_a_failure_not_a_success(monkeypatch):
             # capture-pane and the literal send succeed; only Enter fails
             returncode = 0 if args[0] == "capture-pane" or "-l" in args else 1
             stderr = "boom"
-            stdout = "> "
+            stdout = IDLE_PANE
 
         return R()
 
