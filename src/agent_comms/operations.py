@@ -531,10 +531,15 @@ def run_daemon(
             stored += 1
             if not mention.authorised:
                 _report_undeclared(settings, store, mention, transport_factory)
-            _deliver_to_agent(settings, store, mention, transport_factory)
             _notify(settings, store, mention)
             if on_mention is not None:
                 on_mention(mention)
+
+        # Every tick, not only when a message arrives. Zulip sends a heartbeat
+        # about once a minute (measured: ~54s), so this loop turns over even on
+        # a silent channel — which is what lets a queued message go in the
+        # moment the seat wakes, with no timer and no second thread.
+        _flush_pending(settings, store, transport_factory)
         store.save_position(registration.queue_id, registration.last_event_id)
 
     return stored
@@ -593,6 +598,66 @@ def check_wake_triggers(settings: Settings) -> None:
             "`wake` in ~/.comms/config.toml (or unset notify_command if you meant to use "
             "the built-in). Refusing to start rather than answering every message twice."
         )
+
+
+def _flush_pending(
+    settings: Settings,
+    store: Store,
+    transport_factory: Callable[[Credential], Transport],
+) -> int:
+    """Deliver everything still waiting, if the seat can take it now.
+
+    **The dormant-seat path.** A seat with no live session queues rather than
+    losing messages, and this is what empties the queue once someone wakes it —
+    the operator typing into the session is enough, and the daemon notices
+    within a heartbeat.
+
+    Ordering is preserved and the first failure stops the run: a conversation
+    delivered out of order is worse than one delivered late, and if the seat is
+    still dormant there is no point trying the rest.
+    """
+    if not settings.wake:
+        return 0
+
+    pending = store.undelivered()
+    if not pending:
+        return 0
+
+    was_waiting = len(pending)
+    # Read before delivering: a successful delivery clears the marker inside
+    # wake_agent, so checking afterwards would always say "was not sleeping".
+    was_sleeping = store.sleeping()
+    sent = 0
+    for mention in pending:
+        try:
+            outcome = wake_agent(asdict(mention), transport_factory,
+                                 state_dir=settings.state_dir)
+        except WakeError:
+            break  # already recorded and reported; the seat is not takeable
+        if outcome.startswith("queued"):
+            break  # still dormant — leave the rest in order for the next tick
+        store.mark_delivered(mention.id)
+        sent += 1
+
+    if sent and was_waiting > sent:
+        store.record("info", f"delivered {sent} of {was_waiting} queued messages")
+    elif sent:
+        store.record("info", f"delivered {sent} queued message(s)")
+
+    # Say it once, on the transition. A seat that woke and cleared a backlog is
+    # worth announcing for the same reason a seat that went unreachable is: the
+    # sender was told it was queued, and nothing else would tell them it landed.
+    if sent and was_sleeping:
+        store.set_sleeping(False)
+        _post(
+            settings, store, settings.channel,
+            f"{settings.identity.seat}: awake",
+            f"**{settings.identity.seat} is awake and has taken {sent} queued "
+            f"message{'s' if sent != 1 else ''}.** They were held while the seat had no "
+            "live session and have now been delivered in the order they arrived.",
+            transport_factory,
+        )
+    return sent
 
 
 def _deliver_to_agent(

@@ -30,6 +30,11 @@ class Mention:
     #: Why this message was stored — mention, topic, or direct message. Shown in
     #: the inbox so a seat can tell an explicit summons from a topic it owns.
     reason: str = "mentioned"
+    #: Has this message actually reached the agent? Distinct from `read`:
+    #: `read` is the human/agent having looked at it, `delivered` is the client
+    #: having got it into a session. A message queued while the seat was dormant
+    #: stays undelivered until the seat wakes.
+    delivered: bool = False
     #: Is the sender one this seat accepts direction from (ADR-0009 §9)?
     #: An unauthorised message is still stored and shown — the agent must be able
     #: to report it — but it is never presented as an instruction.
@@ -100,6 +105,24 @@ class Store:
     def unread(self) -> list[Mention]:
         return [m for m in self.all() if not m.read]
 
+    def undelivered(self) -> list[Mention]:
+        """Messages that never reached a session, oldest first.
+
+        These are the ones waiting for the seat to wake. Order is preserved: a
+        conversation delivered out of order is worse than one delivered late.
+        """
+        return [m for m in self.all() if not m.delivered]
+
+    def mark_delivered(self, message_id: int) -> bool:
+        rows = self.all()
+        found = False
+        for m in rows:
+            if m.id == message_id:
+                m.delivered, found = True, True
+        if found:
+            self._rewrite(rows)
+        return found
+
     def mark_read(self, message_id: int) -> bool:
         rows = self.all()
         found = False
@@ -107,14 +130,17 @@ class Store:
             if m.id == message_id:
                 m.read, found = True, True
         if found:
-            self.ensure()
-            tmp = self.messages.with_suffix(".jsonl.tmp")
-            tmp.write_text(
-                "".join(json.dumps(asdict(m), ensure_ascii=False) + "\n" for m in rows),
-                encoding="utf-8",
-            )
-            tmp.replace(self.messages)
+            self._rewrite(rows)
         return found
+
+    def _rewrite(self, rows: list[Mention]) -> None:
+        self.ensure()
+        tmp = self.messages.with_suffix(".jsonl.tmp")
+        tmp.write_text(
+            "".join(json.dumps(asdict(m), ensure_ascii=False) + "\n" for m in rows),
+            encoding="utf-8",
+        )
+        tmp.replace(self.messages)
 
     # -- queue position ----------------------------------------------------
 
