@@ -14,6 +14,7 @@ rebuild the four inference layers behind a nicer facade.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -73,6 +74,29 @@ class SeatStatus:
             )
         detail = self.reason or "no reason given"
         return f"the seat reports {self.verdict}: {detail}"
+
+
+@dataclass
+class Persistence:
+    """What the seat says about how long its session lasts.
+
+    Declared in `~/.seat/session.yml` (contract 0.5). We asked for this in
+    ADR-0011 step 0 because it decides what "queued" means to a sender —
+    minutes, or until somebody notices — and nothing else can tell them.
+    """
+
+    survives: tuple[str, ...] = ()
+    lost_on: tuple[str, ...] = ()
+
+    def summary(self) -> str:
+        if not self.survives and not self.lost_on:
+            return ""
+        parts = []
+        if self.survives:
+            parts.append(f"survives {', '.join(self.survives)}")
+        if self.lost_on:
+            parts.append(f"lost on {', '.join(self.lost_on)}")
+        return "; ".join(parts)
 
 
 @dataclass
@@ -192,3 +216,34 @@ def awake(timeout: int = 20) -> Awake:
         state=value if isinstance(value, bool) else None,
         reason=payload.get("reason") or "",
     )
+
+
+def persistence(path: str | None = None) -> Persistence:
+    """Read the seat's declared session persistence.
+
+    Parsed by hand rather than with PyYAML: the two keys are flat lists in a
+    file the seat owns and documents. Absence is not an error — an older seat
+    simply does not say, and a sender is told less rather than told wrongly.
+    """
+    path = path or os.path.join(os.path.expanduser("~"), ".seat", "session.yml")
+    try:
+        text = open(path, encoding="utf-8").read()
+    except OSError:
+        return Persistence()
+
+    found, section = {}, False
+    for line in text.splitlines():
+        if line.startswith("persistence:"):
+            section = True
+            continue
+        if section:
+            if line and not line.startswith((" ", "\t")):
+                break
+            stripped = line.strip()
+            for key in ("survives", "lost_on"):
+                if stripped.startswith(f"{key}:"):
+                    raw = stripped.split(":", 1)[1].strip().strip("[]")
+                    found[key] = tuple(
+                        v.strip().strip("'\"") for v in raw.split(",") if v.strip()
+                    )
+    return Persistence(survives=found.get("survives", ()), lost_on=found.get("lost_on", ()))

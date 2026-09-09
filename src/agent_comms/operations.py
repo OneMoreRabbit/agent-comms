@@ -27,6 +27,7 @@ from .errors import (
 from .hub import Hub, Registration, Transport, build_transport
 from .seat import SeatStatus, SeatUnavailable
 from .seat import awake as seat_awake_now
+from .seat import persistence as seat_persistence
 from .seat import status as seat_status_now
 from .wake import WakeError, wake
 from .store import Mention, Store
@@ -354,7 +355,7 @@ def wake_agent(
         outcome = f"queued: {exc}"
     else:
         try:
-            outcome = wake(mention, status, awake)
+            outcome = wake(mention, status, awake, seat_persistence())
         except WakeError as exc:
             store.record("warn", f"delivery failed for message {mention.get('id')}: {exc}")
             _tell_sender(settings, store, mention,

@@ -283,3 +283,37 @@ def test_seat_awake_unreadable_is_cannot_tell(monkeypatch):
     monkeypatch.setattr(seat_mod.subprocess, "run", lambda *a, **k: R())
     aw = seat_mod.awake()
     assert aw.state is None and aw.holds, "cannot tell must hold, like undetermined"
+
+
+# -- persistence: what "queued" means to whoever is waiting -------------------
+
+def test_persistence_is_read_from_the_seats_declaration(tmp_path, monkeypatch):
+    seat_dir = tmp_path / ".seat"
+    seat_dir.mkdir()
+    (seat_dir / "session.yml").write_text(
+        'runtime: claude\n'
+        'session:\n  kind: tmux\n  target: "rc:0.0"\n'
+        'persistence:\n'
+        '  survives: [ssh-disconnect, container-restart]\n'
+        '  lost_on: [host-reboot]\n',
+        encoding="utf-8",
+    )
+    p = seat_mod.persistence(str(seat_dir / "session.yml"))
+    assert p.survives == ("ssh-disconnect", "container-restart")
+    assert p.lost_on == ("host-reboot",)
+    assert "survives ssh-disconnect" in p.summary()
+
+
+def test_a_seat_that_does_not_declare_persistence_says_less_not_wrongly(tmp_path):
+    assert seat_mod.persistence(str(tmp_path / "absent.yml")).summary() == ""
+
+
+def test_a_hold_tells_the_sender_how_long_it_might_wait():
+    """We asked for this in ADR-0011 step 0 and then did not consume it."""
+    from agent_comms.seat import Persistence
+
+    st = SeatStatus(verdict="not-addressable", reason="no live session", runtime="claude")
+    outcome = wake(MENTION, st, None,
+                   Persistence(survives=("container-restart",), lost_on=("host-reboot",)))
+    assert "survives container-restart" in outcome
+    assert "lost on host-reboot" in outcome

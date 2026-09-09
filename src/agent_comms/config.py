@@ -111,14 +111,9 @@ class Settings(BaseModel):
             "must carry its project."
         ),
     )
-    model: str | None = Field(
-        default=None,
-        description=(
-            "The runtime this seat drives, declared by the estate in ~/.seat/seat.yml "
-            "(ADR-0009 §7g). A free string, so a future runtime needs no code change "
-            "here. Absent means the pane scan runs as a last resort."
-        ),
-    )
+    # `model` and `model_session` used to live here. Deleted in 0.17: the seat
+    # declares its runtime and target, and `seat status` reports both. Keeping a
+    # second copy is the two-sources problem this contract exists to end.
     authority: tuple[str, ...] = Field(
         default=(),
         description=(
@@ -130,26 +125,6 @@ class Settings(BaseModel):
             "default: this seat's own arch bot."
         ),
     )
-    codex_thread_selection: str | None = Field(
-        default=None,
-        description=(
-            "Opt-in tie-break when several codex threads are loaded. Only "
-            "'most-recent' is understood, and it must be DECLARED — inferring it "
-            "silently is ADR-0009 §7g's failure one layer down (arch, 2026-09-08). "
-            "Absent, several loaded threads is a refusal, reported loudly."
-        ),
-    )
-    model_session: str | None = Field(
-        default=None,
-        description=(
-            "Where the seat's runtime is: a tmux target for Claude, a session name or "
-            "UUID for codex. Declared beside `model` in ~/.seat/seat.yml, because where "
-            "a seat's agent runs is a property of the seat — the estate launches it. "
-            "Absent, the target is searched for and the log line says so."
-        ),
-    )
-    lifespan_secs: int = DEFAULT_LIFESPAN_SECS
-    state_dir: Path = Field(default_factory=lambda: Path.home() / ".comms")
     wake: bool = Field(
         default=False,
         description=(
@@ -158,10 +133,8 @@ class Settings(BaseModel):
             "decision, not a package default."
         ),
     )
-    agent_commands: tuple[str, ...] = Field(
-        default=("claude", "codex"),
-        description="Pane commands that mean an agent is running. Empirical, so settable.",
-    )
+    lifespan_secs: int = DEFAULT_LIFESPAN_SECS
+    state_dir: Path = Field(default_factory=lambda: Path.home() / ".comms")
     notify_command: str | None = Field(
         default=None,
         description=(
@@ -224,7 +197,7 @@ def _seat_manifest(path: Path | None = None) -> dict[str, str]:
             continue
         key, _, value = line.partition(":")
         key = key.strip()
-        if key in ("project", "seat", "model", "model_session",
+        if key in ("project", "seat",
                    "codex_thread_selection", "role", "comms_authority"):
             out[key] = value.strip().strip("'\"")
     return out
@@ -276,8 +249,6 @@ def load_settings(state_dir: Path | None = None, seat_manifest: Path | None = No
     identity = Identity(project=project, seat=seat)
     return Settings(
         identity=identity,
-        model=os.environ.get("AGENT_COMMS_MODEL") or manifest.get("model"),
-        model_session=os.environ.get("AGENT_COMMS_SESSION") or manifest.get("model_session"),
         codex_thread_selection=manifest.get("codex_thread_selection"),
         authority=_authority(manifest.get("comms_authority"), project),
         role=manifest.get("role") or ("arch" if seat == "arch" or seat.endswith("-arch") else "component"),

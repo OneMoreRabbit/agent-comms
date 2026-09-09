@@ -28,7 +28,7 @@ import shutil
 import subprocess
 import time
 
-from .seat import Awake, SeatStatus
+from .seat import Awake, Persistence, SeatStatus
 
 #: How much of a message is sent inline before it is pointed at instead.
 INLINE_LIMIT = 1200
@@ -176,7 +176,8 @@ SENDERS = {"claude": send_claude, "codex": send_codex}
 # dispatch
 # ---------------------------------------------------------------------------
 
-def wake(mention: dict, status: SeatStatus, awake: Awake | None = None) -> str:
+def wake(mention: dict, status: SeatStatus, awake: Awake | None = None,
+         persistence: Persistence | None = None) -> str:
     """Deliver a mention, or say why it is being held.
 
     Two questions, two commands, each answered by the seat:
@@ -192,15 +193,21 @@ def wake(mention: dict, status: SeatStatus, awake: Awake | None = None) -> str:
     A returned string starting `queued:` means held — the message stays in the
     store and is retried when the seat next reports itself deliverable.
     """
+    wait = ""
+    if persistence is not None and persistence.summary():
+        # What "queued" actually means to whoever is waiting. Asked for in
+        # ADR-0011 step 0 and declared by the seat; nothing else can say it.
+        wait = f" [this seat's session {persistence.summary()}]"
+
     if not status.addressable:
-        return f"queued: {status.hold_reason()}"
+        return f"queued: {status.hold_reason()}{wait}"
 
     if awake is not None and awake.holds:
         state = "asleep" if awake.state is False else "of unknown wakefulness"
         detail = f" — {awake.reason}" if awake.reason else ""
         return (
             f"queued: the seat is addressable but its agent is {state}{detail}. "
-            "Held until it wakes; waking is the operator's (ADR-0009 §7e)."
+            f"Held until it wakes; waking is the operator's (ADR-0009 §7e).{wait}"
         )
 
     runtime = (status.runtime or "").strip().casefold()
