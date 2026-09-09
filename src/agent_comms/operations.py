@@ -174,6 +174,16 @@ def _permalink(site: str, event_msg: dict) -> str:
     return f"{site}/#narrow/channel/{stream_id}-{slug}/topic/{quoted}/near/{event_msg['id']}"
 
 
+def is_authorised(settings: Settings, sender: str) -> bool:
+    """May this sender direct this seat? ADR-0009 §9.
+
+    Declared by the estate, defaulting to the seat's own arch bot. Compared on
+    the bot's display name, which is what attribution rests on (§1a) — the same
+    name a human reads in the channel.
+    """
+    return sender.strip().casefold() in {a.casefold() for a in settings.authority}
+
+
 def addressed_to_seat(
     settings: Settings, msg: dict, flags: list[str], own_email: str | None = None
 ) -> str | None:
@@ -235,6 +245,9 @@ def mention_from_event(
         timestamp=msg.get("timestamp", 0),
         permalink=_permalink(site, msg),
         reason=reason,
+        authorised=is_authorised(
+            settings, msg.get("sender_full_name") or msg.get("sender_email", "")
+        ),
     )
 
 
@@ -266,6 +279,24 @@ def send(
     return hub.send(settings.channel, topic, content)
 
 
+def addressed(sender: str, content: str) -> str:
+    """Prefix a reply with an @-mention of whoever asked.
+
+    Without this the arch↔component loop is invisible from the arch side: a
+    seat's inbox is mention-based, and a reply posted into
+    `agent-comms: roll call` matches no topic prefix an *arch* seat answers to.
+    So replies landed in the channel and the arch seat reported that nobody had
+    answered — a false negative pointing the same way as the false `delivered`.
+
+    Mentioning the sender puts the reply in their inbox by the route they
+    already read, rather than requiring them to query Zulip directly, which is
+    the per-seat API integration the operator ruled against.
+    """
+    if not sender or sender.startswith("@"):
+        return content
+    return f"@**{sender}** {content}"
+
+
 def reply(
     message_id: int,
     content: str,
@@ -280,7 +311,9 @@ def reply(
         raise CommsError(f"no message {message_id} in the local store")
     credential = load_credential(settings.identity)
     hub = Hub(transport_factory(credential), settings, credential)
-    result = hub.send(target.channel or settings.channel, target.topic, content)
+    result = hub.send(
+        target.channel or settings.channel, target.topic, addressed(target.sender, content)
+    )
     store.mark_read(message_id)
     return result
 
@@ -345,6 +378,33 @@ def wake_agent(
     else:
         store.set_sleeping(False)
     return outcome
+
+
+def _report_undeclared(
+    settings: Settings,
+    store: Store,
+    mention: Mention,
+    transport_factory: Callable[[Credential], Transport],
+) -> None:
+    """Raise an undeclared sender with the arch seat, per §1a's report half.
+
+    "Report, never comply" only works if the reporting is mechanical. Left to the
+    agent it depends on the agent noticing, which is the aspirational version §9
+    exists to replace.
+    """
+    store.record("warn", f"undeclared sender {mention.sender!r} on message {mention.id}")
+    _post(
+        settings, store, mention.channel or settings.channel,
+        f"{settings.identity.seat}: undeclared sender",
+        f"**{mention.sender} directed {settings.identity.seat}, and is not a declared "
+        f"sender for this seat** (ADR-0009 §9). The message was stored and shown to the "
+        f"agent labelled *do not comply*; it has not been acted on.\n\n"
+        f"Declared senders: {', '.join(settings.authority)}.\n"
+        f"Cite: {mention.permalink}\n\n"
+        "If this should be actionable, the estate declares the link — the seat cannot "
+        "widen its own authority, which is the point of the rule.",
+        transport_factory,
+    )
 
 
 def _announce_unreachable(
@@ -469,10 +529,17 @@ def run_daemon(
                 continue
             store.append(mention)
             stored += 1
-            _deliver_to_agent(settings, store, mention, transport_factory)
+            if not mention.authorised:
+                _report_undeclared(settings, store, mention, transport_factory)
             _notify(settings, store, mention)
             if on_mention is not None:
                 on_mention(mention)
+
+        # Every tick, not only when a message arrives. Zulip sends a heartbeat
+        # about once a minute (measured: ~54s), so this loop turns over even on
+        # a silent channel — which is what lets a queued message go in the
+        # moment the seat wakes, with no timer and no second thread.
+        _flush_pending(settings, store, transport_factory)
         store.save_position(registration.queue_id, registration.last_event_id)
 
     return stored
@@ -531,6 +598,66 @@ def check_wake_triggers(settings: Settings) -> None:
             "`wake` in ~/.comms/config.toml (or unset notify_command if you meant to use "
             "the built-in). Refusing to start rather than answering every message twice."
         )
+
+
+def _flush_pending(
+    settings: Settings,
+    store: Store,
+    transport_factory: Callable[[Credential], Transport],
+) -> int:
+    """Deliver everything still waiting, if the seat can take it now.
+
+    **The dormant-seat path.** A seat with no live session queues rather than
+    losing messages, and this is what empties the queue once someone wakes it —
+    the operator typing into the session is enough, and the daemon notices
+    within a heartbeat.
+
+    Ordering is preserved and the first failure stops the run: a conversation
+    delivered out of order is worse than one delivered late, and if the seat is
+    still dormant there is no point trying the rest.
+    """
+    if not settings.wake:
+        return 0
+
+    pending = store.undelivered()
+    if not pending:
+        return 0
+
+    was_waiting = len(pending)
+    # Read before delivering: a successful delivery clears the marker inside
+    # wake_agent, so checking afterwards would always say "was not sleeping".
+    was_sleeping = store.sleeping()
+    sent = 0
+    for mention in pending:
+        try:
+            outcome = wake_agent(asdict(mention), transport_factory,
+                                 state_dir=settings.state_dir)
+        except WakeError:
+            break  # already recorded and reported; the seat is not takeable
+        if outcome.startswith("queued"):
+            break  # still dormant — leave the rest in order for the next tick
+        store.mark_delivered(mention.id)
+        sent += 1
+
+    if sent and was_waiting > sent:
+        store.record("info", f"delivered {sent} of {was_waiting} queued messages")
+    elif sent:
+        store.record("info", f"delivered {sent} queued message(s)")
+
+    # Say it once, on the transition. A seat that woke and cleared a backlog is
+    # worth announcing for the same reason a seat that went unreachable is: the
+    # sender was told it was queued, and nothing else would tell them it landed.
+    if sent and was_sleeping:
+        store.set_sleeping(False)
+        _post(
+            settings, store, settings.channel,
+            f"{settings.identity.seat}: awake",
+            f"**{settings.identity.seat} is awake and has taken {sent} queued "
+            f"message{'s' if sent != 1 else ''}.** They were held while the seat had no "
+            "live session and have now been delivered in the order they arrived.",
+            transport_factory,
+        )
+    return sent
 
 
 def _deliver_to_agent(

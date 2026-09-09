@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from .config import Settings
 from .wake import (
     Pane,
+    pane_blocked_reason,
     codex_daemon_running,
     codex_lock_threads,
     find_runtime_panes,
@@ -100,8 +101,15 @@ def status(settings: Settings) -> SessionState:
     panes: list[Pane] = list_panes()
     found = find_runtime_panes(panes, model or "claude")
     if len(found) == 1:
-        return SessionState(True, f"one {model or 'claude'} session ({found[0].target})",
-                            found[0].target)
+        target = found[0].target
+        # "A session exists" is not "a message can reach it". A pane holding a
+        # remote-control client has the process in its tree and no prompt, so
+        # this used to report `deliverable` about a seat that was not — the same
+        # false success `wake` was reporting one command away.
+        blocked = pane_blocked_reason(target)
+        if blocked is not None:
+            return SessionState(False, f"{target} is not typeable: {blocked}", target)
+        return SessionState(True, f"one {model or 'claude'} session ({target})", target)
     if not found:
         return SessionState(False, f"no {model or 'claude'} session is running")
     return SessionState(

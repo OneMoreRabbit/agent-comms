@@ -38,6 +38,15 @@ class _Fail:
     stdout = ""
 
 
+IDLE_PANE = "\u23f5\u23f5 auto mode on (shift+tab to cycle)\n> "
+
+
+class _Pane(_Ok):
+    """A tmux call whose capture shows a live idle prompt."""
+
+    stdout = IDLE_PANE
+
+
 def _panes(*specs):
     return [Pane(target=t, command=c, path="/home/dev/work", pid=p) for t, c, p in specs]
 
@@ -47,8 +56,28 @@ def _panes(*specs):
 def test_a_running_claude_session_is_live(monkeypatch):
     monkeypatch.setattr(session_mod, "tmux_available", lambda: True)
     monkeypatch.setattr(session_mod, "list_panes", lambda: _panes(("rc:0.0", "claude", 10)))
+    monkeypatch.setattr(session_mod, "pane_blocked_reason", lambda t: None)
     st = status(_settings())
     assert st.live and st.target == "rc:0.0"
+
+
+def test_a_session_with_no_typeable_prompt_is_not_live(monkeypatch):
+    """The rc pane: the process is in the tree, and there is nothing to type into.
+
+    `status` used to report this seat deliverable — the same false success
+    `wake` was reporting one command away.
+    """
+    monkeypatch.setattr(session_mod, "tmux_available", lambda: True)
+    pane = _panes(("rc:0.0", "bash", 10))
+    monkeypatch.setattr(session_mod, "list_panes", lambda: pane)
+    monkeypatch.setattr(session_mod, "find_runtime_panes", lambda p, r: pane)
+    monkeypatch.setattr(
+        session_mod, "pane_blocked_reason",
+        lambda t: "the pane holds a remote-control client, not an agent prompt",
+    )
+    st = status(_settings())
+    assert st.live is False
+    assert "not typeable" in st.detail
 
 
 def test_no_session_is_not_live(monkeypatch):
@@ -89,6 +118,7 @@ def test_ensure_starts_a_claude_session_when_there_is_none(monkeypatch):
 def test_ensure_is_idempotent(monkeypatch):
     monkeypatch.setattr(session_mod, "tmux_available", lambda: True)
     monkeypatch.setattr(session_mod, "list_panes", lambda: _panes(("rc:0.0", "claude", 10)))
+    monkeypatch.setattr(session_mod, "pane_blocked_reason", lambda t: None)
 
     def boom(cmd):
         raise AssertionError("must not start anything when a session is already live")
