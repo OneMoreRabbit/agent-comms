@@ -130,3 +130,31 @@ def test_an_undeclared_sender_is_raised_on_the_channel(seat):
     assert "dprox" in body
     assert "agent-eco-arch" in body, "the report must say what IS declared"
     assert "has not been acted on" in body
+
+
+# -- the arch<->component loop must be visible from both ends -----------------
+
+def test_a_reply_mentions_whoever_asked(seat):
+    """Arch reported that nobody answered a roll call I had answered twice.
+
+    A seat's inbox is mention-based, and a reply posted into `agent-comms: roll
+    call` matches no topic prefix an *arch* seat answers to — so replies landed
+    in the channel and were invisible to the one seat that needed them.
+    """
+    transport = FakeTransport(event_batches=[{"result": "success",
+                                              "events": [_event(901, "agent-eco-arch")]}])
+    operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
+    operations.reply(901, "doctor is clean", transport_factory=lambda c: transport)
+
+    sent = transport.sent[-1]
+    assert sent["content"].startswith("@**agent-eco-arch**")
+    assert "doctor is clean" in sent["content"]
+    assert sent["topic"] == "agent-comms: do a thing", "replies stay in their topic"
+
+
+def test_addressing_is_not_doubled_up(seat):
+    from agent_comms.operations import addressed
+
+    assert addressed("arch", "hello") == "@**arch** hello"
+    assert addressed("", "hello") == "hello"
+    assert addressed("@**arch**", "hello") == "hello", "already addressed, left alone"

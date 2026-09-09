@@ -279,6 +279,24 @@ def send(
     return hub.send(settings.channel, topic, content)
 
 
+def addressed(sender: str, content: str) -> str:
+    """Prefix a reply with an @-mention of whoever asked.
+
+    Without this the arch↔component loop is invisible from the arch side: a
+    seat's inbox is mention-based, and a reply posted into
+    `agent-comms: roll call` matches no topic prefix an *arch* seat answers to.
+    So replies landed in the channel and the arch seat reported that nobody had
+    answered — a false negative pointing the same way as the false `delivered`.
+
+    Mentioning the sender puts the reply in their inbox by the route they
+    already read, rather than requiring them to query Zulip directly, which is
+    the per-seat API integration the operator ruled against.
+    """
+    if not sender or sender.startswith("@"):
+        return content
+    return f"@**{sender}** {content}"
+
+
 def reply(
     message_id: int,
     content: str,
@@ -293,7 +311,9 @@ def reply(
         raise CommsError(f"no message {message_id} in the local store")
     credential = load_credential(settings.identity)
     hub = Hub(transport_factory(credential), settings, credential)
-    result = hub.send(target.channel or settings.channel, target.topic, content)
+    result = hub.send(
+        target.channel or settings.channel, target.topic, addressed(target.sender, content)
+    )
     store.mark_read(message_id)
     return result
 
