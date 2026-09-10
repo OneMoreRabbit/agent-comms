@@ -94,8 +94,8 @@ the seat works; both are raised with the estate.
 
 ## Versioning
 
-**The `0.30` line is held until the operator says otherwise.** Routine work
-increments the third digit — `0.30.1`, `0.30.2`, … — and the middle number moves
+**The `0.40` line is held until the operator says otherwise.** Routine work
+increments the third digit — `0.40.1`, `0.40.2`, … — and the middle number moves
 **only on the operator's instruction**, to keep major releases aligned with
 `agent-skeleton`.
 

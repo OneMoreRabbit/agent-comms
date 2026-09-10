@@ -157,4 +157,179 @@ def test_addressing_is_not_doubled_up(seat):
 
     assert addressed("arch", "hello") == "@**arch** hello"
     assert addressed("", "hello") == "hello"
-    assert addressed("@**arch**", "hello") == "hello", "already addressed, left alone"
+    # A sender field that already carries Zulip syntax is NORMALISED, not
+    # skipped. The old behaviour returned the content with no mention at all —
+    # a reply addressed to nobody, which is the silent addressing failure the
+    # orchestrator reported.
+    assert addressed("@**arch**", "hello") == "@**arch** hello"
+    assert addressed("@arch", "hello") == "@**arch** hello"
+
+
+# -- addressing: the seat says who, this client knows how --------------------
+#
+# The protocol, since 0.30.3: a seat names its recipient in `--to` and writes
+# prose in the body. This client checks the name against the hub and spells the
+# mention. It does not read the body, which means there is nothing in a message
+# that can be addressing-by-accident — and nothing to get wrong about prose.
+
+
+def test_the_body_is_never_rewritten(seat):
+    """A seat name typed in prose stays prose. It is not addressing.
+
+    The old client scanned for `@name` and converted it. That is guesswork about
+    text, and it fails silently in both directions. Addressing travels in a flag.
+    """
+    from agent_comms import operations
+    from tests.conftest import FakeTransport
+
+    transport = FakeTransport()
+    body = "ask @blocks-android about it, and mail a@b.com — see @**x**"
+    operations.send(body, to="agent-eco-arch", subject="the ask",
+                    transport_factory=lambda c: transport)
+    assert transport.sent[-1]["content"] == f"@**agent-eco-arch** {body}"
+
+
+def test_send_to_addresses_by_plain_seat_name(seat):
+    """`--to agent-skeleton`, not `--to @**agent-skeleton**`."""
+    from agent_comms import operations
+    from tests.conftest import FakeTransport
+
+    transport = FakeTransport()
+    operations.send("please look", to="agent-skeleton", subject="the ask",
+                    transport_factory=lambda c: transport)
+    assert transport.sent[-1]["content"].startswith("@**agent-skeleton** ")
+    assert transport.sent[-1]["topic"] == "agent-skeleton: the ask", (
+        "the topic must name the RECIPIENT — arch naming itself is what failed on blocks"
+    )
+
+
+def test_zulip_syntax_in_to_is_accepted_and_normalised(seat):
+    from agent_comms import operations
+    from tests.conftest import FakeTransport
+
+    transport = FakeTransport()
+    operations.send("hi", to="@**agent-skeleton**", subject="s",
+                    transport_factory=lambda c: transport)
+    assert transport.sent[-1]["content"].startswith("@**agent-skeleton** ")
+
+
+def test_the_recipient_is_matched_case_insensitively(seat):
+    """A seat should not have to know the hub's capitalisation; the mention must."""
+    from agent_comms import operations
+    from tests.conftest import FakeTransport
+
+    transport = FakeTransport()
+    operations.send("hi", to="Agent-Skeleton", subject="s",
+                    transport_factory=lambda c: transport)
+    assert transport.sent[-1]["content"].startswith("@**agent-skeleton** ")
+
+
+# -- the blocks failure: a message that reaches nobody ------------------------
+
+def test_a_message_with_no_recipient_is_refused(seat):
+    """The blocks failure of 2026-09-10, made impossible.
+
+    arch posted under its OWN topic prefix with the recipients as plain text.
+    Comms routes by topic prefix or a real mention and ignores a seat's own
+    posts, so neither target was addressed and nothing was delivered — correct
+    behaviour with an invisible outcome. Now there is no way to express it.
+    """
+    from agent_comms import operations
+    from agent_comms.operations import Unaddressed
+    from tests.conftest import FakeTransport
+
+    transport = FakeTransport()
+    with pytest.raises(Unaddressed, match="names its recipient"):
+        operations.send("please look at the deploy @blocks-service",
+                        topic="agent-comms: my own topic",
+                        transport_factory=lambda c: transport)
+    assert transport.sent == [], "nothing may be posted"
+
+
+def test_a_seat_that_does_not_exist_is_refused(seat):
+    from agent_comms import operations
+    from agent_comms.operations import UnknownRecipient
+    from tests.conftest import FakeTransport
+
+    transport = FakeTransport()
+    with pytest.raises(UnknownRecipient, match="no seat named .blocks-andriod. exists"):
+        operations.send("hi", to="blocks-andriod", subject="typo",
+                        transport_factory=lambda c: transport)
+    assert transport.sent == []
+
+
+def test_a_seat_outside_this_channel_is_refused(seat):
+    """`blocks-android` exists in the realm and is not in `agent-eco`.
+
+    Measured on the live hub. A mention of it here renders correctly and reaches
+    nobody, which is indistinguishable from success — so it is refused.
+    """
+    from agent_comms import operations
+    from agent_comms.operations import UnknownRecipient
+    from tests.conftest import FakeTransport
+
+    transport = FakeTransport()
+    with pytest.raises(UnknownRecipient, match="exists on the hub but is not in channel"):
+        operations.send("hi", to="blocks-android", subject="cross-project",
+                        transport_factory=lambda c: transport)
+    assert transport.sent == []
+
+
+def test_addressing_ourselves_is_refused(seat):
+    """A seat ignores its own posts, so this is the one mention that cannot land."""
+    from agent_comms import operations
+    from agent_comms.operations import UnknownRecipient
+    from tests.conftest import FakeTransport
+
+    transport = FakeTransport()
+    with pytest.raises(UnknownRecipient, match="is this seat"):
+        operations.send("hi", to="agent-comms", subject="myself",
+                        transport_factory=lambda c: transport)
+    assert transport.sent == []
+
+
+def test_an_explicit_topic_still_requires_a_recipient(seat):
+    """`--topic` continues a thread; it does not replace addressing."""
+    from agent_comms import operations
+    from tests.conftest import FakeTransport
+
+    transport = FakeTransport()
+    operations.send("carrying on", to="agent-skeleton",
+                    topic="agent-skeleton: an older thread",
+                    transport_factory=lambda c: transport)
+    assert transport.sent[-1]["topic"] == "agent-skeleton: an older thread"
+    assert transport.sent[-1]["content"].startswith("@**agent-skeleton** ")
+
+
+def test_to_without_subject_is_refused_rather_than_guessed(seat):
+    from agent_comms import operations
+    from agent_comms.operations import Unaddressed
+    from tests.conftest import FakeTransport
+
+    with pytest.raises(Unaddressed, match="needs a --subject"):
+        operations.send("body", to="agent-skeleton",
+                        transport_factory=lambda c: FakeTransport())
+
+
+def test_a_hold_notice_mentions_the_sender(seat, tmp_path, monkeypatch):
+    """A "held" notice posted into our own topic would reach nobody otherwise.
+
+    The topic is named after this seat, so a sender filtering on its own topic
+    prefix never sees it. The mention is the route that works.
+    """
+    from agent_comms import operations
+    from agent_comms.store import Store
+    from tests.conftest import FakeTransport
+
+    transport = FakeTransport()
+    store = Store(tmp_path)
+    store.ensure()
+    operations._tell_sender(
+        operations.load_settings(),
+        store,
+        {"id": 1, "sender": "agent-eco-arch", "topic": "agent-comms: do a thing"},
+        "could not deliver that to my agent",
+        lambda c: transport,
+    )
+    assert transport.sent[-1]["content"].startswith("@**agent-eco-arch** ")
+    assert transport.sent[-1]["topic"] == "agent-comms: do a thing"

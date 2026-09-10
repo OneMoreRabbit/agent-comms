@@ -45,6 +45,62 @@ class Mention:
         return datetime.fromtimestamp(self.timestamp, tz=timezone.utc).isoformat(timespec="seconds")
 
 
+@dataclass
+class DaemonState:
+    """Whether a daemon is up for this seat, and how recently it polled.
+
+    `running` is the flock answer. `last_tick` is the heartbeat written every
+    loop turn; a running daemon with an old tick is a different fault from no
+    daemon at all, so they are two fields rather than one verdict.
+    """
+
+    running: bool
+    pid: int | None = None
+    last_tick: datetime | None = None
+    detail: str = ""
+
+    #: Zulip's own heartbeat turns the loop over about every 54s (measured), so
+    #: a tick older than this means the loop is not turning even though a
+    #: process holds the lock — wedged, not merely quiet.
+    STALE_AFTER_SECS = 300
+
+    @property
+    def silent_for(self) -> float | None:
+        if self.last_tick is None:
+            return None
+        return (datetime.now(tz=timezone.utc) - self.last_tick).total_seconds()
+
+    @property
+    def stale(self) -> bool:
+        gap = self.silent_for
+        return self.running and gap is not None and gap > self.STALE_AFTER_SECS
+
+    def summary(self) -> str:
+        """One line, written for whoever is asking why nothing arrived."""
+        gap = self.silent_for
+        ago = "never polled" if gap is None else f"last polled {_ago(gap)} ago"
+        if not self.running:
+            return (
+                f"NOT RUNNING — nothing is watching the hub, so messages sent to this "
+                f"seat are being lost, not queued ({ago}). Start it: comms daemon --detach"
+            )
+        if self.stale:
+            return (
+                f"running (pid {self.pid}) but WEDGED — {ago}, and Zulip's heartbeat "
+                "should turn the loop over about every minute. Restart it."
+            )
+        return f"running (pid {self.pid}), {ago}"
+
+
+def _ago(seconds: float) -> str:
+    seconds = int(seconds)
+    if seconds < 90:
+        return f"{seconds}s"
+    if seconds < 5400:
+        return f"{seconds // 60}m"
+    return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+
+
 class Store:
     def __init__(self, root: Path) -> None:
         self.root = root
@@ -54,6 +110,52 @@ class Store:
 
     def ensure(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+    def daemon_state(self) -> "DaemonState":
+        """Is a daemon actually running for this seat, and when did it last poll?
+
+        Asks the **lock**, not the lock file: `flock` is released by the OS
+        however a process ends, so a lock we can take means nobody holds it —
+        while the file itself outlives any daemon and says nothing. Reading the
+        file for a PID was the trap here; the file on this seat sat there for
+        four days across several dead daemons.
+
+        The probe is read-write-open + non-blocking flock, released immediately.
+        It never truncates: the running daemon's PID must survive being looked at.
+        """
+        lock_path = self.root / "daemon.lock"
+        pid, running = None, True
+        try:
+            fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+        except OSError:
+            return DaemonState(running=False, pid=None, last_tick=None,
+                               detail="the state directory is not readable")
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                running = True  # somebody holds it: a daemon is up
+            else:
+                running = False
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            try:
+                raw = os.pread(fd, 32, 0).decode("utf-8", "replace").strip()
+                pid = int(raw) if raw.isdigit() else None
+            except (OSError, ValueError):
+                pid = None
+        finally:
+            os.close(fd)
+
+        last_tick = None
+        position = self.load_position() or {}
+        stamp = position.get("saved_at")
+        if stamp:
+            try:
+                last_tick = datetime.fromisoformat(stamp)
+            except ValueError:
+                last_tick = None
+
+        return DaemonState(running=running, pid=pid if running else None, last_tick=last_tick)
 
     def acquire_daemon_lock(self):
         """Take the single-daemon lock, or raise `DaemonAlreadyRunning`.
@@ -145,6 +247,14 @@ class Store:
     # -- queue position ----------------------------------------------------
 
     def save_position(self, queue_id: str, last_event_id: int) -> None:
+        """Record where the queue is, and that we were alive to record it.
+
+        `saved_at` doubles as the daemon's heartbeat. It is written every tick —
+        Zulip's heartbeat turns the loop over about every 54s even on a silent
+        channel — so a stale value is itself the evidence that nothing is
+        polling. That is what makes "down since when" answerable, which it was
+        not when this seat's daemon died unnoticed on 2026-09-10.
+        """
         self.ensure()
         self.state.write_text(
             json.dumps(
