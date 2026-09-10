@@ -25,7 +25,10 @@ from .errors import (
     QueueGapError,
 )
 from .hub import Hub, Registration, Transport, build_transport
-from .session import SessionState, ensure, status as _session_status
+from .seat import SeatStatus, SeatUnavailable
+from .seat import awake as seat_awake_now
+from .seat import persistence as seat_persistence
+from .seat import status as seat_status_now
 from .wake import WakeError, wake
 from .store import Mention, Store
 
@@ -153,10 +156,20 @@ def preflight(
     )
 
     # Deliverability is a separate question from connectivity, and the one that
-    # went unnoticed for 21 minutes in the live incident.
-    from .session import status as _sess
-    sess = _sess(settings)
-    report.add("deliverable", sess.live, sess.detail)
+    # went unnoticed for 21 minutes in the live incident. We no longer answer it
+    # ourselves — this is a passthrough of the seat's verdict, so the estate has
+    # one source for the fact rather than two that can disagree.
+    try:
+        sess = seat_status_now()
+        detail = f"seat status: {sess.verdict}" + (f" — {sess.reason}" if sess.reason else "")
+        ok = sess.addressable
+        if sess.addressable:
+            aw = seat_awake_now()
+            ok = not aw.holds
+            detail += f" | seat awake: {aw.state}" + (f" — {aw.reason}" if aw.reason else "")
+        report.add("deliverable", ok, detail)
+    except SeatUnavailable as exc:
+        report.add("deliverable", False, str(exc))
     report.warnings.extend(registration.warnings)
     report.notes.extend(registration.notes)
     return report
@@ -318,16 +331,6 @@ def reply(
     return result
 
 
-def session_status(**kw) -> SessionState:
-    """Is this seat's one agent session live? Never starts anything."""
-    return _session_status(load_settings(**kw))
-
-
-def session_ensure(workdir: str | None = None, **kw) -> str:
-    """Start this seat's session if it has none — for a supervisor, not delivery."""
-    return ensure(load_settings(**kw), workdir=workdir)
-
-
 def wake_agent(
     mention: dict,
     transport_factory: Callable[[Credential], Transport] = build_transport,
@@ -346,22 +349,19 @@ def wake_agent(
     store.ensure()
 
     try:
-        outcome = wake(
-            mention,
-            model=settings.model,
-            session=settings.model_session,
-            agent_commands=settings.agent_commands,
-            selection=settings.codex_thread_selection,
-        )
-    except WakeError as exc:
-        store.record("warn", f"wake failed for message {mention.get('id')}: {exc}")
-        _tell_sender(settings, store, mention, f"could not deliver that to my agent: {exc}",
-                     transport_factory)
-        if "UNREACHABLE" in str(exc):
-            _announce_unreachable(settings, store, str(exc), transport_factory)
-        raise
+        status = seat_status_now()
+        awake = seat_awake_now() if status.addressable else None
+    except SeatUnavailable as exc:
+        outcome = f"queued: {exc}"
+    else:
+        try:
+            outcome = wake(mention, status, awake, seat_persistence())
+        except WakeError as exc:
+            store.record("warn", f"delivery failed for message {mention.get('id')}: {exc}")
+            _tell_sender(settings, store, mention,
+                         f"could not deliver that to my agent: {exc}", transport_factory)
+            raise
 
-    store.set_unreachable(False)
     queued = outcome.startswith("queued")
     store.record("info" if not queued else "warn", f"wake: {outcome}")
     if queued:
