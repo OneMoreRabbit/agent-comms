@@ -283,13 +283,44 @@ def show(message_id: int, **kw) -> Mention | None:
 def send(
     topic: str,
     content: str,
+    to: str | None = None,
     transport_factory: Callable[[Credential], Transport] = build_transport,
     **kw,
 ) -> dict:
+    """Post to this seat's project channel.
+
+    `to` addresses another seat **by its plain name** — `blocks-android`, not
+    `@**blocks-android**`. Knowing how Zulip spells a mention is this client's
+    job, not the sending seat's.
+    """
     settings = load_settings(**kw)
     credential = load_credential(settings.identity)
     hub = Hub(transport_factory(credential), settings, credential)
-    return hub.send(settings.channel, topic, content)
+    return hub.send(settings.channel, topic, addressed(to or "", content))
+
+
+#: A seat name as a seat writes it: letters, digits, dashes, underscores.
+_RAW_MENTION = re.compile(r"(?<![\w*@])@([A-Za-z0-9][A-Za-z0-9_-]*)(?!\*\*)")
+
+
+def zulip_addressing(content: str) -> str:
+    """Convert seat-written addressing into Zulip's mention syntax.
+
+    **A seat should not have to know how Zulip spells a mention.** Left to it, a
+    seat writes `@blocks-android`, which Zulip renders as plain text — the
+    recipient is never mentioned, and the message reaches them only if the topic
+    happens to route. That is a silent addressing failure, and the seat has no
+    way to see it: the post succeeds.
+
+    So the seat addresses by **raw seat name** and this client converts. The
+    division is the same one the whole design runs on — the seat says *who*, the
+    client knows *how*.
+
+    Already-correct `@**name**` is left alone, so a seat that does know the
+    syntax is not punished for it, and an email address is untouched because the
+    `@` there is preceded by a word character.
+    """
+    return _RAW_MENTION.sub(r"@**\1**", content)
 
 
 def addressed(sender: str, content: str) -> str:
@@ -305,9 +336,13 @@ def addressed(sender: str, content: str) -> str:
     already read, rather than requiring them to query Zulip directly, which is
     the per-seat API integration the operator ruled against.
     """
-    if not sender or sender.startswith("@"):
-        return content
-    return f"@**{sender}** {content}"
+    body = zulip_addressing(content)
+    if not sender:
+        return body
+    name = sender.lstrip("@").strip("*").strip()
+    if not name:
+        return body
+    return f"@**{name}** {body}"
 
 
 def reply(

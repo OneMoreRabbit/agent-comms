@@ -157,4 +157,55 @@ def test_addressing_is_not_doubled_up(seat):
 
     assert addressed("arch", "hello") == "@**arch** hello"
     assert addressed("", "hello") == "hello"
-    assert addressed("@**arch**", "hello") == "hello", "already addressed, left alone"
+    # A sender field that already carries Zulip syntax is NORMALISED, not
+    # skipped. The old behaviour returned the content with no mention at all —
+    # a reply addressed to nobody, which is the silent addressing failure the
+    # orchestrator reported.
+    assert addressed("@**arch**", "hello") == "@**arch** hello"
+    assert addressed("@arch", "hello") == "@**arch** hello"
+
+
+# -- addressing: the seat says who, this client knows how --------------------
+
+def test_a_raw_seat_name_in_the_body_becomes_a_real_mention():
+    """A seat writes @blocks-android; Zulip renders that as plain text.
+
+    The post succeeds and mentions nobody, so the sending seat cannot see the
+    failure — which is why the conversion belongs here rather than in the seat.
+    """
+    from agent_comms.operations import zulip_addressing
+
+    assert zulip_addressing("ping @blocks-android please") == (
+        "ping @**blocks-android** please"
+    )
+
+
+def test_correct_syntax_is_left_alone():
+    from agent_comms.operations import zulip_addressing
+
+    assert zulip_addressing("@**blocks-arch** hi") == "@**blocks-arch** hi"
+
+
+def test_an_email_address_is_not_mangled():
+    from agent_comms.operations import zulip_addressing
+
+    assert zulip_addressing("mail a@b.com") == "mail a@b.com"
+
+
+def test_several_seats_in_one_message():
+    from agent_comms.operations import zulip_addressing
+
+    assert zulip_addressing("@blocks-arch and @orient-app") == (
+        "@**blocks-arch** and @**orient-app**"
+    )
+
+
+def test_send_to_addresses_by_plain_seat_name(seat, monkeypatch):
+    """`--to blocks-android`, not `--to @**blocks-android**`."""
+    from agent_comms import operations
+    from tests.conftest import FakeTransport
+
+    transport = FakeTransport()
+    operations.send("t: x", "please look", to="blocks-android",
+                    transport_factory=lambda c: transport)
+    assert transport.sent[-1]["content"].startswith("@**blocks-android** ")

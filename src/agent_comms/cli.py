@@ -109,10 +109,17 @@ def reply(message_id: int, content: str) -> None:
 
 @main.command()
 @click.option("--topic", required=True, help="Topic, named '<component>: <ask>'.")
+@click.option("--to", default=None,
+              help="Seat to address, by plain name (blocks-android). Not Zulip syntax.")
 @click.argument("content")
-def send(topic: str, content: str) -> None:
-    """Post to this seat's project channel."""
-    operations.send(topic, content)
+def send(topic: str, to: str | None, content: str) -> None:
+    """Post to this seat's project channel.
+
+    Address other seats by plain name — `--to blocks-android`, or `@blocks-android`
+    in the text. This client converts to Zulip's mention syntax; a seat that
+    writes `@name` raw would otherwise post text that mentions nobody.
+    """
+    operations.send(topic, content, to=to)
     click.echo("sent")
 
 
