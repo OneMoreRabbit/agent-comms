@@ -238,6 +238,11 @@ def test_doctor_treats_disabled_as_a_state_not_a_failure(seat):
 
 
 def test_doctor_reports_every_check_not_just_the_first(running_daemon, monkeypatch):
+    # The seat build is a real subprocess otherwise, so this test would report
+    # whatever build the machine running it happens to carry.
+    monkeypatch.setattr("agent_comms.operations.seat_version_now",
+                        lambda: __import__("agent_comms.seat", fromlist=["x"]).SeatVersion(
+                            seat="0.3.3", contract="0.3.3"))
     monkeypatch.setattr("agent_comms.operations.seat_status_now",
                         lambda: __import__("agent_comms.seat", fromlist=["x"]).SeatStatus(
                             verdict="addressable", runtime="claude", target="rc:0.0", awake=True))
@@ -245,7 +250,7 @@ def test_doctor_reports_every_check_not_just_the_first(running_daemon, monkeypat
     report = operations.preflight(transport_factory=lambda c: FakeTransport())
     names = [n for n, _, _ in report.checks]
     assert names == ["enabled", "credential", "identity", "subscription",
-                     "event queue", "deliverable", "daemon"]
+                     "event queue", "deliverable", "seat build", "daemon"]
     assert report.ok
     assert report.warnings == []
     assert any("Honoured" in n for n in report.notes)

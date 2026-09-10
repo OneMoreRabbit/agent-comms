@@ -317,3 +317,56 @@ def test_a_hold_tells_the_sender_how_long_it_might_wait():
                    Persistence(survives=("container-restart",), lost_on=("host-reboot",)))
     assert "survives container-restart" in outcome
     assert "lost on host-reboot" in outcome
+
+
+# -- which build answered: seat --version, contractual from 0.3.3 -------------
+
+def _fake_seat(monkeypatch, stdout: str, code: int = 0):
+    import subprocess as sp
+
+    class R:
+        returncode, stderr = code, ""
+    R.stdout = stdout
+    monkeypatch.setattr(seat_mod, "seat_available", lambda: True)
+    monkeypatch.setattr(sp, "run", lambda *a, **k: R)
+    monkeypatch.setattr(seat_mod.subprocess, "run", lambda *a, **k: R)
+
+
+def test_version_reads_the_contracted_json(monkeypatch):
+    _fake_seat(monkeypatch, '{"seat":"0.3.3","contract":"0.3.3"}\n')
+    v = seat_mod.version()
+    assert (v.seat, v.contract) == ("0.3.3", "0.3.3")
+    assert not v.below()
+
+
+def test_version_reads_an_0_3_0_seat_that_prints_prose_first(monkeypatch):
+    """0.3.0 printed the two prose lines, then the object.
+
+    Both shapes are on real seats during a rollout, so the reader scans for the
+    object rather than parsing the whole stream. Measured on this seat_mod.
+    """
+    _fake_seat(monkeypatch,
+               "seat 0.3.0\ncontract devagent-seat-contract 0.5 (ADR-0011)\n"
+               '{"seat":"0.3.0","contract":"0.5"}\n')
+    v = seat_mod.version()
+    assert v.seat == "0.3.0"
+    assert v.below(), "older than the build this client is written against"
+    assert "0.3.3" in v.summary()
+
+
+def test_version_falls_back_to_the_plain_form(monkeypatch):
+    _fake_seat(monkeypatch, "seat 0.3.4\ncontract devagent-seat-contract 0.3.4 (ADR-0011)\n")
+    assert seat_mod.version().seat == "0.3.4"
+
+
+def test_version_sorts_numerically_not_lexically(monkeypatch):
+    """0.3.10 is newer than 0.3.9 — the trap that nearly numbered our own release."""
+    _fake_seat(monkeypatch, '{"seat":"0.3.10","contract":"0.3.10"}\n')
+    assert not seat_mod.version().below("0.3.9")
+
+
+def test_an_unreadable_version_is_unknown_not_old(monkeypatch):
+    _fake_seat(monkeypatch, "who knows\n")
+    v = seat_mod.version()
+    assert not v.known and not v.below()
+    assert "unknown" in v.summary()

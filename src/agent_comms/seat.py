@@ -117,6 +117,103 @@ class Awake:
         return self.state is not True
 
 
+#: The seat contract this client is written against. Consumed per its own
+#: guidance: compare on `.seat`, because a build below 0.3.1 could misreport the
+#: contract it implements — 0.3.0 shipped saying `contract 0.5` after the
+#: renumber, having held the two as separate literals.
+MINIMUM_SEAT = "0.3.3"
+
+
+@dataclass
+class SeatVersion:
+    """Which build of `seat` this is. Contractual from 0.3.3."""
+
+    seat: str = ""
+    contract: str = ""
+    raw: str = ""
+
+    @property
+    def known(self) -> bool:
+        return bool(self.seat)
+
+    def below(self, minimum: str = MINIMUM_SEAT) -> bool:
+        """Is this build older than the one this client is written against?
+
+        Compared as integer tuples, so `0.3.10` sorts above `0.3.9` — the trap
+        that made us propose `0.3.0` for our own release when we were at 0.17.
+        An unparseable version is not treated as old: it is unknown, and the
+        caller says so rather than acting on a guess.
+        """
+        def parts(v: str) -> tuple[int, ...] | None:
+            try:
+                return tuple(int(x) for x in v.split("."))
+            except ValueError:
+                return None
+
+        mine, theirs = parts(self.seat), parts(minimum)
+        if mine is None or theirs is None:
+            return False
+        return mine < theirs
+
+    def summary(self) -> str:
+        if not self.known:
+            return "seat build unknown — `seat --version` did not report one"
+        line = f"seat {self.seat} (contract {self.contract or 'unstated'})"
+        if self.below():
+            line += (
+                f" — older than {MINIMUM_SEAT}, which this client is written against. "
+                "It will still work: 0.3.3 changed no calls or fields. What it cannot "
+                "do is guarantee a codex seat declares a thread id rather than a tmux "
+                "target, which is the corruption 0.3.2 fixed."
+            )
+        return line
+
+
+def version(timeout: int = 20) -> SeatVersion:
+    """Ask the seat which build it is.
+
+    Read leniently on purpose. From 0.3.1 `--json` emits the object and nothing
+    else, but 0.3.0 printed the two prose lines *first* and the object after —
+    so during a staged rollout both shapes are on real seats at once. Scanning
+    for the object rather than parsing the whole stream reads either.
+
+    That is tolerance of an older build, not a workaround of a live defect: the
+    defect is fixed, and this exists so a half-upgraded estate reports honestly
+    instead of reporting nothing.
+    """
+    if not seat_available():
+        raise SeatUnavailable(
+            "this seat has no `seat` command, so it cannot say which build it is."
+        )
+    try:
+        result = subprocess.run(
+            ["seat", "--version", "--json"],
+            text=True, capture_output=True, timeout=timeout, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return SeatVersion(raw=f"`seat --version` did not run: {exc}")
+
+    out = (result.stdout or "").strip()
+    for line in reversed(out.splitlines()):
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                payload = json.loads(line)
+            except ValueError:
+                continue
+            return SeatVersion(
+                seat=str(payload.get("seat") or ""),
+                contract=str(payload.get("contract") or ""),
+                raw=out,
+            )
+
+    # No object anywhere: fall back to the guaranteed plain form, `seat <v>`.
+    for line in out.splitlines():
+        if line.strip().startswith("seat "):
+            return SeatVersion(seat=line.strip().split()[1], raw=out)
+    return SeatVersion(raw=out)
+
+
 class SeatUnavailable(Exception):
     """This seat has no `seat` command, so nothing can be confirmed.
 

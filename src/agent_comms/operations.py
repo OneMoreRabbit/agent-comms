@@ -34,6 +34,7 @@ from .seat import SeatStatus, SeatUnavailable
 from .seat import awake as seat_awake_now
 from .seat import persistence as seat_persistence
 from .seat import status as seat_status_now
+from .seat import version as seat_version_now
 from .wake import WakeError, wake
 from .store import DaemonState, Mention, Store
 
@@ -182,6 +183,18 @@ def preflight(
         report.add("deliverable", ok, detail)
     except SeatUnavailable as exc:
         report.add("deliverable", False, str(exc))
+
+    # Which seat build answered the questions above. Contractual from 0.3.3, and
+    # consumed because a mixed estate is the normal state during a rollout: a
+    # verdict is only as good as the build that produced it, and until 0.3.1 a
+    # seat could misreport the contract it implemented.
+    try:
+        build = seat_version_now()
+        report.add("seat build", build.known, build.summary())
+        if build.known and build.below():
+            report.warnings.append(build.summary())
+    except SeatUnavailable as exc:
+        report.add("seat build", False, str(exc))
 
     # A daemon is what makes any of the above matter. Without one the checks
     # above all pass and the seat receives nothing — every other failure in this
