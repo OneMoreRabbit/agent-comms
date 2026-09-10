@@ -243,6 +243,73 @@ class Hub:
 
     # -- sending -----------------------------------------------------------
 
+    # -- who can be addressed ----------------------------------------------
+
+    def realm_names(self) -> list[str]:
+        """Every active account the hub knows, as it spells them.
+
+        Existence is the hub's answer, not a pattern we recognise: `@**name**`
+        for a name the realm does not hold renders as literal text, and the post
+        succeeds. The sender cannot see that, which is why it is checked here.
+        """
+        users = self._t.call_endpoint(url="users", method="GET")
+        if users.get("result") != "success":
+            raise NotSubscribed(
+                f"could not list realm users ({users.get('msg') or users!r}); refusing to "
+                "post a mention that may not resolve."
+            )
+        return sorted(
+            u["full_name"] for u in users.get("members", [])
+            if u.get("is_active") and u.get("full_name")
+        )
+
+    def addressable_names(self) -> list[str]:
+        """The seats this seat can address: in the realm **and** in this channel.
+
+        The second half is the one that bites. Measured on this hub:
+        `blocks-android` is a real bot and is *not* subscribed to `agent-eco`, so
+        a mention of it from here renders perfectly and reaches nobody — which is
+        indistinguishable from success. That is the failure of 2026-09-10.
+
+        The realm is the roster. There is no second list to maintain, and nothing
+        here is inferred from a name's shape.
+        """
+        subs = self._t.call_endpoint(url="users/me/subscriptions", method="GET")
+        if subs.get("result") != "success":
+            raise NotSubscribed(
+                f"could not list this bot's subscriptions ({subs.get('msg') or subs!r}), "
+                "so who is reachable in this channel cannot be established."
+            )
+        stream_id = next(
+            (s.get("stream_id") for s in subs.get("subscriptions", [])
+             if s.get("name") == self._settings.channel),
+            None,
+        )
+        if stream_id is None:
+            raise NotSubscribed(
+                f"this bot is not subscribed to channel '{self._settings.channel}', so it "
+                "cannot address anyone in it."
+            )
+
+        members = self._t.call_endpoint(url=f"streams/{stream_id}/members", method="GET")
+        if members.get("result") != "success":
+            raise NotSubscribed(
+                f"could not list the subscribers of '{self._settings.channel}' "
+                f"({members.get('msg') or members!r}); refusing to guess who is reachable."
+            )
+        here = set(members.get("subscribers", []))
+
+        users = self._t.call_endpoint(url="users", method="GET")
+        if users.get("result") != "success":
+            raise NotSubscribed(
+                f"could not list realm users ({users.get('msg') or users!r}); refusing to "
+                "post a mention that may not resolve."
+            )
+        return sorted(
+            u["full_name"] for u in users.get("members", [])
+            if u.get("user_id") in here and u.get("is_active") and u.get("full_name")
+        )
+
     def send(self, channel: str, topic: str, content: str) -> dict:
         """Post as this seat's bot. Attribution is automatic and not optional."""
         return self._t.call_endpoint(

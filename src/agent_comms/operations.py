@@ -281,7 +281,7 @@ def show(message_id: int, **kw) -> Mention | None:
 
 
 class Unaddressed(CommsError):
-    """This message would reach nobody. Refused before it is posted.
+    """This message names no recipient. Refused before it is posted.
 
     The failure it prevents, observed on blocks 2026-09-10: arch posted under
     its **own** topic prefix with the recipients typed as plain text. Comms
@@ -293,6 +293,18 @@ class Unaddressed(CommsError):
     tag = "unaddressed"
 
 
+class UnknownRecipient(CommsError):
+    """`--to` named a seat this seat cannot address. Refused before it is posted.
+
+    Two ways to earn this, and they are different problems: a name that exists
+    nowhere in the realm (a typo, or a seat that was never minted), and a name
+    that exists but is not in this seat's channel (real, reachable — just not
+    from here). Both are told apart in the message, because the fix differs.
+    """
+
+    tag = "unknown-recipient"
+
+
 def send(
     content: str,
     to: str | None = None,
@@ -301,94 +313,88 @@ def send(
     transport_factory: Callable[[Credential], Transport] = build_transport,
     **kw,
 ) -> dict:
-    """Post to this seat's project channel, addressed so it actually arrives.
+    """Post to this seat's project channel, addressed to a named seat.
 
-    **`--to` is the whole point: the agent names the seat, this client builds
-    the addressing.** Both routes at once — the topic becomes
-    `<recipient>: <subject>` and the body is prefixed with a real
-    `@**<recipient>**` mention — because the sender should not have to know
-    which of the two the recipient happens to match on.
+    **The protocol is one line: the sender names the seat, this client spells the
+    address.** `--to` is required and carries a plain seat name; the topic
+    becomes `<recipient>: <subject>` and the body is prefixed with a real
+    `@**<recipient>**` mention, so both of the two routes a recipient matches on
+    are covered without the sender knowing which.
 
-    `topic` remains for a deliberate topic, and is refused if it would reach
-    nobody.
+    **The body is never examined and never rewritten.** An earlier version
+    scanned message text for `@name` and converted it, which is guesswork about
+    prose — it has to decide what is a mention, what is an email address, what is
+    already correct, and it is wrong silently when it decides badly. Addressing
+    is structure, so it travels in a flag, not in the text.
+
+    The named seat is checked against the hub before anything is posted: it must
+    exist in the realm and be subscribed to this channel. A message to a seat
+    that cannot be reached from here is refused loudly rather than posted into
+    the void — which is the failure that started this, and which looks exactly
+    like success.
     """
     settings = load_settings(**kw)
 
-    if to:
-        recipient = to.lstrip("@").strip("*").strip()
-        if not topic:
-            if not subject:
-                raise Unaddressed(
-                    f"--to {recipient} needs a --subject, so the topic can be "
-                    f"'{recipient}: <subject>'. Without one there is no topic to post under."
-                )
-            topic = f"{recipient}: {subject}"
-        content = addressed(recipient, content)
-    else:
-        if subject and not topic:
-            topic = subject
-        if not topic:
-            raise Unaddressed(
-                "nothing to address this to: give --to <seat> (preferred), or a --topic."
-            )
-        content = zulip_addressing(content)
+    if not to or not to.strip():
+        raise Unaddressed(
+            "nothing to address this to. Every message names its recipient: "
+            "--to <seat> --subject '<what it is about>'. The body is not scanned "
+            "for addressing, so a seat named only in the text reaches nobody."
+        )
 
-    _refuse_if_unaddressed(settings, topic, content)
+    recipient = to.lstrip("@").strip("*").strip()
+    if not topic:
+        if not subject:
+            raise Unaddressed(
+                f"--to {recipient} needs a --subject, so the topic can be "
+                f"'{recipient}: <subject>'. Without one there is no topic to post under."
+            )
+        topic = f"{recipient}: {subject}"
 
     credential = load_credential(settings.identity)
     hub = Hub(transport_factory(credential), settings, credential)
-    return hub.send(settings.channel, topic, content)
+    recipient = _resolve_recipient(settings, hub, recipient)
+
+    return hub.send(settings.channel, topic, addressed(recipient, content))
 
 
-def _refuse_if_unaddressed(settings: Settings, topic: str, content: str) -> None:
-    """Refuse a message that would reach nobody.
+def _resolve_recipient(settings: Settings, hub: Hub, name: str) -> str:
+    """Return the recipient as Zulip spells it, or refuse and say why.
 
-    A topic prefixed with **our own** seat name addresses only us, and we ignore
-    our own posts. With no mention of anyone else either, the message is visible
-    on the channel and delivered nowhere — which looks exactly like a delivery
-    that worked.
+    Matched case-insensitively so a seat need not know the hub's capitalisation,
+    and returned in the hub's own spelling because that is what `@**...**` has to
+    contain to resolve. Addressing yourself is refused: a seat ignores its own
+    posts, so it is the one mention guaranteed to reach nobody.
     """
-    prefix = topic.split(":", 1)[0].strip().casefold() if ":" in topic else ""
     ours = {n.casefold() for n in settings.identity.canonical_names(settings.role)}
-    if prefix not in ours:
-        return
-    mentions = {m.casefold() for m in re.findall(r"@\*\*([^*]+)\*\*", content)}
-    if mentions - ours:
-        return
-    raise Unaddressed(
-        f"this would reach nobody. The topic '{topic}' is prefixed with this seat's own "
-        "name, so it addresses only us — and we ignore our own posts — and the body "
-        "mentions no other seat. Use --to <seat> so the topic names the recipient and "
-        "the mention is built for you. (This is the blocks failure of 2026-09-10.)"
+    if name.casefold() in ours:
+        raise UnknownRecipient(
+            f"'{name}' is this seat. A seat ignores its own posts, so this would "
+            "reach nobody. Name the seat you want to reach."
+        )
+
+    reachable = hub.addressable_names()
+    match = next((n for n in reachable if n.casefold() == name.casefold()), None)
+    if match is not None:
+        return match
+
+    others = ", ".join(n for n in reachable if n.casefold() not in ours) or "nobody"
+    exists = any(n.casefold() == name.casefold() for n in hub.realm_names())
+    if exists:
+        raise UnknownRecipient(
+            f"'{name}' exists on the hub but is not in channel '{settings.channel}', so a "
+            "mention of it here would render correctly and reach nobody. Reach it through "
+            "a channel you both sit in, or ask the estate to subscribe it. "
+            f"Reachable from here: {others}."
+        )
+    raise UnknownRecipient(
+        f"no seat named '{name}' exists on the hub — check the spelling. "
+        f"Reachable from here: {others}."
     )
 
 
-#: A seat name as a seat writes it: letters, digits, dashes, underscores.
-_RAW_MENTION = re.compile(r"(?<![\w*@])@([A-Za-z0-9][A-Za-z0-9_-]*)(?!\*\*)")
-
-
-def zulip_addressing(content: str) -> str:
-    """Convert seat-written addressing into Zulip's mention syntax.
-
-    **A seat should not have to know how Zulip spells a mention.** Left to it, a
-    seat writes `@blocks-android`, which Zulip renders as plain text — the
-    recipient is never mentioned, and the message reaches them only if the topic
-    happens to route. That is a silent addressing failure, and the seat has no
-    way to see it: the post succeeds.
-
-    So the seat addresses by **raw seat name** and this client converts. The
-    division is the same one the whole design runs on — the seat says *who*, the
-    client knows *how*.
-
-    Already-correct `@**name**` is left alone, so a seat that does know the
-    syntax is not punished for it, and an email address is untouched because the
-    `@` there is preceded by a word character.
-    """
-    return _RAW_MENTION.sub(r"@**\1**", content)
-
-
 def addressed(sender: str, content: str) -> str:
-    """Prefix a reply with an @-mention of whoever asked.
+    """Prefix a message with an @-mention of the seat it is for.
 
     Without this the arch↔component loop is invisible from the arch side: a
     seat's inbox is mention-based, and a reply posted into
@@ -396,17 +402,14 @@ def addressed(sender: str, content: str) -> str:
     So replies landed in the channel and the arch seat reported that nobody had
     answered — a false negative pointing the same way as the false `delivered`.
 
-    Mentioning the sender puts the reply in their inbox by the route they
-    already read, rather than requiring them to query Zulip directly, which is
-    the per-seat API integration the operator ruled against.
+    The name is turned into Zulip's `@**name**` syntax here and nowhere else,
+    and the body is passed through untouched. A seat writes seat names; only
+    this client writes hub syntax.
     """
-    body = zulip_addressing(content)
-    if not sender:
-        return body
-    name = sender.lstrip("@").strip("*").strip()
+    name = (sender or "").lstrip("@").strip("*").strip()
     if not name:
-        return body
-    return f"@**{name}** {body}"
+        return content
+    return f"@**{name}** {content}"
 
 
 def reply(
@@ -559,12 +562,19 @@ def _tell_sender(
     text: str,
     transport_factory: Callable[[Credential], Transport],
 ) -> None:
-    """Post back into the mention's own topic. Best effort, and logged if it fails."""
+    """Post back into the mention's own topic. Best effort, and logged if it fails.
+
+    Mentioning the sender for the same reason `reply` does: the topic is named
+    after *us*, so an arch seat filtering on its own topic prefix would never see
+    a "your message is held" notice posted there. A hold nobody is told about is
+    the silence §7b.5 exists to prevent.
+    """
     try:
         credential = load_credential(settings.identity)
         hub = Hub(transport_factory(credential), settings, credential)
         hub.send(mention.get("channel") or settings.channel,
-                 mention.get("topic") or f"{settings.identity.seat}: comms", text)
+                 mention.get("topic") or f"{settings.identity.seat}: comms",
+                 addressed(mention.get("sender") or "", text))
     except Exception as exc:
         store.record("warn", f"could not tell the sender about message "
                              f"{mention.get('id')}: {exc}")

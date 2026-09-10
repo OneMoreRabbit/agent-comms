@@ -7,4 +7,4 @@ is authoritative, and it carries the operating rules as well as the API
 §4 still binds you.
 """
 
-__version__ = "0.30.2"
+__version__ = "0.30.3"

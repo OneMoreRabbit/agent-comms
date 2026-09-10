@@ -108,21 +108,25 @@ def reply(message_id: int, content: str) -> None:
 
 
 @main.command()
-@click.option("--to", default=None,
-              help="Seat to address, by plain name (blocks-service). Preferred.")
+@click.option("--to", required=True,
+              help="The seat this message is for, by plain name (agent-skeleton).")
 @click.option("--subject", default=None, help="Subject; the topic becomes '<to>: <subject>'.")
-@click.option("--topic", default=None, help="Explicit topic, if you need one.")
+@click.option("--topic", default=None,
+              help="Continue an existing topic instead of starting one. Still needs --to.")
 @click.argument("content")
-def send(to: str | None, subject: str | None, topic: str | None, content: str) -> None:
-    """Post to this seat's project channel.
+def send(to: str, subject: str | None, topic: str | None, content: str) -> None:
+    """Post to this seat's project channel, addressed to a named seat.
 
-    Address by plain seat name and this client builds the addressing — both
-    routes at once, so it does not matter which one the recipient matches on:
+    You name the seat; this client spells the address:
 
-        comms send --to blocks-service --subject 'the ask' 'body text'
+        comms send --to agent-skeleton --subject 'the ask' 'body text'
 
-    gives the topic `blocks-service: the ask` and a real `@**blocks-service**`
-    mention. A message that would reach nobody is refused rather than posted.
+    gives the topic `agent-skeleton: the ask` and a real `@**agent-skeleton**`
+    mention — both routes a recipient matches on, so it does not matter which.
+
+    The body is never read or rewritten: a seat name typed in prose is prose.
+    The name in --to is checked against the hub first, and a seat that does not
+    exist or is not in this channel is refused rather than posted to.
     """
     operations.send(content, to=to, subject=subject, topic=topic)
     click.echo("sent")

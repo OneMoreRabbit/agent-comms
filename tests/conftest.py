@@ -15,8 +15,21 @@ class FakeTransport:
         event_batches: list[dict] | None = None,
         full_name: str = "agent-eco-agent-comms",
         is_bot: bool = True,
+        realm: list[str] | None = None,
+        channel_members: list[str] | None = None,
     ) -> None:
         self.subscriptions = subscriptions if subscriptions is not None else ["agent-eco"]
+        # Modelled on the live hub, measured 2026-09-10: `blocks-android` is a
+        # real bot in the realm and is NOT subscribed to `agent-eco`, so it
+        # exists and is unreachable from this seat. That distinction is the
+        # whole point of the reachability check, so the fake carries it.
+        self.realm = realm if realm is not None else [
+            "agent-comms", "agent-eco-arch", "agent-skeleton", "orchestrator",
+            "blocks-android", "blocks-service", "blocks-arch",
+        ]
+        self.channel_members = channel_members if channel_members is not None else [
+            "agent-comms", "agent-eco-arch", "agent-skeleton", "orchestrator",
+        ]
         self.full_name = full_name
         self.is_bot = is_bot
         self.register_result = register_result
@@ -35,7 +48,26 @@ class FakeTransport:
         if url == "users/me/subscriptions":
             return {
                 "result": "success",
-                "subscriptions": [{"name": n} for n in self.subscriptions],
+                "subscriptions": [
+                    {"name": n, "stream_id": 100 + i}
+                    for i, n in enumerate(self.subscriptions)
+                ],
+            }
+        if url == "users":
+            return {
+                "result": "success",
+                "members": [
+                    {"full_name": n, "user_id": 1 + i, "is_active": True, "is_bot": True}
+                    for i, n in enumerate(self.realm)
+                ],
+            }
+        if url.startswith("streams/") and url.endswith("/members"):
+            return {
+                "result": "success",
+                "subscribers": [
+                    1 + self.realm.index(n)
+                    for n in self.channel_members if n in self.realm
+                ],
             }
         if url == "messages":
             self.sent.append(request or {})
