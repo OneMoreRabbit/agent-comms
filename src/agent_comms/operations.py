@@ -7,9 +7,13 @@ raises. `cli.py` is the only module that formats for a human.
 
 from __future__ import annotations
 
+import atexit
 import json
 import re
+import signal
+import os
 import subprocess
+import sys
 import time
 import urllib.parse
 from dataclasses import asdict, dataclass, field
@@ -22,6 +26,7 @@ from .errors import (
     CommsError,
     ConflictingWakeTriggers,
     CredentialMissing,
+    DaemonAlreadyRunning,
     QueueGapError,
 )
 from .hub import Hub, Registration, Transport, build_transport
@@ -30,7 +35,7 @@ from .seat import awake as seat_awake_now
 from .seat import persistence as seat_persistence
 from .seat import status as seat_status_now
 from .wake import WakeError, wake
-from .store import Mention, Store
+from .store import DaemonState, Mention, Store
 
 
 @dataclass
@@ -44,6 +49,9 @@ class Status:
     channel: str | None = None
     credential: str | None = None
     ready: bool = False
+    #: Whether a daemon is actually watching the hub for this seat. `None` when
+    #: comms is off or unusable, where the question does not arise.
+    daemon: "DaemonState | None" = None
 
 
 def status(**kw) -> Status:
@@ -77,6 +85,10 @@ def status(**kw) -> Status:
     base.credential = credential.source
     base.detail = f"comms enabled for {settings.identity.bot_name} on channel '{settings.channel}'"
     base.ready = True
+    # Asked here rather than left to `doctor`: "is comms working?" is the
+    # question status exists to answer, and a configured seat with no daemon is
+    # not working — it is losing messages while reporting itself ready.
+    base.daemon = Store(settings.state_dir).daemon_state()
     return base
 
 
@@ -170,6 +182,14 @@ def preflight(
         report.add("deliverable", ok, detail)
     except SeatUnavailable as exc:
         report.add("deliverable", False, str(exc))
+
+    # A daemon is what makes any of the above matter. Without one the checks
+    # above all pass and the seat receives nothing — every other failure in this
+    # client's catalogue has that shape, and this one had it too until it was
+    # measured by hand on 2026-09-10.
+    daemon = Store(settings.state_dir).daemon_state()
+    report.add("daemon", daemon.running and not daemon.stale, daemon.summary())
+
     report.warnings.extend(registration.warnings)
     report.notes.extend(registration.notes)
     return report
@@ -580,6 +600,101 @@ def _tell_sender(
                              f"{mention.get('id')}: {exc}")
 
 
+def detach_daemon(log_path: str | None = None, **kw) -> int:
+    """Start the daemon in the background, detached from this shell.
+
+    A double fork with `setsid` between: the first fork lets this command
+    return, `setsid` puts the daemon in its own session so it has no controlling
+    terminal, and the second fork means it can never acquire one. The practical
+    effect is the one that matters on a seat — **closing the shell, or losing the
+    tmux session, no longer takes the daemon with it**, which is how this seat's
+    daemon has died more than once.
+
+    It is deliberately not a supervisor. Nothing restarts this process, and
+    saying so plainly is better than a half-restarter that hides the gap.
+    """
+    settings = load_settings(**kw)
+    store = Store(settings.state_dir)
+    store.ensure()
+
+    state = store.daemon_state()
+    if state.running:
+        raise DaemonAlreadyRunning(
+            f"a comms daemon is already running for this seat (pid {state.pid}, "
+            f"{state.summary()}). Two daemons mean two event queues and every mention "
+            "handled twice."
+        )
+
+    out = Path(log_path) if log_path else settings.state_dir / "daemon.out"
+
+    if os.fork() > 0:
+        # Reap the intermediate child immediately so it cannot linger as a zombie.
+        os.wait()
+        for _ in range(50):  # up to ~5s for the grandchild to take the lock
+            time.sleep(0.1)
+            state = store.daemon_state()
+            if state.running:
+                return state.pid or 0
+        raise CommsError(
+            f"the daemon was started but has not taken its lock within 5s. Look in {out} "
+            "for why — it is refusing to start rather than failing silently."
+        )
+
+    os.setsid()
+    if os.fork() > 0:
+        os._exit(0)
+
+    handle = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    devnull = os.open(os.devnull, os.O_RDONLY)
+    os.dup2(devnull, 0)
+    os.dup2(handle, 1)
+    os.dup2(handle, 2)
+    os.chdir("/")
+
+    try:
+        run_daemon(**kw)
+    except BaseException as exc:  # noqa: BLE001 - last line before the process ends
+        try:
+            store.record("warn", f"detached daemon exited: {type(exc).__name__}: {exc}")
+        finally:
+            os._exit(1)
+    os._exit(0)
+
+
+def _record_exits(store: Store) -> None:
+    """Make the daemon say so when it dies, however it dies.
+
+    It did not, and that is why this seat's daemon was down for five hours on
+    2026-09-10 with nothing in the log to say when or why — the gap had to be
+    inferred, which is the silent-failure shape this whole client exists to
+    refuse. Only the poll was guarded before; a signal or an exception anywhere
+    else left no record at all.
+
+    SIGTERM and SIGHUP are turned into `SystemExit` so the `atexit` line still
+    runs: SIGHUP matters because it is what arrives when the shell or tmux
+    session that launched the daemon goes away, which is the most common way one
+    dies on a seat with no supervisor. SIGKILL cannot be caught by anyone, and is
+    the one case still inferred from a stale heartbeat.
+    """
+    def _die(signum, _frame):
+        raise SystemExit(f"signal {signal.Signals(signum).name}")
+
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        try:
+            signal.signal(sig, _die)
+        except (ValueError, OSError, AttributeError):
+            pass  # not the main thread, or no such signal here: best effort
+
+    def _note() -> None:
+        exc = sys.exc_info()[1]
+        if exc is None:
+            store.record("info", "daemon stopped")
+        else:
+            store.record("warn", f"daemon stopped: {type(exc).__name__}: {exc}")
+
+    atexit.register(_note)
+
+
 def run_daemon(
     transport_factory: Callable[[Credential], Transport] = build_transport,
     max_iterations: int | None = None,
@@ -612,6 +727,12 @@ def run_daemon(
     hub.verify_subscription()
 
     registration = _resume_or_register(hub, store)
+    _record_exits(store)
+    # Beat once at startup. The first poll blocks until Zulip's heartbeat (~54s),
+    # so without this a freshly started daemon carries the *previous* daemon's
+    # last tick and reads as wedged for its first minute — a false alarm on the
+    # one signal that has to stay trustworthy.
+    store.save_position(registration.queue_id, registration.last_event_id)
 
     stored, iterations, backoff = 0, 0, 1
     while max_iterations is None or iterations < max_iterations:

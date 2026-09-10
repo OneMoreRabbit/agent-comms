@@ -119,3 +119,22 @@ def seat(tmp_path, monkeypatch):
     ):
         monkeypatch.delenv(var, raising=False)
     return home
+
+
+@pytest.fixture
+def running_daemon(seat):
+    """A seat with a daemon actually holding the lock and ticking.
+
+    Holds the real `flock` rather than faking the probe, because the probe *is*
+    the thing under test everywhere else: the seat's stale lock file sat on disk
+    for four days across several dead daemons, and only the lock told the truth.
+    """
+    from agent_comms.config import load_settings
+    from agent_comms.store import Store
+
+    store = Store(load_settings().state_dir)
+    store.ensure()
+    handle = store.acquire_daemon_lock()
+    store.save_position("queue-under-test", 1)
+    yield store
+    handle.close()

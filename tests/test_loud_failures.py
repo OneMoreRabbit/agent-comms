@@ -237,7 +237,7 @@ def test_doctor_treats_disabled_as_a_state_not_a_failure(seat):
     assert all(passed for _, passed, _ in report.checks)
 
 
-def test_doctor_reports_every_check_not_just_the_first(seat, monkeypatch):
+def test_doctor_reports_every_check_not_just_the_first(running_daemon, monkeypatch):
     monkeypatch.setattr("agent_comms.operations.seat_status_now",
                         lambda: __import__("agent_comms.seat", fromlist=["x"]).SeatStatus(
                             verdict="addressable", runtime="claude", target="rc:0.0", awake=True))
@@ -245,7 +245,7 @@ def test_doctor_reports_every_check_not_just_the_first(seat, monkeypatch):
     report = operations.preflight(transport_factory=lambda c: FakeTransport())
     names = [n for n, _, _ in report.checks]
     assert names == ["enabled", "credential", "identity", "subscription",
-                     "event queue", "deliverable"]
+                     "event queue", "deliverable", "daemon"]
     assert report.ok
     assert report.warnings == []
     assert any("Honoured" in n for n in report.notes)
@@ -253,7 +253,7 @@ def test_doctor_reports_every_check_not_just_the_first(seat, monkeypatch):
 
 # -- attribution: the bot must be who the vault thinks it is -----------------
 
-def test_component_bot_name_is_accepted_silently(seat, monkeypatch):
+def test_component_bot_name_is_accepted_silently(running_daemon, monkeypatch):
     monkeypatch.setattr("agent_comms.operations.seat_status_now",
                         lambda: __import__("agent_comms.seat", fromlist=["x"]).SeatStatus(
                             verdict="addressable", runtime="claude", target="rc:0.0", awake=True))

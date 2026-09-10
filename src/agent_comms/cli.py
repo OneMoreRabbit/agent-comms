@@ -41,10 +41,21 @@ def status() -> None:
         click.secho(f"comms: enabled but not usable ({st.tag})", fg="red", bold=True)
         click.echo(f"\n{st.detail}")
         sys.exit(EXIT_FAULT)
-    click.secho("comms: ready", fg="green", bold=True)
+    daemon = st.daemon
+    healthy = daemon is not None and daemon.running and not daemon.stale
+    if healthy:
+        click.secho("comms: ready", fg="green", bold=True)
+    else:
+        # Configured and not receiving is not "ready". Saying ready here is the
+        # reassuring green light over a seat that is losing its messages.
+        click.secho("comms: configured, but NOT RECEIVING", fg="red", bold=True)
     click.echo(f"  identity   {st.identity}")
     click.echo(f"  channel    {st.channel}")
     click.echo(f"  credential {st.credential}")
+    if daemon is not None:
+        click.secho(f"  daemon     {daemon.summary()}", fg=None if healthy else "red")
+    if not healthy:
+        sys.exit(EXIT_FAULT)
 
 
 @main.command()
@@ -163,13 +174,26 @@ def wake(message_id: int | None) -> None:
 
 @main.command()
 @click.option("--once", is_flag=True, help="One poll cycle, then exit. For testing.")
-def daemon(once: bool) -> None:
+@click.option("--detach", is_flag=True,
+              help="Run in the background, surviving the shell that started it.")
+@click.option("--log", type=click.Path(), default=None,
+              help="Where a detached daemon's stdout/stderr go (default ~/.comms/daemon.out).")
+def daemon(once: bool, detach: bool, log: str | None) -> None:
     """Hold the outbound connection and record what arrives.
 
     One long-lived process per comms-enabled seat. It never writes into the
     agent's working session: mentions go to the local store, and the seat's
     designated comms conversation reads them from there.
+
+    **--detach is not supervision.** It survives its parent shell, which is the
+    common way a daemon dies on a seat; it does not survive a container restart
+    or a kill, and nothing here restarts it. Real supervision belongs to the
+    deployer — see the daemon-supervision need raised with ansible-platform.
     """
+    if detach:
+        pid = operations.detach_daemon(log)
+        click.echo(f"daemon detached, pid {pid}. Check it with: comms status")
+        return
     stored = operations.run_daemon(max_iterations=1 if once else None)
     click.echo(f"stored {stored} mention(s)")
 
