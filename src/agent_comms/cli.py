@@ -108,18 +108,23 @@ def reply(message_id: int, content: str) -> None:
 
 
 @main.command()
-@click.option("--topic", required=True, help="Topic, named '<component>: <ask>'.")
 @click.option("--to", default=None,
-              help="Seat to address, by plain name (blocks-android). Not Zulip syntax.")
+              help="Seat to address, by plain name (blocks-service). Preferred.")
+@click.option("--subject", default=None, help="Subject; the topic becomes '<to>: <subject>'.")
+@click.option("--topic", default=None, help="Explicit topic, if you need one.")
 @click.argument("content")
-def send(topic: str, to: str | None, content: str) -> None:
+def send(to: str | None, subject: str | None, topic: str | None, content: str) -> None:
     """Post to this seat's project channel.
 
-    Address other seats by plain name — `--to blocks-android`, or `@blocks-android`
-    in the text. This client converts to Zulip's mention syntax; a seat that
-    writes `@name` raw would otherwise post text that mentions nobody.
+    Address by plain seat name and this client builds the addressing — both
+    routes at once, so it does not matter which one the recipient matches on:
+
+        comms send --to blocks-service --subject 'the ask' 'body text'
+
+    gives the topic `blocks-service: the ask` and a real `@**blocks-service**`
+    mention. A message that would reach nobody is refused rather than posted.
     """
-    operations.send(topic, content, to=to)
+    operations.send(content, to=to, subject=subject, topic=topic)
     click.echo("sent")
 
 

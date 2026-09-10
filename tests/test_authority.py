@@ -206,6 +206,82 @@ def test_send_to_addresses_by_plain_seat_name(seat, monkeypatch):
     from tests.conftest import FakeTransport
 
     transport = FakeTransport()
-    operations.send("t: x", "please look", to="blocks-android",
+    operations.send("please look", to="blocks-android", subject="the ask",
                     transport_factory=lambda c: transport)
     assert transport.sent[-1]["content"].startswith("@**blocks-android** ")
+    assert transport.sent[-1]["topic"] == "blocks-android: the ask", (
+        "the topic must name the RECIPIENT — arch naming itself is what failed on blocks"
+    )
+
+
+# -- the blocks failure: a message that reaches nobody ------------------------
+
+def test_a_message_addressed_only_to_ourselves_is_refused(seat):
+    """The blocks failure of 2026-09-10, made impossible.
+
+    arch posted under its OWN topic prefix with the recipients as plain text.
+    Comms routes by topic prefix or a real mention and ignores a seat's own
+    posts, so neither target was addressed and nothing was delivered — correct
+    behaviour with an invisible outcome.
+    """
+    from agent_comms import operations
+    from agent_comms.operations import Unaddressed
+    from tests.conftest import FakeTransport
+
+    transport = FakeTransport()
+    with pytest.raises(Unaddressed, match="would reach nobody"):
+        operations.send("please look at the deploy",
+                        topic="agent-comms: my own topic",
+                        transport_factory=lambda c: transport)
+    assert transport.sent == [], "nothing may be posted"
+
+
+def test_the_blocks_case_itself_now_arrives(seat):
+    """arch's actual message — own topic, recipient as plain text.
+
+    0.30.1 converts the raw name to a real mention, so this reaches the target
+    by the mention route rather than reaching nobody. The guard below catches
+    what is left: a message with no route at all.
+    """
+    from agent_comms import operations
+    from tests.conftest import FakeTransport
+
+    transport = FakeTransport()
+    operations.send("please look @blocks-service",
+                    topic="blocks-arch: kick off",
+                    transport_factory=lambda c: transport)
+    assert "@**blocks-service**" in transport.sent[-1]["content"]
+
+
+def test_our_own_topic_is_fine_when_another_seat_is_mentioned(seat):
+    """A real mention is a route, so this one does arrive."""
+    from agent_comms import operations
+    from tests.conftest import FakeTransport
+
+    transport = FakeTransport()
+    operations.send("@**blocks-service** please look",
+                    topic="agent-comms: my own topic",
+                    transport_factory=lambda c: transport)
+    assert transport.sent[-1]["topic"] == "agent-comms: my own topic"
+
+
+def test_to_without_subject_is_refused_rather_than_guessed(seat):
+    from agent_comms import operations
+    from agent_comms.operations import Unaddressed
+    from tests.conftest import FakeTransport
+
+    with pytest.raises(Unaddressed, match="needs a --subject"):
+        operations.send("body", to="blocks-service",
+                        transport_factory=lambda c: FakeTransport())
+
+
+def test_a_raw_mention_in_the_body_counts_as_addressing(seat):
+    """`@blocks-service` is converted first, so it is a real route by the time
+    the reachability check runs."""
+    from agent_comms import operations
+    from tests.conftest import FakeTransport
+
+    transport = FakeTransport()
+    operations.send("@blocks-service look", topic="agent-comms: mine",
+                    transport_factory=lambda c: transport)
+    assert "@**blocks-service**" in transport.sent[-1]["content"]

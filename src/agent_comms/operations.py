@@ -280,23 +280,87 @@ def show(message_id: int, **kw) -> Mention | None:
     return None
 
 
+class Unaddressed(CommsError):
+    """This message would reach nobody. Refused before it is posted.
+
+    The failure it prevents, observed on blocks 2026-09-10: arch posted under
+    its **own** topic prefix with the recipients typed as plain text. Comms
+    routes by topic prefix or by a real mention, and a seat ignores its own
+    posts — so neither target was addressed by any route and nothing was
+    delivered. Correct behaviour, invisible outcome.
+    """
+
+    tag = "unaddressed"
+
+
 def send(
-    topic: str,
     content: str,
     to: str | None = None,
+    subject: str | None = None,
+    topic: str | None = None,
     transport_factory: Callable[[Credential], Transport] = build_transport,
     **kw,
 ) -> dict:
-    """Post to this seat's project channel.
+    """Post to this seat's project channel, addressed so it actually arrives.
 
-    `to` addresses another seat **by its plain name** — `blocks-android`, not
-    `@**blocks-android**`. Knowing how Zulip spells a mention is this client's
-    job, not the sending seat's.
+    **`--to` is the whole point: the agent names the seat, this client builds
+    the addressing.** Both routes at once — the topic becomes
+    `<recipient>: <subject>` and the body is prefixed with a real
+    `@**<recipient>**` mention — because the sender should not have to know
+    which of the two the recipient happens to match on.
+
+    `topic` remains for a deliberate topic, and is refused if it would reach
+    nobody.
     """
     settings = load_settings(**kw)
+
+    if to:
+        recipient = to.lstrip("@").strip("*").strip()
+        if not topic:
+            if not subject:
+                raise Unaddressed(
+                    f"--to {recipient} needs a --subject, so the topic can be "
+                    f"'{recipient}: <subject>'. Without one there is no topic to post under."
+                )
+            topic = f"{recipient}: {subject}"
+        content = addressed(recipient, content)
+    else:
+        if subject and not topic:
+            topic = subject
+        if not topic:
+            raise Unaddressed(
+                "nothing to address this to: give --to <seat> (preferred), or a --topic."
+            )
+        content = zulip_addressing(content)
+
+    _refuse_if_unaddressed(settings, topic, content)
+
     credential = load_credential(settings.identity)
     hub = Hub(transport_factory(credential), settings, credential)
-    return hub.send(settings.channel, topic, addressed(to or "", content))
+    return hub.send(settings.channel, topic, content)
+
+
+def _refuse_if_unaddressed(settings: Settings, topic: str, content: str) -> None:
+    """Refuse a message that would reach nobody.
+
+    A topic prefixed with **our own** seat name addresses only us, and we ignore
+    our own posts. With no mention of anyone else either, the message is visible
+    on the channel and delivered nowhere — which looks exactly like a delivery
+    that worked.
+    """
+    prefix = topic.split(":", 1)[0].strip().casefold() if ":" in topic else ""
+    ours = {n.casefold() for n in settings.identity.canonical_names(settings.role)}
+    if prefix not in ours:
+        return
+    mentions = {m.casefold() for m in re.findall(r"@\*\*([^*]+)\*\*", content)}
+    if mentions - ours:
+        return
+    raise Unaddressed(
+        f"this would reach nobody. The topic '{topic}' is prefixed with this seat's own "
+        "name, so it addresses only us — and we ignore our own posts — and the body "
+        "mentions no other seat. Use --to <seat> so the topic names the recipient and "
+        "the mention is built for you. (This is the blocks failure of 2026-09-10.)"
+    )
 
 
 #: A seat name as a seat writes it: letters, digits, dashes, underscores.
