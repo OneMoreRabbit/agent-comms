@@ -92,6 +92,22 @@ than the contracted `zuliprc-<project>-<seat>`, and the bot is named
 `agent-comms` rather than `<project>-<seat>` (ADR-0009 §1a). Both are accepted so
 the seat works; both are raised with the estate.
 
+## Versioning
+
+**The `0.30` line is held until the operator says otherwise.** Routine work
+increments the third digit — `0.30.1`, `0.30.2`, … — and the middle number moves
+**only on the operator's instruction**, to keep major releases aligned with
+`agent-skeleton`.
+
+Two things this exists to prevent, both of which nearly happened:
+
+- **Releases that sort backwards.** The line was briefly going to be `0.3.0`,
+  which sorts *below* the `0.17.0` it replaced — so any "latest tag" resolution
+  would have kept installing the pre-seat client. `0.30.0` sorts above it.
+- **A stale tag being deployed.** `main` is the release branch and is merged
+  **only on the operator's instruction**. Pin the exact tag; never ask for
+  "newest".
+
 ## Development
 
 ```sh
