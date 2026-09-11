@@ -19,11 +19,20 @@ import shutil
 import subprocess
 from dataclasses import dataclass, field
 
-#: Exit codes from `seat status`, per contract 0.5.
+#: Exit codes from `seat status`. The contract's stable surface: reasons are
+#: prose and may be reworded, verdict strings are a convenience, exit codes are
+#: the interface. An exit we do not recognise is `undetermined`, never fine.
 ADDRESSABLE = 0
 NOT_ADDRESSABLE = 10
 BROKEN = 20
 UNDETERMINED = 30
+
+VERDICTS = {
+    ADDRESSABLE: "addressable",
+    NOT_ADDRESSABLE: "not-addressable",
+    BROKEN: "broken",
+    UNDETERMINED: "undetermined",
+}
 
 @dataclass
 class SeatStatus:
@@ -37,11 +46,37 @@ class SeatStatus:
     #: Where to send: a tmux target for claude, the thread id for codex.
     target: str = ""
     pinned: str | None = None
+    #: How many agent sessions are running, per runtime. `None` for a runtime
+    #: the seat could not ask, which is **not** the same as 0.
+    sessions: dict = field(default_factory=dict)
     raw: dict = field(default_factory=dict)
 
     @property
     def addressable(self) -> bool:
         return self.verdict == "addressable"
+
+    @property
+    def session_running(self) -> int | None:
+        """Sessions running for the runtime this seat declares, or `None` if unknown."""
+        value = self.sessions.get(self.runtime)
+        return value if isinstance(value, int) else None
+
+    @property
+    def waiting(self) -> bool:
+        """Deliverable, but nothing is running to read it yet.
+
+        A pinned codex thread takes a message whether or not the thread is
+        loaded — codex has its own queue and the message waits there until the
+        thread next runs (`agent-skeleton-addressable-logic` 0.1, measured on
+        their seat with the app-server stopped). So the verdict is `addressable`
+        either way, and the exit code cannot tell the two apart.
+
+        The **session count** can, and it is a declared field rather than prose:
+        zero sessions for the declared runtime means the message will wait. That
+        is worth telling a sender, because the remedy is theirs — wake the seat —
+        and because silence for an hour otherwise looks like a fault.
+        """
+        return self.deliverable and self.session_running == 0
 
     @property
     def attending(self) -> bool:
@@ -107,7 +142,7 @@ class Persistence:
 #: guidance: compare on `.seat`, because a build below 0.3.1 could misreport the
 #: contract it implements — 0.3.0 shipped saying `contract 0.5` after the
 #: renumber, having held the two as separate literals.
-MINIMUM_SEAT = "0.4.0"
+MINIMUM_SEAT = "0.5.1"
 
 
 @dataclass
@@ -148,11 +183,12 @@ class SeatVersion:
         if self.below():
             line += (
                 f" — older than {MINIMUM_SEAT}, which this client is written against. "
-                "It will still work: no call or field changed. What it cannot do is "
-                "vouch for WHICH claude process the declared target holds. Below 0.4.0 "
-                "several processes can share one conversation id and the seat picks "
-                "among them, so a message can be typed into a stale instance and "
-                "reported delivered. 0.4.0 records the pid it started and verifies that."
+                "No call or field changed, so it works. Two things an older build "
+                "cannot do: vouch for WHICH claude process the declared target holds "
+                "(0.4.0 records the pid it started, so below that a message can be "
+                "typed into a stale instance), and report a pinned codex thread as "
+                "deliverable while nothing is loaded (0.5.1 — below it, a seat that "
+                "would have taken the message says it would be lost)."
             )
         return line
 
@@ -249,15 +285,30 @@ def status(timeout: int = 20) -> SeatStatus:
             ),
         )
 
-    verdict = payload.get("verdict") or "undetermined"
+    # **The exit code is the verdict.** The contract says so from 0.5.1:
+    # "branch on the exit code, not this string". A string can be reworded and
+    # a reason is explicitly for people; an exit code is the stable surface.
+    # The string is still read, and a disagreement is reported rather than
+    # silently resolved — two sources for one fact is how this client got into
+    # trouble before.
+    verdict = VERDICTS.get(result.returncode, "undetermined")
+    declared = payload.get("verdict")
+    reason = payload.get("reason") or ""
+    if declared and declared != verdict:
+        reason = (
+            f"the seat exited {result.returncode} ({verdict}) but its JSON says "
+            f"{declared!r}; taking the exit code. Original reason: {reason}"
+        )
     awake = payload.get("awake")
+    sessions = payload.get("sessions")
     return SeatStatus(
         verdict=verdict,
-        reason=payload.get("reason") or "",
+        reason=reason,
         runtime=payload.get("runtime") or "",
         awake=awake if isinstance(awake, bool) else None,
         target=payload.get("target") or "",
         pinned=payload.get("pinned"),
+        sessions=sessions if isinstance(sessions, dict) else {},
         raw=payload,
     )
 

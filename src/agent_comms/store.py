@@ -289,6 +289,24 @@ class Store:
         elif marker.exists():
             marker.unlink()
 
+    def sleeping_waiting(self) -> bool:
+        """Have we already told senders their messages are waiting to be read?
+
+        Distinct from `sleeping`: that one means nothing was delivered at all.
+        This one means delivery worked and nothing is running to read it — a
+        pinned codex thread with no session. Two different things to be told,
+        and each is said once.
+        """
+        return (self.root / "waiting").exists()
+
+    def set_sleeping_waiting(self, value: bool) -> None:
+        self.ensure()
+        marker = self.root / "waiting"
+        if value:
+            marker.touch()
+        elif marker.exists():
+            marker.unlink()
+
     def unreachable(self) -> bool:
         return (self.root / "unreachable").exists()
 

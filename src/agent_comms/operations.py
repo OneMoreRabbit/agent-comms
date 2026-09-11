@@ -534,6 +534,7 @@ def wake_agent(
     store = Store(settings.state_dir)
     store.ensure()
 
+    status = None
     try:
         status = seat_status_now()
     except SeatUnavailable as exc:
@@ -549,19 +550,43 @@ def wake_agent(
 
     queued = outcome.startswith("queued")
     store.record("info" if not queued else "warn", f"wake: {outcome}")
+
     if queued:
+        # **Not deliverable, and the sender is told why in the seat's own words.**
+        # Said once per dormant spell: a seat repeating "still asleep" at every
+        # message is the noise that teaches people to skip the notice.
         if not store.sleeping():
             store.set_sleeping(True)
+            reason = status.hold_reason() if status is not None else outcome[len("queued: "):]
             _tell_sender(
                 settings, store, mention,
-                "queued — no agent session is running on this seat, so nothing has read "
-                "this yet. It is stored and will be taken up when a session next starts "
-                "(ADR-0009 §7e: a message never starts an agent). Saying so once rather "
-                "than repeating it for every message while asleep.",
+                f"**not deliverable right now** — {reason}\n\n"
+                "Your message is stored on this seat and will be taken up when the seat "
+                "can take it (ADR-0009 §7e: a message never starts an agent). Saying so "
+                "once rather than repeating it while the seat stays this way.",
                 transport_factory,
             )
-    else:
-        store.set_sleeping(False)
+        return outcome
+
+    store.set_sleeping(False)
+
+    # **Delivered, but nothing is running to read it.** A pinned codex thread
+    # takes a message whether or not anything is loaded — it waits in codex's
+    # own queue — so this is a successful delivery with a delay the sender
+    # cannot otherwise see. The remedy is theirs, so give it to them.
+    if status is not None and status.waiting and not store.sleeping_waiting():
+        store.set_sleeping_waiting(True)
+        _tell_sender(
+            settings, store, mention,
+            f"**queued — no {status.runtime} session is running on this seat.** The "
+            "message reached the thread's queue and will be read when the seat next "
+            f"wakes; nothing is lost. To have it read now, the seat needs waking "
+            f"(`seat start {status.runtime}`) — waking is the operator's, not mine "
+            "(ADR-0009 §7e). Saying so once rather than at every message.",
+            transport_factory,
+        )
+    elif status is not None and not status.waiting:
+        store.set_sleeping_waiting(False)
     return outcome
 
 
