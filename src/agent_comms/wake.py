@@ -28,7 +28,7 @@ import shutil
 import subprocess
 import time
 
-from .seat import Awake, Persistence, SeatStatus
+from .seat import Persistence, SeatStatus
 
 #: How much of a message is sent inline before it is pointed at instead.
 INLINE_LIMIT = 1200
@@ -175,19 +175,17 @@ SENDERS = {"claude": send_claude, "codex": send_codex}
 # dispatch
 # ---------------------------------------------------------------------------
 
-def wake(mention: dict, status: SeatStatus, awake: Awake | None = None,
+def wake(mention: dict, status: SeatStatus,
          persistence: Persistence | None = None) -> str:
     """Deliver a mention, or say why it is being held.
 
-    Two questions, two commands, each answered by the seat:
+    Two questions, one command: `seat status --json` reports the verdict *and*
+    `awake`, and agent-skeleton now answers both from one shared check.
 
-    - `seat status` — can this seat be spoken to, and where?
-    - `seat awake`  — is its agent actually attending?
-
-    They are asked separately because they *are* separate, and because only the
-    dedicated command asks the runtime. Taking wakefulness off `status` was our
-    error: on codex that field is set by a branch that never reaches the
-    app-server, so a live thread read asleep.
+    It was two commands until 2026-09-11. `seat awake` existed because the
+    status field had been set by a codex branch that never reached the
+    app-server, so a live thread read asleep. That is fixed at the source; a
+    second call asking the same check the same question was work for nothing.
 
     A returned string starting `queued:` means held — the message stays in the
     store and is retried when the seat next reports itself deliverable.
@@ -201,9 +199,9 @@ def wake(mention: dict, status: SeatStatus, awake: Awake | None = None,
     if not status.addressable:
         return f"queued: {status.hold_reason()}{wait}"
 
-    if awake is not None and awake.holds:
-        state = "asleep" if awake.state is False else "of unknown wakefulness"
-        detail = f" — {awake.reason}" if awake.reason else ""
+    if not status.attending:
+        state = "asleep" if status.awake is False else "of unknown wakefulness"
+        detail = f" — {status.reason}" if status.reason else ""
         return (
             f"queued: the seat is addressable but its agent is {state}{detail}. "
             f"Held until it wakes; waking is the operator's (ADR-0009 §7e).{wait}"

@@ -533,3 +533,58 @@ def test_someone_else_in_our_topic_still_reaches_us(seat):
         "content": "please look at this", "timestamp": 1, "stream_id": 7, "type": "stream"}}
     transport = FakeTransport(event_batches=[{"result": "success", "events": [other]}])
     assert operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1) == 1
+
+
+# -- the permission check must not be able to kill the daemon -----------------
+
+def test_a_hub_failure_in_the_permission_check_holds_rather_than_killing(seat):
+    """0.40.2 introduced this and it is the class this client exists to refuse.
+
+    The permission check asks the hub, and the loop it runs in sits outside the
+    guard around `get_events`. Unguarded, one transport hiccup ends the daemon —
+    silently, until someone notices nothing is arriving.
+    """
+    class Flaky(FakeTransport):
+        def call_endpoint(self, url, method="GET", request=None):
+            if url == "users":
+                raise ConnectionError("hub said no")
+            return super().call_endpoint(url, method, request)
+
+    transport = Flaky(event_batches=[{"result": "success", "events": [
+        {"id": 1, "type": "message", "flags": ["mentioned"], "message": {
+            "id": 701, "sender_full_name": "agent-eco-arch", "display_recipient": "agent-eco",
+            "subject": "agent-comms: ping", "content": "hello",
+            "timestamp": 1, "stream_id": 7}},
+    ]}])
+    notified = []
+    stored = operations.run_daemon(transport_factory=lambda c: transport,
+                                   max_iterations=1, on_mention=notified.append)
+
+    assert stored == 1, "the daemon survived and stored the message"
+    assert notified == [], "held: an undetermined permission is not a yes"
+    log = (seat / ".comms" / "events.log").read_text()
+    assert "could not determine whether" in log
+    assert "holding the message rather than refusing it" in log
+
+
+def test_an_undetermined_permission_does_not_bounce(seat):
+    """A non-answer is not a refusal, and telling the sender otherwise would be
+    a false accusation the estate would then try to fix in the directory."""
+    posted = []
+
+    class Flaky(FakeTransport):
+        def call_endpoint(self, url, method="GET", request=None):
+            if url == "users":
+                raise ConnectionError("hub said no")
+            if url == "messages":
+                posted.append(request)
+            return super().call_endpoint(url, method, request)
+
+    transport = Flaky(event_batches=[{"result": "success", "events": [
+        {"id": 1, "type": "message", "flags": ["mentioned"], "message": {
+            "id": 702, "sender_full_name": "agent-eco-arch", "display_recipient": "agent-eco",
+            "subject": "agent-comms: ping", "content": "hello",
+            "timestamp": 1, "stream_id": 7}},
+    ]}])
+    operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
+    assert not any("did not reach the agent" in (p.get("content") or "") for p in posted)

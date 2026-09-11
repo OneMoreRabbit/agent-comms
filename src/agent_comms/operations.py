@@ -33,7 +33,6 @@ from .errors import (
 )
 from .hub import Hub, Registration, Transport, build_transport
 from .seat import SeatStatus, SeatUnavailable
-from .seat import awake as seat_awake_now
 from .seat import persistence as seat_persistence
 from .seat import status as seat_status_now
 from .seat import version as seat_version_now
@@ -177,11 +176,9 @@ def preflight(
     try:
         sess = seat_status_now()
         detail = f"seat status: {sess.verdict}" + (f" — {sess.reason}" if sess.reason else "")
-        ok = sess.addressable
+        ok = sess.deliverable
         if sess.addressable:
-            aw = seat_awake_now()
-            ok = not aw.holds
-            detail += f" | seat awake: {aw.state}" + (f" — {aw.reason}" if aw.reason else "")
+            detail += f" | awake: {sess.awake}"
         report.add("deliverable", ok, detail)
     except SeatUnavailable as exc:
         report.add("deliverable", False, str(exc))
@@ -539,12 +536,11 @@ def wake_agent(
 
     try:
         status = seat_status_now()
-        awake = seat_awake_now() if status.addressable else None
     except SeatUnavailable as exc:
         outcome = f"queued: {exc}"
     else:
         try:
-            outcome = wake(mention, status, awake, seat_persistence())
+            outcome = wake(mention, status, seat_persistence())
         except WakeError as exc:
             store.record("warn", f"delivery failed for message {mention.get('id')}: {exc}")
             _tell_sender(settings, store, mention,
@@ -598,9 +594,14 @@ def _refuse_sender(
     bounced.add(key)
 
     in_project, _ = hub.in_channel(mention.sender)
+    # **Into the sender's own topic**, not a topic of our own. Found by the live
+    # test on 2026-09-11: the reply went to `agent-comms: not a permitted sender`
+    # while the operator sat in the topic they had posted in, so from their side
+    # the refusal was silent. The unit test asserted the post existed and passed,
+    # which is exactly the check that cannot see this.
     _post(
         settings, store, mention.channel or settings.channel,
-        f"{settings.identity.seat}: not a permitted sender",
+        mention.topic or f"{settings.identity.seat}: not a permitted sender",
         f"@**{mention.sender}** **your message was not delivered to "
         f"{settings.identity.seat}.** {directory.refusal(mention.sender, in_project=in_project)}"
         f"\n\nIt is stored on the seat and visible to the operator, but it did not reach "
@@ -848,9 +849,32 @@ def run_daemon(
             continue
 
         for event in events:
+            # The permission check asks the hub, so it can fail — and this loop
+            # sits outside the guard around `get_events`. Unguarded, a single
+            # transport hiccup would end the daemon, which is the silent-death
+            # class this client exists to refuse; 0.40.2 introduced it and this
+            # closes it. An undetermined permission **holds**: stored, visible,
+            # not delivered, and not bounced — the same rule as the seat's own
+            # `undetermined` verdict, because an answer nobody could get is not
+            # a "no", it is a "not now".
+            undetermined = False
+
+            def _permitted(name: str) -> bool:
+                nonlocal undetermined
+                try:
+                    return is_permitted(directory, hub, name)
+                except Exception as exc:  # noqa: BLE001 - any hub failure
+                    undetermined = True
+                    store.record(
+                        "warn",
+                        f"could not determine whether {name!r} may message this seat "
+                        f"({exc}); holding the message rather than refusing it.",
+                    )
+                    return False
+
             mention = mention_from_event(
                 credential.site, event, settings, credential.email,
-                permitted=lambda name: is_permitted(directory, hub, name),
+                permitted=_permitted,
             )
             if mention is None:
                 continue
@@ -865,6 +889,8 @@ def run_daemon(
                 # It is still stored, still visible in `comms inbox`, and the
                 # sender is told once, so nothing is silent and a wrong
                 # directory is recoverable.
+                if undetermined:
+                    continue  # held, already logged; no bounce for a non-answer
                 _refuse_sender(settings, store, mention, directory, hub,
                                bounced, transport_factory)
                 continue

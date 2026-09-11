@@ -11,6 +11,7 @@ honest. The interesting one is `verify_lifespan`: see its docstring.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -60,6 +61,7 @@ class Hub:
         self._settings = settings
         self._credential = credential
         self._roster: dict[str, bool] | None = None
+        self._roster_at = 0.0
 
     # -- §3: bot not subscribed to its channel -----------------------------
 
@@ -261,13 +263,27 @@ class Hub:
         """
         if self._roster is None or refresh:
             self._roster = self._fetch_roster()
+            self._roster_at = time.monotonic()
         return self._roster
 
+    #: A miss re-fetches at most this often. Without it a sender who is simply
+    #: not a member — someone else's conversation in a shared channel — costs a
+    #: hub call per message, which is both waste and a wider window for the
+    #: transport to fail in.
+    MISS_REFETCH_SECS = 60
+
     def in_channel(self, name: str) -> tuple[bool, bool]:
-        """`(is in my channel, is a human)` for one name, re-fetching on a miss."""
+        """`(is in my channel, is a human)`, re-fetching at most once a minute on a miss.
+
+        A miss is worth one fetch because the alternative is refusing a seat the
+        estate minted five minutes ago on the strength of a stale list. It is not
+        worth a fetch every time, because most misses are permanent.
+        """
         folded = name.strip().casefold()
         roster = self.channel_roster()
-        if folded not in roster:
+        if folded not in roster and (
+            time.monotonic() - self._roster_at > self.MISS_REFETCH_SECS
+        ):
             roster = self.channel_roster(refresh=True)
         if folded not in roster:
             return False, False

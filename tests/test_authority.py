@@ -203,8 +203,15 @@ def test_the_refused_sender_is_told_why(seat):
     posted = _posts_from(FakeTransport, events=[
         {"result": "success", "events": [_event(803, "blocks-android")]}])
 
-    refusals = [p for p in posted if "not a permitted sender" in p["topic"]]
+    # **In the sender's own topic.** The live test of 2026-09-11 found the
+    # refusal posted to a topic of our own, where the sender was not looking —
+    # and an earlier version of this test passed while that was true, because it
+    # asserted only that a post existed.
+    refusals = [p for p in posted if "did not reach the agent" in p["content"]]
     assert len(refusals) == 1
+    assert refusals[0]["topic"] == "agent-comms: do a thing", (
+        "the refusal must land where the sender is reading"
+    )
     body = refusals[0]["content"]
     assert "@**blocks-android**" in body, "addressed, or the sender never sees it"
     assert "did not reach the agent" in body
@@ -219,7 +226,7 @@ def test_the_sender_is_told_only_once(seat):
         {"result": "success", "events": [_event(804, "blocks-android")]},
         {"result": "success", "events": [_event(805, "blocks-android")]},
     ])
-    assert len([p for p in posted if "not a permitted sender" in p["topic"]]) == 1
+    assert len([p for p in posted if "did not reach the agent" in p["content"]]) == 1
 
 
 # -- the arch<->component loop must be visible from both ends -----------------

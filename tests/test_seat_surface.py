@@ -13,7 +13,7 @@ import pytest
 
 from agent_comms import seat as seat_mod
 from agent_comms import wake as wake_mod
-from agent_comms.seat import Awake, SeatStatus, SeatUnavailable
+from agent_comms.seat import SeatStatus, SeatUnavailable
 from agent_comms.wake import WakeError, wake
 
 MENTION = {"id": 1, "sender": "arch", "topic": "t", "content": "go"}
@@ -85,19 +85,27 @@ def test_no_seat_command_raises_rather_than_guessing(monkeypatch):
 
 
 # -- awake: the operator's hold ruling ---------------------------------------
+#
+# Read from `seat status --json`'s `awake` field. It was a separate `seat awake`
+# call until 2026-09-11: the status field had been set by a codex branch that
+# never reached the app-server, so a live thread read asleep and every codex seat
+# looked undeliverable. agent-skeleton merged the two onto one shared check, and
+# a second call asking the same check the same question is work for nothing.
+
 
 def test_asleep_holds_even_though_addressable():
-    """Wakefulness comes from `seat awake`, its own command."""
-    st = SeatStatus(verdict="addressable", runtime="claude", target="rc:0.0")
-    outcome = wake(MENTION, st, Awake(state=False, reason="no live session"))
+    st = SeatStatus(verdict="addressable", runtime="claude", target="rc:0.0",
+                    awake=False, reason="no live session")
+    outcome = wake(MENTION, st)
     assert outcome.startswith("queued")
     assert "asleep" in outcome and "no live session" in outcome
 
 
 def test_cannot_tell_holds_like_a_no():
-    """`seat awake` exit 2. Undetermined is never treated as fine."""
-    st = SeatStatus(verdict="addressable", runtime="claude", target="rc:0.0")
-    outcome = wake(MENTION, st, Awake(state=None, reason="could not query"))
+    """`awake: null` — the runtime could not be asked. Never treated as fine."""
+    st = SeatStatus(verdict="addressable", runtime="claude", target="rc:0.0",
+                    awake=None, reason="could not query")
+    outcome = wake(MENTION, st)
     assert outcome.startswith("queued")
     assert "unknown wakefulness" in outcome
 
@@ -112,28 +120,17 @@ def test_awake_yes_delivers(monkeypatch):
 
     monkeypatch.setattr(wake_mod, "_tmux", lambda *a: (calls.append(a), Ok())[1])
     monkeypatch.setattr(wake_mod.shutil, "which", lambda n: f"/usr/bin/{n}")
-    st = SeatStatus(verdict="addressable", runtime="claude", target="rc:0.0")
-    assert wake(MENTION, st, Awake(state=True)) == "delivered to rc:0.0 (claude)"
+    st = SeatStatus(verdict="addressable", runtime="claude", target="rc:0.0", awake=True)
+    assert wake(MENTION, st) == "delivered to rc:0.0 (claude)"
 
 
-def test_wakefulness_is_not_read_off_status(monkeypatch):
-    """`seat status`'s awake field is not consulted — that was the bug.
-
-    On codex it is set by a branch that never reaches the app-server query, so a
-    live thread read asleep and every codex seat looked undeliverable.
-    """
-    calls = []
-
-    class Ok:
-        returncode = 0
-        stderr = ""
-        stdout = ""
-
-    monkeypatch.setattr(wake_mod, "_tmux", lambda *a: (calls.append(a), Ok())[1])
-    monkeypatch.setattr(wake_mod.shutil, "which", lambda n: f"/usr/bin/{n}")
-    # status says asleep; the dedicated command says awake. The command wins.
-    st = SeatStatus(verdict="addressable", runtime="claude", target="rc:0.0", awake=False)
-    assert wake(MENTION, st, Awake(state=True)).startswith("delivered")
+def test_only_a_clear_yes_is_attending():
+    addressable = dict(verdict="addressable", runtime="claude", target="rc:0.0")
+    assert SeatStatus(**addressable, awake=True).deliverable
+    assert not SeatStatus(**addressable, awake=False).deliverable
+    assert not SeatStatus(**addressable, awake=None).deliverable, (
+        "the seat could not ask the runtime; that is not a yes"
+    )
 
 
 # -- sending: one mechanism per runtime, chosen by the seat -------------------
@@ -264,25 +261,23 @@ def test_landing_check_reads_the_thread_record(tmp_path, monkeypatch):
     assert wake_mod.codex_landed("no-such-thread", "x", wait=0) is False
 
 
-def test_seat_awake_is_parsed(monkeypatch):
+def test_awake_is_parsed_off_status(monkeypatch):
+    """One call, both answers."""
     monkeypatch.setattr(seat_mod, "seat_available", lambda: True)
     monkeypatch.setattr(seat_mod.subprocess, "run", lambda *a, **k: _reply({
-        "awake": True, "runtime": "codex",
-        "reason": "the app-server reports thread 01a0 loaded"}))
-    aw = seat_mod.awake()
-    assert aw.state is True and not aw.holds
+        "verdict": "addressable", "awake": True, "runtime": "codex",
+        "target": "01a0", "reason": "the app-server reports thread 01a0 loaded"}))
+    st = seat_mod.status()
+    assert st.attending and st.deliverable
 
 
-def test_seat_awake_unreadable_is_cannot_tell(monkeypatch):
-    class R:
-        returncode = 2
-        stdout = ""
-        stderr = "boom"
-
+def test_a_missing_awake_field_is_not_a_yes(monkeypatch):
+    """An older seat that reports no `awake` holds rather than delivering."""
     monkeypatch.setattr(seat_mod, "seat_available", lambda: True)
-    monkeypatch.setattr(seat_mod.subprocess, "run", lambda *a, **k: R())
-    aw = seat_mod.awake()
-    assert aw.state is None and aw.holds, "cannot tell must hold, like undetermined"
+    monkeypatch.setattr(seat_mod.subprocess, "run", lambda *a, **k: _reply({
+        "verdict": "addressable", "runtime": "claude", "target": "rc:0.0"}))
+    st = seat_mod.status()
+    assert st.awake is None and not st.deliverable
 
 
 # -- persistence: what "queued" means to whoever is waiting -------------------
@@ -313,7 +308,7 @@ def test_a_hold_tells_the_sender_how_long_it_might_wait():
     from agent_comms.seat import Persistence
 
     st = SeatStatus(verdict="not-addressable", reason="no live session", runtime="claude")
-    outcome = wake(MENTION, st, None,
+    outcome = wake(MENTION, st,
                    Persistence(survives=("container-restart",), lost_on=("host-reboot",)))
     assert "survives container-restart" in outcome
     assert "lost on host-reboot" in outcome
