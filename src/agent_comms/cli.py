@@ -176,20 +176,54 @@ def wake(message_id: int | None) -> None:
 @click.option("--once", is_flag=True, help="One poll cycle, then exit. For testing.")
 @click.option("--detach", is_flag=True,
               help="Run in the background, surviving the shell that started it.")
+@click.option("--stop", is_flag=True,
+              help="Stop this seat's daemon and wait until its lock is free.")
+@click.option("--restart", is_flag=True,
+              help="Stop it if running, then start a fresh detached one.")
 @click.option("--log", type=click.Path(), default=None,
               help="Where a detached daemon's stdout/stderr go (default ~/.comms/daemon.out).")
-def daemon(once: bool, detach: bool, log: str | None) -> None:
+def daemon(once: bool, detach: bool, stop: bool, restart: bool, log: str | None) -> None:
     """Hold the outbound connection and record what arrives.
 
     One long-lived process per comms-enabled seat. It never writes into the
     agent's working session: mentions go to the local store, and the seat's
     designated comms conversation reads them from there.
 
-    **--detach is not supervision.** It survives its parent shell, which is the
-    common way a daemon dies on a seat; it does not survive a container restart
-    or a kill, and nothing here restarts it. Real supervision belongs to the
+    **--detach is not supervision, and neither is --restart.** Both survive the
+    shell that started them; neither survives a container restart or a kill, and
+    nothing here notices a dead daemon or brings it back. --restart saves the
+    operator a two-step by hand, no more. Real supervision belongs to the
     deployer — see the daemon-supervision need raised with ansible-platform.
+
+    The daemon --restart starts is always **detached**, whatever the old one ran
+    under. How a daemon is hosted is declared by whoever starts it, so this does
+    not copy an arrangement it merely observed (constitution §10) — it says
+    which it gave you instead.
     """
+    chosen = [n for n, on in
+              (("--once", once), ("--detach", detach), ("--stop", stop), ("--restart", restart))
+              if on]
+    if len(chosen) > 1:
+        raise click.UsageError(
+            f"{' and '.join(chosen)} ask for different things. Pick one."
+        )
+
+    if stop:
+        stopped, pid = operations.stop_daemon()
+        if stopped:
+            click.echo(f"daemon stopped, was pid {pid}.\n\n"
+                       "Nothing is watching the hub now, so messages to this seat are "
+                       "lost rather than queued. Start one with: comms daemon --restart")
+        else:
+            click.echo("no daemon was running for this seat — nothing to stop.")
+        return
+
+    if restart:
+        replaced, pid = operations.restart_daemon(log)
+        was = "restarted" if replaced else "started (nothing was running)"
+        click.echo(f"daemon {was}, pid {pid}, detached. Check it with: comms status")
+        return
+
     if detach:
         pid = operations.detach_daemon(log)
         click.echo(f"daemon detached, pid {pid}. Check it with: comms status")

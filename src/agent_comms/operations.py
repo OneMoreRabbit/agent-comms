@@ -29,6 +29,7 @@ from .errors import (
     ConflictingWakeTriggers,
     CredentialMissing,
     DaemonAlreadyRunning,
+    DaemonWillNotStop,
     QueueGapError,
 )
 from .hub import Hub, Registration, Transport, build_transport
@@ -730,7 +731,7 @@ def detach_daemon(log_path: str | None = None, **kw) -> int:
         raise DaemonAlreadyRunning(
             f"a comms daemon is already running for this seat (pid {state.pid}, "
             f"{state.summary()}). Two daemons mean two event queues and every mention "
-            "handled twice."
+            "handled twice. To replace it rather than add to it: comms daemon --restart"
         )
 
     out = Path(log_path) if log_path else settings.state_dir / "daemon.out"
@@ -767,6 +768,85 @@ def detach_daemon(log_path: str | None = None, **kw) -> int:
         finally:
             os._exit(1)
     os._exit(0)
+
+
+def stop_daemon(timeout: float = 10.0, **kw) -> tuple[bool, int | None]:
+    """Stop this seat's daemon and wait until the lock is actually free.
+
+    Returns `(stopped, pid)` — `stopped` False means there was nothing running,
+    which is a state and not a failure, so an operator can run this twice.
+
+    The wait is the point. SIGTERM returns immediately, but the lock is released
+    by the OS when the process ends, and `detach_daemon` refuses to start while
+    anyone holds it. Signalling and returning would therefore make `--restart`
+    a race that usually works — and when it lost, it would report a daemon
+    started that never was. So this polls the lock, not the clock, and raises
+    `DaemonWillNotStop` rather than returning a hopeful answer.
+    """
+    settings = load_settings(**kw)
+    store = Store(settings.state_dir)
+    store.ensure()
+
+    state = store.daemon_state()
+    if not state.running:
+        return False, None
+    if state.pid is None:
+        raise DaemonWillNotStop(
+            "a daemon holds this seat's lock but its pid is unreadable, so there is "
+            f"nothing to signal. Find it with: pgrep -f 'comms daemon', then kill it, "
+            f"and check {settings.state_dir / 'daemon.lock'} is writable."
+        )
+
+    pid = state.pid
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        # Gone between the lock probe and the signal. Fall through to the wait,
+        # which is what actually decides the answer.
+        pass
+    except PermissionError:
+        raise DaemonWillNotStop(
+            f"pid {pid} holds this seat's lock but belongs to another user, so this "
+            "seat cannot stop it. A daemon for one seat should never be owned by "
+            "another — check who started it before killing it by hand."
+        ) from None
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        time.sleep(0.1)
+        if not store.daemon_state().running:
+            return True, pid
+
+    raise DaemonWillNotStop(
+        f"daemon pid {pid} was sent SIGTERM and still holds the lock {timeout:.0f}s later. "
+        "It is wedged somewhere that does not return. Stop it by hand — kill -9 "
+        f"{pid} — then start a fresh one with: comms daemon --detach"
+    )
+
+
+def restart_daemon(log_path: str | None = None, timeout: float = 10.0, **kw) -> tuple[bool, int]:
+    """Stop the running daemon, if any, then start a detached one.
+
+    Returns `(replaced, pid)` — `replaced` says whether something was actually
+    stopped, so the caller can tell "restarted" from "there was nothing running,
+    so I started one".
+
+    **This is not supervision**, and naming it `restart` does not make it so.
+    It is an operator action: something has to run it. Nothing here notices a
+    dead daemon or brings it back, which remains the deployer's to solve (see
+    the daemon-supervision need with ansible-platform). What it does fix is the
+    two-step by hand, where the second step was forgotten and the seat sat with
+    no daemon at all — the exact five-hour outage of 2026-09-10.
+
+    The replacement is always **detached**, never re-hosted the way the old one
+    was. A daemon started under tmux, systemd or a bare shell is hosted by
+    whoever declared it, and copying the arrangement observed at runtime would
+    be inferring an owned fact from visible state (constitution §10). Detached
+    is this command's own declared answer, and it is stated in the output so
+    nobody has to guess which they got.
+    """
+    replaced, _ = stop_daemon(timeout=timeout, **kw)
+    return replaced, detach_daemon(log_path, **kw)
 
 
 def _record_exits(store: Store) -> None:

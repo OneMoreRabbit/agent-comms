@@ -107,3 +107,16 @@ class ConflictingWakeTriggers(CommsError):
     """
 
     tag = "conflicting-wake-triggers"
+
+
+class DaemonWillNotStop(CommsError):
+    """A daemon was asked to stop, was signalled, and still holds the lock.
+
+    SIGTERM is caught and turned into a clean exit (`_record_exits`), so a
+    daemon that outlives it is wedged somewhere that does not return — and the
+    lock it still holds will refuse the replacement. Reporting that is the whole
+    job: a restart that silently failed to stop the old process would start
+    nothing and say it had, which is the failure this client exists to refuse.
+    """
+
+    tag = "daemon-will-not-stop"

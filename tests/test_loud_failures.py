@@ -6,6 +6,7 @@ a consumer pinning 0.1 is entitled to exactly these.
 
 from __future__ import annotations
 
+import click
 import pytest
 
 from agent_comms import operations
@@ -588,3 +589,84 @@ def test_an_undetermined_permission_does_not_bounce(seat):
     ]}])
     operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
     assert not any("did not reach the agent" in (p.get("content") or "") for p in posted)
+
+
+# -- stopping and replacing the daemon (0.50.2) -------------------------------
+
+def test_stop_reports_when_there_was_nothing_to_stop(seat):
+    """Idempotent: an operator may run it twice, and the second is not a failure."""
+    stopped, pid = operations.stop_daemon()
+    assert (stopped, pid) == (False, None)
+
+
+def test_stop_waits_for_the_lock_not_the_signal(seat, monkeypatch):
+    """The lock is what refuses the replacement, so the lock is what we wait on.
+
+    Signalling and returning would make --restart a race that usually works.
+    Here the holder releases only after several polls; stop must not return
+    until it does.
+    """
+    from agent_comms.store import Store
+
+    store = Store(seat / ".comms")
+    held = store.acquire_daemon_lock()
+    polls = {"n": 0}
+    real_state = store.daemon_state
+
+    def releasing_state():
+        polls["n"] += 1
+        if polls["n"] == 4:
+            held.close()  # the "process" finally ends, freeing the flock
+        return real_state()
+
+    monkeypatch.setattr(Store, "daemon_state", lambda self: releasing_state())
+    monkeypatch.setattr(operations.os, "kill", lambda pid, sig: None)
+
+    stopped, pid = operations.stop_daemon(timeout=5.0)
+    assert stopped is True
+    assert polls["n"] >= 4, "returned before the lock was actually released"
+
+
+def test_stop_refuses_rather_than_reporting_a_hopeful_stop(seat, monkeypatch):
+    """A daemon that outlives SIGTERM is wedged; saying 'stopped' would be a lie."""
+    from agent_comms.errors import DaemonWillNotStop
+    from agent_comms.store import Store
+
+    held = Store(seat / ".comms").acquire_daemon_lock()
+    try:
+        monkeypatch.setattr(operations.os, "kill", lambda pid, sig: None)
+        with pytest.raises(DaemonWillNotStop, match="kill -9"):
+            operations.stop_daemon(timeout=0.3)
+    finally:
+        held.close()
+
+
+def test_restart_says_whether_it_replaced_anything(seat, monkeypatch):
+    """'restarted' and 'started, nothing was running' are different facts."""
+    monkeypatch.setattr(operations, "detach_daemon", lambda log=None, **kw: 4242)
+    replaced, pid = operations.restart_daemon()
+    assert (replaced, pid) == (False, 4242)
+
+
+def test_restart_stops_before_it_starts(seat, monkeypatch):
+    """Start-then-stop would kill the replacement; the order is the whole command."""
+    calls = []
+    monkeypatch.setattr(operations, "stop_daemon",
+                        lambda **kw: (calls.append("stop"), (True, 111))[1])
+    monkeypatch.setattr(operations, "detach_daemon",
+                        lambda log=None, **kw: (calls.append("start"), 222)[1])
+    replaced, pid = operations.restart_daemon()
+    assert calls == ["stop", "start"]
+    assert (replaced, pid) == (True, 222)
+
+
+def test_daemon_flags_that_ask_for_different_things_are_refused(seat):
+    """--stop --restart together has no single meaning; guessing one would be wrong."""
+    from click.testing import CliRunner
+
+    from agent_comms import cli
+
+    result = CliRunner().invoke(cli.main, ["daemon", "--stop", "--restart"],
+                                standalone_mode=False)
+    assert isinstance(result.exception, click.UsageError)
+    assert "Pick one" in str(result.exception)
