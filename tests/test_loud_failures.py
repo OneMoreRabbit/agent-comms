@@ -250,7 +250,7 @@ def test_doctor_reports_every_check_not_just_the_first(running_daemon, monkeypat
     report = operations.preflight(transport_factory=lambda c: FakeTransport())
     names = [n for n, _, _ in report.checks]
     assert names == ["enabled", "credential", "identity", "subscription",
-                     "event queue", "deliverable", "seat build", "daemon"]
+                     "event queue", "deliverable", "directory", "seat build", "daemon"]
     assert report.ok
     assert report.warnings == []
     assert any("Honoured" in n for n in report.notes)
@@ -331,7 +331,7 @@ def test_resume_does_not_discard_events(seat):
     Store(seat / ".comms").save_position("q-existing", 42)
     transport = FakeTransport(event_batches=[{"result": "success", "events": [
         {"id": 43, "type": "message", "flags": ["mentioned"], "message": {
-            "id": 401, "sender_full_name": "arch", "display_recipient": "agent-eco",
+            "id": 401, "sender_full_name": "agent-eco-arch", "display_recipient": "agent-eco",
             "subject": "t", "content": "must not be dropped",
             "timestamp": 1, "stream_id": 7}},
     ]}])
@@ -355,7 +355,7 @@ def test_daemon_stores_only_mentions(seat):
     """A project channel carries every conversation; only ours is ours."""
     transport = FakeTransport(event_batches=[{"result": "success", "events": [
         {"id": 1, "type": "message", "flags": ["mentioned"], "message": {
-            "id": 101, "sender_full_name": "arch", "display_recipient": "agent-eco",
+            "id": 101, "sender_full_name": "agent-eco-arch", "display_recipient": "agent-eco",
             "subject": "agent-comms: build it", "content": "please proceed",
             "timestamp": 1756900000, "stream_id": 7}},
         {"id": 2, "type": "message", "flags": [], "message": {
@@ -377,7 +377,7 @@ def test_notify_command_receives_the_mention(seat, tmp_path):
     )
     transport = FakeTransport(event_batches=[{"result": "success", "events": [
         {"id": 1, "type": "message", "flags": ["mentioned"], "message": {
-            "id": 201, "sender_full_name": "arch", "display_recipient": "agent-eco",
+            "id": 201, "sender_full_name": "agent-eco-arch", "display_recipient": "agent-eco",
             "subject": "agent-comms: ping", "content": "hello",
             "timestamp": 1756900000, "stream_id": 7}},
     ]}])
@@ -391,7 +391,7 @@ def test_failing_notify_command_is_recorded_not_swallowed(seat):
     )
     transport = FakeTransport(event_batches=[{"result": "success", "events": [
         {"id": 1, "type": "message", "flags": ["mentioned"], "message": {
-            "id": 202, "sender_full_name": "arch", "display_recipient": "agent-eco",
+            "id": 202, "sender_full_name": "agent-eco-arch", "display_recipient": "agent-eco",
             "subject": "t", "content": "c", "timestamp": 1, "stream_id": 7}},
     ]}])
     operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
@@ -401,7 +401,7 @@ def test_failing_notify_command_is_recorded_not_swallowed(seat):
 def test_reply_goes_to_the_mentions_own_topic(seat):
     transport = FakeTransport(event_batches=[{"result": "success", "events": [
         {"id": 1, "type": "message", "flags": ["mentioned"], "message": {
-            "id": 301, "sender_full_name": "arch", "display_recipient": "agent-eco",
+            "id": 301, "sender_full_name": "agent-eco-arch", "display_recipient": "agent-eco",
             "subject": "agent-comms: a question", "content": "?",
             "timestamp": 1, "stream_id": 7}},
     ]}])

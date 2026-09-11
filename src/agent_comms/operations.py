@@ -21,6 +21,8 @@ from pathlib import Path
 from typing import Callable
 
 from .config import Credential, Settings, load_credential, load_settings
+from .directory import Directory
+from .directory import load as load_directory
 from .errors import (
     CommsDisabled,
     CommsError,
@@ -184,6 +186,39 @@ def preflight(
     except SeatUnavailable as exc:
         report.add("deliverable", False, str(exc))
 
+    # Who may talk to this seat. Reported because "no directory installed" is a
+    # real state — the orchestrator installs the file with comms, so its absence
+    # means permissions are a default rather than a declaration, and nobody
+    # should have to read source to find that out.
+    try:
+        directory = load_directory(settings.state_dir)
+        report.add("directory", True, directory.summary())
+        report.warnings.extend(directory.warnings)
+        refused = [m for m in Store(settings.state_dir).all() if not m.authorised]
+        if refused:
+            # The stored flag records the rule in force when the message arrived,
+            # so re-check the senders against the directory as it stands now.
+            # Otherwise this note reports a seat as blocked when the only thing
+            # that changed is the rule — which is how a stale flag becomes a
+            # false accusation.
+            senders = {m.sender for m in refused}
+            still = sorted(n for n in senders if not is_permitted(directory, hub, n))
+            note = f"{len(refused)} stored message(s) were refused as not permitted"
+            if still:
+                note += f"; still refused today: {', '.join(still)}"
+            if len(still) < len(senders):
+                was = sorted(senders - set(still))
+                note += (
+                    f". {', '.join(was)} would be permitted now — those were refused "
+                    "under an earlier rule, not by the current directory"
+                )
+            report.notes.append(
+                note + ". All are stored and visible in `comms inbox`; if one should "
+                "have arrived, the directory is what to fix."
+            )
+    except CommsError as exc:
+        report.add("directory", False, str(exc))
+
     # Which seat build answered the questions above. Contractual from 0.3.3, and
     # consumed because a mixed estate is the normal state during a rollout: a
     # verdict is only as good as the build that produced it, and until 0.3.1 a
@@ -220,14 +255,19 @@ def _permalink(site: str, event_msg: dict) -> str:
     return f"{site}/#narrow/channel/{stream_id}-{slug}/topic/{quoted}/near/{event_msg['id']}"
 
 
-def is_authorised(settings: Settings, sender: str) -> bool:
-    """May this sender direct this seat? ADR-0009 §9.
+def is_permitted(directory: Directory, hub: Hub, sender: str) -> bool:
+    """May this sender exchange messages with this seat? ADR-0009 §9.
 
-    Declared by the estate, defaulting to the seat's own arch bot. Compared on
-    the bot's display name, which is what attribution rests on (§1a) — the same
-    name a human reads in the channel.
+    Declared by the estate in `~/.comms/comms.yml`, never by the seat. Compared
+    on the bot's display name, which is what attribution rests on (§1a) — the
+    same name a human reads in the channel.
+
+    Membership of "my project" is the hub's answer (the channel's subscriber
+    list), not a second roster kept here, so a seat the estate minted this
+    morning is permitted this afternoon with no file to edit.
     """
-    return sender.strip().casefold() in {a.casefold() for a in settings.authority}
+    in_project, is_human = hub.in_channel(sender)
+    return directory.permits(sender, in_project=in_project, is_human=is_human)
 
 
 def addressed_to_seat(
@@ -273,7 +313,11 @@ def addressed_to_seat(
 
 
 def mention_from_event(
-    site: str, event: dict, settings: Settings, own_email: str | None = None
+    site: str,
+    event: dict,
+    settings: Settings,
+    own_email: str | None = None,
+    permitted: Callable[[str], bool] | None = None,
 ) -> Mention | None:
     """Turn a Zulip message event into a stored mention, or None if not for us."""
     if event.get("type") != "message":
@@ -291,8 +335,9 @@ def mention_from_event(
         timestamp=msg.get("timestamp", 0),
         permalink=_permalink(site, msg),
         reason=reason,
-        authorised=is_authorised(
-            settings, msg.get("sender_full_name") or msg.get("sender_email", "")
+        authorised=(
+            True if permitted is None
+            else permitted(msg.get("sender_full_name") or msg.get("sender_email", ""))
         ),
     )
 
@@ -409,6 +454,15 @@ def _resolve_recipient(settings: Settings, hub: Hub, name: str) -> str:
     reachable = hub.addressable_names()
     match = next((n for n in reachable if n.casefold() == name.casefold()), None)
     if match is not None:
+        # Reachable is not permitted. The hub says a message *can* arrive; the
+        # directory says whether the estate allows it. Same rule as inbound, so
+        # a link cannot be one-way by accident.
+        directory = load_directory(settings.state_dir)
+        if not is_permitted(directory, hub, match):
+            in_project, _ = hub.in_channel(match)
+            raise UnknownRecipient(
+                f"not permitted: {directory.refusal(match, in_project=in_project)}"
+            )
         return match
 
     others = ", ".join(n for n in reachable if n.casefold() not in ours) or "nobody"
@@ -515,29 +569,44 @@ def wake_agent(
     return outcome
 
 
-def _report_undeclared(
+def _refuse_sender(
     settings: Settings,
     store: Store,
     mention: Mention,
+    directory: Directory,
+    hub: Hub,
+    bounced: set[str],
     transport_factory: Callable[[Credential], Transport],
 ) -> None:
-    """Raise an undeclared sender with the arch seat, per §1a's report half.
+    """Refuse a message from a sender the estate has not permitted.
 
-    "Report, never comply" only works if the reporting is mechanical. Left to the
-    agent it depends on the agent noticing, which is the aspirational version §9
-    exists to replace.
+    "Report, never comply" only worked if the reporting was mechanical, and
+    leaving it to the agent depended on the agent noticing. Now it does not
+    reach the agent at all — but it is stored, logged and answered, because a
+    refusal nobody can see is how a wrong directory becomes a silent outage.
+
+    The sender is told **once per daemon run**. Bouncing every message would
+    ping-pong against a seat that refuses us in turn.
     """
-    store.record("warn", f"undeclared sender {mention.sender!r} on message {mention.id}")
+    store.record(
+        "warn",
+        f"refused message {mention.id} from {mention.sender!r}: not a permitted partner",
+    )
+    key = mention.sender.strip().casefold()
+    if key in bounced:
+        return
+    bounced.add(key)
+
+    in_project, _ = hub.in_channel(mention.sender)
     _post(
         settings, store, mention.channel or settings.channel,
-        f"{settings.identity.seat}: undeclared sender",
-        f"**{mention.sender} directed {settings.identity.seat}, and is not a declared "
-        f"sender for this seat** (ADR-0009 §9). The message was stored and shown to the "
-        f"agent labelled *do not comply*; it has not been acted on.\n\n"
-        f"Declared senders: {', '.join(settings.authority)}.\n"
-        f"Cite: {mention.permalink}\n\n"
-        "If this should be actionable, the estate declares the link — the seat cannot "
-        "widen its own authority, which is the point of the rule.",
+        f"{settings.identity.seat}: not a permitted sender",
+        f"@**{mention.sender}** **your message was not delivered to "
+        f"{settings.identity.seat}.** {directory.refusal(mention.sender, in_project=in_project)}"
+        f"\n\nIt is stored on the seat and visible to the operator, but it did not reach "
+        f"the agent. Cite: {mention.permalink}\n\n"
+        "Further messages from you to this seat are refused without a reply until the "
+        "estate declares the link.",
         transport_factory,
     )
 
@@ -739,6 +808,18 @@ def run_daemon(
         store.record("warn", notice)
     hub.verify_subscription()
 
+    directory = load_directory(settings.state_dir)
+    for notice in directory.warnings:
+        store.record("warn", notice)
+    store.record("info", f"comms directory: {directory.summary()}")
+
+    #: Senders already told they are not permitted, this daemon run. The bounce
+    #: is itself a channel message, so a seat that considers us unpermitted would
+    #: bounce it back and we would bounce that: two seats ping-ponging refusals.
+    #: Saying it once per sender bounds that whatever the other side does, and is
+    #: the same shape as the queued-message announcement.
+    bounced: set[str] = set()
+
     registration = _resume_or_register(hub, store)
     _record_exits(store)
     # Beat once at startup. The first poll blocks until Zulip's heartbeat (~54s),
@@ -767,13 +848,26 @@ def run_daemon(
             continue
 
         for event in events:
-            mention = mention_from_event(credential.site, event, settings, credential.email)
+            mention = mention_from_event(
+                credential.site, event, settings, credential.email,
+                permitted=lambda name: is_permitted(directory, hub, name),
+            )
             if mention is None:
                 continue
             store.append(mention)
             stored += 1
             if not mention.authorised:
-                _report_undeclared(settings, store, mention, transport_factory)
+                # **Refused, not delivered.** Labelling it and handing it to the
+                # agent made the boundary advisory — it put text from a sender
+                # the estate has not permitted into the session, carrying an
+                # instruction not to obey it, and an agent is exactly the thing
+                # that can be argued out of a rule. Operator ruling, 2026-09-11.
+                # It is still stored, still visible in `comms inbox`, and the
+                # sender is told once, so nothing is silent and a wrong
+                # directory is recoverable.
+                _refuse_sender(settings, store, mention, directory, hub,
+                               bounced, transport_factory)
+                continue
             _notify(settings, store, mention)
             if on_mention is not None:
                 on_mention(mention)

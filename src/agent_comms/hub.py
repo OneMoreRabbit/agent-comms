@@ -59,6 +59,7 @@ class Hub:
         self._t = transport
         self._settings = settings
         self._credential = credential
+        self._roster: dict[str, bool] | None = None
 
     # -- §3: bot not subscribed to its channel -----------------------------
 
@@ -245,6 +246,70 @@ class Hub:
 
     # -- who can be addressed ----------------------------------------------
 
+    def channel_roster(self, refresh: bool = False) -> dict[str, bool]:
+        """Who is in this seat's channel, and which of them are people.
+
+        Returns `{casefolded name: is_bot}`. Two facts in one call because they
+        come from one place and are always wanted together: the directory's
+        `project: true` needs membership, and its "humans are never governed"
+        rule needs `is_bot`.
+
+        **Cached for the life of the process, and re-fetched once on a miss.**
+        A daemon asks this per message, so a call per message would be silly —
+        but a stale cache that refuses a seat minted five minutes ago would be
+        worse than silly. Missing is the only case that costs a fetch.
+        """
+        if self._roster is None or refresh:
+            self._roster = self._fetch_roster()
+        return self._roster
+
+    def in_channel(self, name: str) -> tuple[bool, bool]:
+        """`(is in my channel, is a human)` for one name, re-fetching on a miss."""
+        folded = name.strip().casefold()
+        roster = self.channel_roster()
+        if folded not in roster:
+            roster = self.channel_roster(refresh=True)
+        if folded not in roster:
+            return False, False
+        return True, not roster[folded]
+
+    def _fetch_roster(self) -> dict[str, bool]:
+        subs = self._t.call_endpoint(url="users/me/subscriptions", method="GET")
+        if subs.get("result") != "success":
+            raise NotSubscribed(
+                f"could not list this bot's subscriptions ({subs.get('msg') or subs!r}), "
+                "so who is reachable in this channel cannot be established."
+            )
+        stream_id = next(
+            (s.get("stream_id") for s in subs.get("subscriptions", [])
+             if s.get("name") == self._settings.channel),
+            None,
+        )
+        if stream_id is None:
+            raise NotSubscribed(
+                f"this bot is not subscribed to channel '{self._settings.channel}', so it "
+                "cannot address anyone in it."
+            )
+        members = self._t.call_endpoint(url=f"streams/{stream_id}/members", method="GET")
+        if members.get("result") != "success":
+            raise NotSubscribed(
+                f"could not list the subscribers of '{self._settings.channel}' "
+                f"({members.get('msg') or members!r}); refusing to guess who is reachable."
+            )
+        here = set(members.get("subscribers", []))
+
+        users = self._t.call_endpoint(url="users", method="GET")
+        if users.get("result") != "success":
+            raise NotSubscribed(
+                f"could not list realm users ({users.get('msg') or users!r}); refusing to "
+                "post a mention that may not resolve."
+            )
+        return {
+            u["full_name"].casefold(): bool(u.get("is_bot"))
+            for u in users.get("members", [])
+            if u.get("user_id") in here and u.get("is_active") and u.get("full_name")
+        }
+
     def realm_names(self) -> list[str]:
         """Every active account the hub knows, as it spells them.
 
@@ -264,51 +329,23 @@ class Hub:
         )
 
     def addressable_names(self) -> list[str]:
-        """The seats this seat can address: in the realm **and** in this channel.
+        """The seats this seat can reach: in the realm **and** in this channel.
 
         The second half is the one that bites. Measured on this hub:
         `blocks-android` is a real bot and is *not* subscribed to `agent-eco`, so
         a mention of it from here renders perfectly and reaches nobody — which is
         indistinguishable from success. That is the failure of 2026-09-10.
 
-        The realm is the roster. There is no second list to maintain, and nothing
-        here is inferred from a name's shape.
+        Reachability is not permission: the comms directory decides whether a
+        seat *may* be messaged, this decides whether a message *can arrive*. A
+        send needs both, and they fail with different remedies.
         """
-        subs = self._t.call_endpoint(url="users/me/subscriptions", method="GET")
-        if subs.get("result") != "success":
-            raise NotSubscribed(
-                f"could not list this bot's subscriptions ({subs.get('msg') or subs!r}), "
-                "so who is reachable in this channel cannot be established."
-            )
-        stream_id = next(
-            (s.get("stream_id") for s in subs.get("subscriptions", [])
-             if s.get("name") == self._settings.channel),
-            None,
-        )
-        if stream_id is None:
-            raise NotSubscribed(
-                f"this bot is not subscribed to channel '{self._settings.channel}', so it "
-                "cannot address anyone in it."
-            )
-
-        members = self._t.call_endpoint(url=f"streams/{stream_id}/members", method="GET")
-        if members.get("result") != "success":
-            raise NotSubscribed(
-                f"could not list the subscribers of '{self._settings.channel}' "
-                f"({members.get('msg') or members!r}); refusing to guess who is reachable."
-            )
-        here = set(members.get("subscribers", []))
-
         users = self._t.call_endpoint(url="users", method="GET")
-        if users.get("result") != "success":
-            raise NotSubscribed(
-                f"could not list realm users ({users.get('msg') or users!r}); refusing to "
-                "post a mention that may not resolve."
-            )
-        return sorted(
-            u["full_name"] for u in users.get("members", [])
-            if u.get("user_id") in here and u.get("is_active") and u.get("full_name")
-        )
+        by_name = {
+            u["full_name"].casefold(): u["full_name"]
+            for u in users.get("members", []) if u.get("full_name")
+        } if users.get("result") == "success" else {}
+        return sorted(by_name.get(n, n) for n in self.channel_roster())
 
     def send(self, channel: str, topic: str, content: str) -> dict:
         """Post as this seat's bot. Attribution is automatic and not optional."""
