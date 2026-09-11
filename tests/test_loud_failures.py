@@ -242,7 +242,7 @@ def test_doctor_reports_every_check_not_just_the_first(running_daemon, monkeypat
     # whatever build the machine running it happens to carry.
     monkeypatch.setattr("agent_comms.operations.seat_version_now",
                         lambda: __import__("agent_comms.seat", fromlist=["x"]).SeatVersion(
-                            seat="0.3.3", contract="0.3.3"))
+                            seat="0.4.0", contract="0.4.0"))
     monkeypatch.setattr("agent_comms.operations.seat_status_now",
                         lambda: __import__("agent_comms.seat", fromlist=["x"]).SeatStatus(
                             verdict="addressable", runtime="claude", target="rc:0.0", awake=True))
@@ -250,7 +250,7 @@ def test_doctor_reports_every_check_not_just_the_first(running_daemon, monkeypat
     report = operations.preflight(transport_factory=lambda c: FakeTransport())
     names = [n for n, _, _ in report.checks]
     assert names == ["enabled", "credential", "identity", "subscription",
-                     "event queue", "deliverable", "seat build", "daemon"]
+                     "event queue", "deliverable", "directory", "seat build", "daemon"]
     assert report.ok
     assert report.warnings == []
     assert any("Honoured" in n for n in report.notes)
@@ -331,7 +331,7 @@ def test_resume_does_not_discard_events(seat):
     Store(seat / ".comms").save_position("q-existing", 42)
     transport = FakeTransport(event_batches=[{"result": "success", "events": [
         {"id": 43, "type": "message", "flags": ["mentioned"], "message": {
-            "id": 401, "sender_full_name": "arch", "display_recipient": "agent-eco",
+            "id": 401, "sender_full_name": "agent-eco-arch", "display_recipient": "agent-eco",
             "subject": "t", "content": "must not be dropped",
             "timestamp": 1, "stream_id": 7}},
     ]}])
@@ -355,7 +355,7 @@ def test_daemon_stores_only_mentions(seat):
     """A project channel carries every conversation; only ours is ours."""
     transport = FakeTransport(event_batches=[{"result": "success", "events": [
         {"id": 1, "type": "message", "flags": ["mentioned"], "message": {
-            "id": 101, "sender_full_name": "arch", "display_recipient": "agent-eco",
+            "id": 101, "sender_full_name": "agent-eco-arch", "display_recipient": "agent-eco",
             "subject": "agent-comms: build it", "content": "please proceed",
             "timestamp": 1756900000, "stream_id": 7}},
         {"id": 2, "type": "message", "flags": [], "message": {
@@ -377,7 +377,7 @@ def test_notify_command_receives_the_mention(seat, tmp_path):
     )
     transport = FakeTransport(event_batches=[{"result": "success", "events": [
         {"id": 1, "type": "message", "flags": ["mentioned"], "message": {
-            "id": 201, "sender_full_name": "arch", "display_recipient": "agent-eco",
+            "id": 201, "sender_full_name": "agent-eco-arch", "display_recipient": "agent-eco",
             "subject": "agent-comms: ping", "content": "hello",
             "timestamp": 1756900000, "stream_id": 7}},
     ]}])
@@ -391,7 +391,7 @@ def test_failing_notify_command_is_recorded_not_swallowed(seat):
     )
     transport = FakeTransport(event_batches=[{"result": "success", "events": [
         {"id": 1, "type": "message", "flags": ["mentioned"], "message": {
-            "id": 202, "sender_full_name": "arch", "display_recipient": "agent-eco",
+            "id": 202, "sender_full_name": "agent-eco-arch", "display_recipient": "agent-eco",
             "subject": "t", "content": "c", "timestamp": 1, "stream_id": 7}},
     ]}])
     operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
@@ -401,7 +401,7 @@ def test_failing_notify_command_is_recorded_not_swallowed(seat):
 def test_reply_goes_to_the_mentions_own_topic(seat):
     transport = FakeTransport(event_batches=[{"result": "success", "events": [
         {"id": 1, "type": "message", "flags": ["mentioned"], "message": {
-            "id": 301, "sender_full_name": "arch", "display_recipient": "agent-eco",
+            "id": 301, "sender_full_name": "agent-eco-arch", "display_recipient": "agent-eco",
             "subject": "agent-comms: a question", "content": "?",
             "timestamp": 1, "stream_id": 7}},
     ]}])
@@ -533,3 +533,58 @@ def test_someone_else_in_our_topic_still_reaches_us(seat):
         "content": "please look at this", "timestamp": 1, "stream_id": 7, "type": "stream"}}
     transport = FakeTransport(event_batches=[{"result": "success", "events": [other]}])
     assert operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1) == 1
+
+
+# -- the permission check must not be able to kill the daemon -----------------
+
+def test_a_hub_failure_in_the_permission_check_holds_rather_than_killing(seat):
+    """0.40.2 introduced this and it is the class this client exists to refuse.
+
+    The permission check asks the hub, and the loop it runs in sits outside the
+    guard around `get_events`. Unguarded, one transport hiccup ends the daemon —
+    silently, until someone notices nothing is arriving.
+    """
+    class Flaky(FakeTransport):
+        def call_endpoint(self, url, method="GET", request=None):
+            if url == "users":
+                raise ConnectionError("hub said no")
+            return super().call_endpoint(url, method, request)
+
+    transport = Flaky(event_batches=[{"result": "success", "events": [
+        {"id": 1, "type": "message", "flags": ["mentioned"], "message": {
+            "id": 701, "sender_full_name": "agent-eco-arch", "display_recipient": "agent-eco",
+            "subject": "agent-comms: ping", "content": "hello",
+            "timestamp": 1, "stream_id": 7}},
+    ]}])
+    notified = []
+    stored = operations.run_daemon(transport_factory=lambda c: transport,
+                                   max_iterations=1, on_mention=notified.append)
+
+    assert stored == 1, "the daemon survived and stored the message"
+    assert notified == [], "held: an undetermined permission is not a yes"
+    log = (seat / ".comms" / "events.log").read_text()
+    assert "could not determine whether" in log
+    assert "holding the message rather than refusing it" in log
+
+
+def test_an_undetermined_permission_does_not_bounce(seat):
+    """A non-answer is not a refusal, and telling the sender otherwise would be
+    a false accusation the estate would then try to fix in the directory."""
+    posted = []
+
+    class Flaky(FakeTransport):
+        def call_endpoint(self, url, method="GET", request=None):
+            if url == "users":
+                raise ConnectionError("hub said no")
+            if url == "messages":
+                posted.append(request)
+            return super().call_endpoint(url, method, request)
+
+    transport = Flaky(event_batches=[{"result": "success", "events": [
+        {"id": 1, "type": "message", "flags": ["mentioned"], "message": {
+            "id": 702, "sender_full_name": "agent-eco-arch", "display_recipient": "agent-eco",
+            "subject": "agent-comms: ping", "content": "hello",
+            "timestamp": 1, "stream_id": 7}},
+    ]}])
+    operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
+    assert not any("did not reach the agent" in (p.get("content") or "") for p in posted)
