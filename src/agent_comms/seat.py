@@ -121,7 +121,7 @@ class Awake:
 #: guidance: compare on `.seat`, because a build below 0.3.1 could misreport the
 #: contract it implements — 0.3.0 shipped saying `contract 0.5` after the
 #: renumber, having held the two as separate literals.
-MINIMUM_SEAT = "0.3.3"
+MINIMUM_SEAT = "0.4.0"
 
 
 @dataclass
@@ -162,9 +162,11 @@ class SeatVersion:
         if self.below():
             line += (
                 f" — older than {MINIMUM_SEAT}, which this client is written against. "
-                "It will still work: 0.3.3 changed no calls or fields. What it cannot "
-                "do is guarantee a codex seat declares a thread id rather than a tmux "
-                "target, which is the corruption 0.3.2 fixed."
+                "It will still work: no call or field changed. What it cannot do is "
+                "vouch for WHICH claude process the declared target holds. Below 0.4.0 "
+                "several processes can share one conversation id and the seat picks "
+                "among them, so a message can be typed into a stale instance and "
+                "reported delivered. 0.4.0 records the pid it started and verifies that."
             )
         return line
 

@@ -333,9 +333,9 @@ def _fake_seat(monkeypatch, stdout: str, code: int = 0):
 
 
 def test_version_reads_the_contracted_json(monkeypatch):
-    _fake_seat(monkeypatch, '{"seat":"0.3.3","contract":"0.3.3"}\n')
+    _fake_seat(monkeypatch, '{"seat":"0.4.0","contract":"0.4.0"}\n')
     v = seat_mod.version()
-    assert (v.seat, v.contract) == ("0.3.3", "0.3.3")
+    assert (v.seat, v.contract) == ("0.4.0", "0.4.0")
     assert not v.below()
 
 
@@ -351,7 +351,7 @@ def test_version_reads_an_0_3_0_seat_that_prints_prose_first(monkeypatch):
     v = seat_mod.version()
     assert v.seat == "0.3.0"
     assert v.below(), "older than the build this client is written against"
-    assert "0.3.3" in v.summary()
+    assert "0.4.0" in v.summary()
 
 
 def test_version_falls_back_to_the_plain_form(monkeypatch):

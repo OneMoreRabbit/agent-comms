@@ -242,7 +242,7 @@ def test_doctor_reports_every_check_not_just_the_first(running_daemon, monkeypat
     # whatever build the machine running it happens to carry.
     monkeypatch.setattr("agent_comms.operations.seat_version_now",
                         lambda: __import__("agent_comms.seat", fromlist=["x"]).SeatVersion(
-                            seat="0.3.3", contract="0.3.3"))
+                            seat="0.4.0", contract="0.4.0"))
     monkeypatch.setattr("agent_comms.operations.seat_status_now",
                         lambda: __import__("agent_comms.seat", fromlist=["x"]).SeatStatus(
                             verdict="addressable", runtime="claude", target="rc:0.0", awake=True))
