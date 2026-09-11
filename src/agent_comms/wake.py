@@ -22,7 +22,6 @@ Two rules survive from ADR-0009 and are unchanged:
 
 from __future__ import annotations
 
-import glob
 import os
 import shutil
 import subprocess
@@ -111,60 +110,32 @@ def send_claude(target: str, text: str) -> None:
         )
 
 
-def _thread_record(thread: str) -> str | None:
-    home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
-    matches = glob.glob(os.path.join(home, "sessions", "**", f"rollout-*{thread}*.jsonl"),
-                        recursive=True)
-    return matches[0] if matches else None
-
-
-def codex_landed(thread: str, marker: str, wait: float = 8.0) -> bool:
-    """Did the message actually reach the thread?
-
-    `codex queue` exits 0 for a message that strands — verified 2026-09-07, and
-    again on 2026-09-09 against a thread the seat wrongly called addressable. So
-    the exit code is not evidence and this reads the thread's own record, which
-    is (contract §4).
-    """
-    record = _thread_record(thread)
-    if record is None:
-        return False
-    deadline = time.monotonic() + wait
-    while True:
-        try:
-            if marker in open(record, encoding="utf-8", errors="replace").read():
-                return True
-        except OSError:
-            return False
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(0.5)
-
-
 def send_codex(thread: str, text: str) -> None:
     """Queue one turn into a codex thread, through the app-server. No tmux.
 
-    Confirms the turn reached the thread's record before reporting success. A
-    queue that accepts a message for an unloaded thread strands it silently, and
-    `delivered` must mean landed (ADR-0011).
+    **We no longer check the thread's record afterwards, and dropping that was a
+    correction rather than a simplification.**
+
+    The check looked for the message in the thread's rollout record and, finding
+    nothing, reported that it had stranded. `agent-skeleton` measured the real
+    behaviour on 2026-09-11 — thread unloaded, and app-server stopped — and in
+    both cases the message **waited in codex's own queue and was answered**.
+    Absence from the record meant *waiting*, not *lost*. The two are
+    indistinguishable if you only look in one place, and we only looked in one.
+
+    It was also asymmetric, which is the argument that settles it: there is no
+    way to confirm a claude delivery landed, so confirming codex made
+    `delivered` mean two different things depending on the runtime. The seat
+    says whether a message can get through; whether the agent acts on it is not
+    something this client can observe, for either runtime.
     """
     if not shutil.which("codex"):
         raise WakeError("the codex CLI is not on PATH, so a codex thread cannot be reached")
-
     result = _run(["codex", "queue", "--thread", thread, "--message", text])
     if result.returncode != 0:
         raise WakeError(
             f"codex queue failed for thread {thread!r}: "
             f"{(result.stderr or result.stdout or '').strip()[:400]}"
-        )
-
-    marker = text[:60]
-    if not codex_landed(thread, marker):
-        raise WakeError(
-            f"codex accepted the message for thread {thread} but it has not reached the "
-            "thread's record, which means the thread is not loaded and the message has "
-            "stranded. `codex queue` exits 0 in this case, so its success is not evidence. "
-            "Holding the message rather than reporting a delivery that did not happen."
         )
 
 

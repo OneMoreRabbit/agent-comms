@@ -166,7 +166,6 @@ def test_codex_is_queued_to_its_thread_with_no_tmux(monkeypatch):
     monkeypatch.setattr(wake_mod, "_tmux", no_tmux)
     monkeypatch.setattr(wake_mod, "_run", lambda cmd: (ran.append(cmd), Ok())[1])
     monkeypatch.setattr(wake_mod.shutil, "which", lambda n: f"/usr/bin/{n}")
-    monkeypatch.setattr(wake_mod, "codex_landed", lambda t, m, wait=8.0: True)
     st = SeatStatus(verdict="addressable", runtime="codex",
                     target="01a0-thread", awake=True)
     assert wake(MENTION, st) == "delivered to 01a0-thread (codex)"
@@ -199,67 +198,6 @@ def test_enter_failing_is_a_failed_delivery(monkeypatch):
     st = SeatStatus(verdict="addressable", runtime="claude", target="rc:0.0", awake=True)
     with pytest.raises(WakeError, match="Enter did not"):
         wake(MENTION, st)
-
-
-# -- the seam holds -----------------------------------------------------------
-
-def test_we_never_look_at_panes_ourselves():
-    """The deletion is the point: no pane scan, no process tree, no heuristic."""
-    for gone in ("list_panes", "find_runtime_panes", "find_agent_panes",
-                 "pane_blocked_reason", "deliver_by_scan", "codex_lock_threads",
-                 "codex_live_threads", "codex_daemon_running", "_descendants"):
-        assert not hasattr(wake_mod, gone), f"{gone} should have been deleted, not demoted"
-
-
-def test_there_is_no_session_module():
-    """`seat start`/`seat status` own the session; we no longer have a copy."""
-    with pytest.raises(ImportError):
-        __import__("agent_comms.session")
-
-
-# -- delivered means landed ---------------------------------------------------
-
-def test_codex_success_requires_the_message_to_reach_the_record(monkeypatch):
-    """`codex queue` exits 0 for a message that strands. Twice observed live."""
-    class Ok:
-        returncode = 0
-        stderr = ""
-        stdout = ""
-
-    monkeypatch.setattr(wake_mod, "_run", lambda cmd: Ok())
-    monkeypatch.setattr(wake_mod.shutil, "which", lambda n: f"/usr/bin/{n}")
-    monkeypatch.setattr(wake_mod, "codex_landed", lambda t, m, wait=8.0: False)
-    st = SeatStatus(verdict="addressable", runtime="codex", target="cold", awake=True)
-    with pytest.raises(WakeError, match="stranded"):
-        wake(MENTION, st)
-
-
-def test_codex_success_when_it_does_reach_the_record(monkeypatch):
-    class Ok:
-        returncode = 0
-        stderr = ""
-        stdout = ""
-
-    monkeypatch.setattr(wake_mod, "_run", lambda cmd: Ok())
-    monkeypatch.setattr(wake_mod.shutil, "which", lambda n: f"/usr/bin/{n}")
-    monkeypatch.setattr(wake_mod, "codex_landed", lambda t, m, wait=8.0: True)
-    st = SeatStatus(verdict="addressable", runtime="codex", target="warm", awake=True)
-    assert wake(MENTION, st) == "delivered to warm (codex)"
-
-
-def test_landing_check_reads_the_thread_record(tmp_path, monkeypatch):
-    """Against a real file layout, so the glob is not assumed."""
-    home = tmp_path / "codex"
-    day = home / "sessions" / "2026" / "09" / "09"
-    day.mkdir(parents=True)
-    (day / "rollout-2026-09-09T00-00-00-thread-xyz.jsonl").write_text(
-        '{"payload":{"content":"hello LANDED-MARKER there"}}\n', encoding="utf-8"
-    )
-    monkeypatch.setenv("CODEX_HOME", str(home))
-    assert wake_mod.codex_landed("thread-xyz", "LANDED-MARKER", wait=0) is True
-    assert wake_mod.codex_landed("thread-xyz", "ABSENT-MARKER", wait=0) is False
-    assert wake_mod.codex_landed("no-such-thread", "x", wait=0) is False
-
 
 def test_awake_is_parsed_off_status(monkeypatch):
     """One call, both answers."""
@@ -328,9 +266,9 @@ def _fake_seat(monkeypatch, stdout: str, code: int = 0):
 
 
 def test_version_reads_the_contracted_json(monkeypatch):
-    _fake_seat(monkeypatch, '{"seat":"0.4.0","contract":"0.4.0"}\n')
+    _fake_seat(monkeypatch, '{"seat":"0.5.1","contract":"0.5.1"}\n')
     v = seat_mod.version()
-    assert (v.seat, v.contract) == ("0.4.0", "0.4.0")
+    assert (v.seat, v.contract) == ("0.5.1", "0.5.1")
     assert not v.below()
 
 
@@ -346,7 +284,7 @@ def test_version_reads_an_0_3_0_seat_that_prints_prose_first(monkeypatch):
     v = seat_mod.version()
     assert v.seat == "0.3.0"
     assert v.below(), "older than the build this client is written against"
-    assert "0.4.0" in v.summary()
+    assert "0.5.1" in v.summary()
 
 
 def test_version_falls_back_to_the_plain_form(monkeypatch):
@@ -365,3 +303,77 @@ def test_an_unreadable_version_is_unknown_not_old(monkeypatch):
     v = seat_mod.version()
     assert not v.known and not v.below()
     assert "unknown" in v.summary()
+
+
+# -- the exit code is the verdict, not the string -----------------------------
+#
+# `devagent-seat-contract` 0.5.1: "branch on the exit code, not this string."
+# Reasons are prose and may be reworded; verdict strings are a convenience.
+
+
+def _status_reply(monkeypatch, payload, code=0):
+    class R:
+        returncode = code
+        stderr = ""
+    R.stdout = json.dumps(payload)
+    monkeypatch.setattr(seat_mod, "seat_available", lambda: True)
+    monkeypatch.setattr(seat_mod.subprocess, "run", lambda *a, **k: R)
+
+
+def test_the_exit_code_decides_the_verdict(monkeypatch):
+    _status_reply(monkeypatch, {"verdict": "addressable", "runtime": "codex"}, code=10)
+    st = seat_mod.status()
+    assert st.verdict == "not-addressable" and not st.addressable
+
+
+def test_a_disagreement_is_reported_not_silently_resolved(monkeypatch):
+    """Two sources for one fact is how this client got into trouble before."""
+    _status_reply(monkeypatch, {"verdict": "addressable", "reason": "fine"}, code=10)
+    assert "but its JSON says 'addressable'" in seat_mod.status().reason
+
+
+def test_an_unknown_exit_code_is_undetermined(monkeypatch):
+    _status_reply(monkeypatch, {"verdict": "addressable"}, code=7)
+    assert seat_mod.status().verdict == "undetermined"
+
+
+# -- waiting: delivered, with nothing running to read it ----------------------
+
+
+def test_a_pinned_codex_thread_with_no_session_is_waiting(monkeypatch):
+    """Addressable either way — the session count is what tells them apart.
+
+    Codex has its own queue, so a pinned thread takes a message whether or not
+    anything is loaded (agent-skeleton measured it with the app-server stopped).
+    The exit code cannot distinguish; `sessions` can, and it is a declared field
+    rather than prose.
+    """
+    _status_reply(monkeypatch, {
+        "verdict": "addressable", "runtime": "codex", "awake": True,
+        "target": "01a0", "sessions": {"claude": 0, "codex": 0}})
+    st = seat_mod.status()
+    assert st.deliverable and st.waiting
+
+
+def test_a_running_session_is_not_waiting(monkeypatch):
+    _status_reply(monkeypatch, {
+        "verdict": "addressable", "runtime": "codex", "awake": True,
+        "target": "01a0", "sessions": {"claude": 0, "codex": 1}})
+    assert not seat_mod.status().waiting
+
+
+def test_an_unknown_session_count_is_not_waiting(monkeypatch):
+    """`null` is "could not be asked", which is not 0. We do not claim either way."""
+    _status_reply(monkeypatch, {
+        "verdict": "addressable", "runtime": "codex", "awake": True,
+        "target": "01a0", "sessions": {"codex": None}})
+    st = seat_mod.status()
+    assert st.session_running is None and not st.waiting
+
+
+def test_the_landing_check_is_gone():
+    """Dropped 2026-09-11. It read absence from the thread record as loss, when
+    it meant waiting — and it was asymmetric: claude has no equivalent, so
+    `delivered` meant two different things depending on the runtime."""
+    for gone in ("codex_landed", "_thread_record"):
+        assert not hasattr(wake_mod, gone), f"{gone} should be deleted, not demoted"

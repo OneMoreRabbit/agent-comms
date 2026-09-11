@@ -181,7 +181,12 @@ def test_waking_is_announced_once(seat, monkeypatch):
                                                       "events": [_event(1001)]}]),
         max_iterations=1,
     )
-    assert any("queued" in p["content"] for p in posted), "queued notice on the way down"
+    # The operator asked for this wording, 2026-09-11: a sender should be told
+    # plainly that the message is **not deliverable**, in the seat's own words,
+    # rather than left to infer it from "queued".
+    assert any("not deliverable right now" in p["content"] for p in posted), (
+        "the sender is told, on the way down"
+    )
 
     posted.clear()
     delivered = []
@@ -248,3 +253,68 @@ def test_a_seat_with_no_seat_command_holds_and_says_so(seat, monkeypatch):
     from agent_comms.store import Store
     assert [m.id for m in Store(seat / ".comms").undelivered()] == [2002]
     assert "no `seat` command" in (seat / ".comms" / "events.log").read_text()
+
+
+# -- delivered, but nothing is running to read it ----------------------------
+
+def test_a_waiting_seat_tells_the_sender_how_to_have_it_read_now(seat, monkeypatch):
+    """Operator ask, 2026-09-11: "a message queued - session not active" is
+    useful when the codex seat needs waking.
+
+    This is a *successful* delivery with a delay the sender cannot otherwise
+    see — the message is in codex's queue. The remedy is theirs, so say it.
+    """
+    from agent_comms.seat import Persistence, SeatStatus
+
+    _wake_on(seat)
+    posted = []
+
+    class T(FakeTransport):
+        def call_endpoint(self, url, method="GET", request=None):
+            if url == "messages":
+                posted.append(request)
+            return super().call_endpoint(url, method, request)
+
+    waiting = SeatStatus(verdict="addressable", runtime="codex", awake=True,
+                         target="01a0", sessions={"codex": 0})
+    monkeypatch.setattr(operations, "seat_status_now", lambda: waiting)
+    monkeypatch.setattr(operations, "seat_persistence", lambda: Persistence())
+    monkeypatch.setattr(operations, "wake", lambda *a, **k: "delivered to 01a0 (codex)")
+
+    operations.run_daemon(
+        transport_factory=lambda c: T(event_batches=[{"result": "success",
+                                                      "events": [_event(1101)]}]),
+        max_iterations=1,
+    )
+    notices = [p for p in posted if "no codex session is running" in p["content"]]
+    assert len(notices) == 1
+    assert "seat start codex" in notices[0]["content"]
+    assert "nothing is lost" in notices[0]["content"]
+
+
+def test_the_waiting_notice_is_said_once(seat, monkeypatch):
+    from agent_comms.seat import Persistence, SeatStatus
+
+    _wake_on(seat)
+    posted = []
+
+    class T(FakeTransport):
+        def call_endpoint(self, url, method="GET", request=None):
+            if url == "messages":
+                posted.append(request)
+            return super().call_endpoint(url, method, request)
+
+    waiting = SeatStatus(verdict="addressable", runtime="codex", awake=True,
+                         target="01a0", sessions={"codex": 0})
+    monkeypatch.setattr(operations, "seat_status_now", lambda: waiting)
+    monkeypatch.setattr(operations, "seat_persistence", lambda: Persistence())
+    monkeypatch.setattr(operations, "wake", lambda *a, **k: "delivered to 01a0 (codex)")
+
+    operations.run_daemon(
+        transport_factory=lambda c: T(event_batches=[
+            {"result": "success", "events": [_event(1102)]},
+            {"result": "success", "events": [_event(1103)]},
+        ]),
+        max_iterations=2,
+    )
+    assert len([p for p in posted if "no codex session is running" in p["content"]]) == 1
