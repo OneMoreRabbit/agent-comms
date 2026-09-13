@@ -82,12 +82,13 @@ class DaemonState:
         if not self.running:
             return (
                 f"NOT RUNNING — nothing is watching the hub, so messages sent to this "
-                f"seat are being lost, not queued ({ago}). Start it: comms daemon --detach"
+                f"seat are being lost, not queued ({ago}). Start it: comms daemon --restart"
             )
         if self.stale:
             return (
                 f"running (pid {self.pid}) but WEDGED — {ago}, and Zulip's heartbeat "
-                "should turn the loop over about every minute. Restart it."
+                "should turn the loop over about every minute. Replace it: "
+                "comms daemon --restart"
             )
         return f"running (pid {self.pid}), {ago}"
 
@@ -176,7 +177,7 @@ class Store:
             raise DaemonAlreadyRunning(
                 f"another comms daemon already holds {lock_path}. Two daemons on one bot "
                 "means two event queues, so every mention would be stored and handed to "
-                "notify_command twice. Stop the running one first."
+                "notify_command twice. Replace it in one step: comms daemon --restart"
             ) from None
         handle.write(str(os.getpid()))
         handle.flush()

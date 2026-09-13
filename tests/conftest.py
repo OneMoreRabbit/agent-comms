@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 
@@ -109,7 +111,43 @@ def seat(tmp_path, monkeypatch):
 
     state = home / ".comms"
     state.mkdir()
-    (state / "config.toml").write_text("enabled = true\n", encoding="utf-8")
+    # A trigger is part of a *valid* seat, not an extra: wake-on-mention Ask 2
+    # rules that an unset notify_command "is not a valid pilot configuration — it
+    # is a seat that receives and does nothing". Until 0.50.2 this fixture wrote
+    # `enabled = true` alone, which is byte-for-byte the broken config on the live
+    # agent-comms seat — so every test here ran against the defect and none of
+    # them could see it. Tests that need the bare seat strip it with
+    # `without_wake_trigger()`.
+    #
+    # The trigger is INERT, and must stay inert. `_notify` runs it with
+    # `shell=True` for real, so a fixture naming the real `comms wake` turns the
+    # suite into a live message injector: on 2026-09-13 that is exactly what it
+    # did — six fabricated mentions from the fixtures below were delivered into
+    # the running agent session, carrying invented instructions ("please
+    # proceed", "must not be dropped") that read as if they came from the arch
+    # seat. A test must never reach the real seat. This appends the payload to a
+    # file inside the test's own home, which is assertable and goes nowhere.
+    notified = state / "notified.jsonl"
+    (state / "config.toml").write_text(
+        f'enabled = true\nnotify_command = "cat >> {notified}"\n', encoding="utf-8"
+    )
+
+    # Belt and braces for the same accident: even if a fixture or a test names
+    # `comms` directly, it resolves to a no-op shim here rather than the real
+    # pipx client on PATH. The guard is structural because the failure was
+    # silent — the suite reported 142 passed while injecting turns into a live
+    # session.
+    shim = home / ".test-bin"
+    shim.mkdir()
+    (shim / "comms").write_text(
+        "#!/bin/sh\n"
+        "# Test shim. The real client must never be reachable from the suite.\n"
+        "echo \"test shim refused: comms $*\" >&2\n"
+        "exit 127\n",
+        encoding="utf-8",
+    )
+    (shim / "comms").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{shim}:{os.environ.get('PATH', '')}")
 
     monkeypatch.setattr("pathlib.Path.home", classmethod(lambda cls: home))
     for var in (
@@ -138,3 +176,15 @@ def running_daemon(seat):
     store.save_position("queue-under-test", 1)
     yield store
     handle.close()
+
+
+def without_wake_trigger() -> None:
+    """Strip the wake trigger from the seat under test, leaving `enabled = true`.
+
+    The state a seat is actually found in when the estate has not configured it.
+    """
+    from pathlib import Path
+
+    (Path.home() / ".comms" / "config.toml").write_text(
+        "enabled = true\n", encoding="utf-8"
+    )
