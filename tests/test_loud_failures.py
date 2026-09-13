@@ -592,7 +592,7 @@ def test_an_undetermined_permission_does_not_bounce(seat):
     assert not any("did not reach the agent" in (p.get("content") or "") for p in posted)
 
 
-# -- stopping and replacing the daemon (0.50.2) -------------------------------
+# -- stopping and replacing the daemon (0.51.0) -------------------------------
 
 def test_stop_reports_when_there_was_nothing_to_stop(seat):
     """Idempotent: an operator may run it twice, and the second is not a failure."""
@@ -673,7 +673,7 @@ def test_daemon_flags_that_ask_for_different_things_are_refused(seat):
     assert "Pick one" in str(result.exception)
 
 
-# -- the last mile: a seat that receives and wakes nobody (0.50.2) -------------
+# -- the last mile: a seat that receives and wakes nobody (0.51.0) -------------
 
 def test_doctor_fails_when_no_wake_trigger_is_configured(seat):
     """The defect arch found on 2026-09-13: every check passed on a seat that
