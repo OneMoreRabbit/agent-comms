@@ -55,6 +55,11 @@ class Status:
     #: Whether a daemon is actually watching the hub for this seat. `None` when
     #: comms is off or unusable, where the question does not arise.
     daemon: "DaemonState | None" = None
+    #: Which wake trigger is armed, or None when nothing is. A seat with a daemon
+    #: and no trigger receives and does nothing, and `ready` above stays True
+    #: because the hub half genuinely is ready — so this is a separate fact, not
+    #: folded into it.
+    wake_trigger: str | None = None
 
 
 def status(**kw) -> Status:
@@ -92,6 +97,7 @@ def status(**kw) -> Status:
     # question status exists to answer, and a configured seat with no daemon is
     # not working — it is losing messages while reporting itself ready.
     base.daemon = Store(settings.state_dir).daemon_state()
+    base.wake_trigger = settings.notify_command or ("wake = true" if settings.wake else None)
     return base
 
 
@@ -236,9 +242,42 @@ def preflight(
     daemon = Store(settings.state_dir).daemon_state()
     report.add("daemon", daemon.running and not daemon.stale, daemon.summary())
 
+    # The last mile, and the one this client had no check for until arch found it
+    # on 2026-09-13: a seat with no wake trigger stores every mention and wakes
+    # nobody. Every check above passed on exactly that seat, which is the shape
+    # constitution §9 names first — a check that declines to run under the
+    # condition it exists to catch, reading as "all clear".
+    #
+    # It FAILS rather than notes. `_deliver_to_agent` is right that waking is a
+    # consumer's decision and off by default, but for this estate the decision is
+    # already made: wake-on-mention Ask 2 rules that "an unset notify_command is
+    # not a valid pilot configuration — it is a seat that receives and does
+    # nothing". A note would be true and would change nobody's behaviour.
+    report.add("wake trigger", bool(settings.notify_command or settings.wake),
+               _wake_summary(settings))
+
     report.warnings.extend(registration.warnings)
     report.notes.extend(registration.notes)
     return report
+
+
+def _wake_summary(settings: Settings) -> str:
+    """Say which trigger is armed, or what the absence of one costs.
+
+    Written for whoever is asking why a seat answers nothing despite a green
+    `doctor` — so the absence names the remedy, not just the state.
+    """
+    if settings.notify_command:
+        return f"notify_command: {settings.notify_command}"
+    if settings.wake:
+        return "wake = true (the built-in; notify_command is canonical)"
+    return (
+        "NONE — mentions are stored and no agent is ever woken, so this seat "
+        "receives and does nothing. Every other check here can pass while that is "
+        "true. Set notify_command = \"comms wake\" in ~/.comms/config.toml "
+        "(the estate installs this file; ansible-platform owns it on a provisioned "
+        "seat). Until then, mentions are only visible to `comms inbox`."
+    )
 
 
 def _permalink(site: str, event_msg: dict) -> str:
@@ -918,6 +957,15 @@ def run_daemon(
     for notice in directory.warnings:
         store.record("warn", notice)
     store.record("info", f"comms directory: {directory.summary()}")
+
+    # Said once per daemon, at the top of the log, because it governs everything
+    # the daemon does afterwards: with no trigger it will store every mention and
+    # wake nobody, and the log would otherwise show a healthy daemon storing
+    # messages with no hint that the last mile is missing. It does NOT refuse to
+    # start — a seat that receives into `comms inbox` is degraded, not broken, and
+    # refusing would take away the half that works.
+    if not (settings.notify_command or settings.wake):
+        store.record("warn", f"no wake trigger configured — {_wake_summary(settings)}")
 
     #: Senders already told they are not permitted, this daemon run. The bounce
     #: is itself a channel message, so a seat that considers us unpermitted would

@@ -42,18 +42,32 @@ def status() -> None:
         click.echo(f"\n{st.detail}")
         sys.exit(EXIT_FAULT)
     daemon = st.daemon
-    healthy = daemon is not None and daemon.running and not daemon.stale
+    receiving = daemon is not None and daemon.running and not daemon.stale
+    # Receiving and waking are two halves, and a seat can have either without the
+    # other. "ready" means both: a daemon with no wake trigger stores every
+    # mention and answers none, which is the same reassuring green light over a
+    # broken seat that the daemon check was added to stop.
+    healthy = receiving and st.wake_trigger is not None
     if healthy:
         click.secho("comms: ready", fg="green", bold=True)
-    else:
-        # Configured and not receiving is not "ready". Saying ready here is the
-        # reassuring green light over a seat that is losing its messages.
+    elif not receiving:
         click.secho("comms: configured, but NOT RECEIVING", fg="red", bold=True)
+    else:
+        click.secho("comms: receiving, but NOTHING IS WOKEN", fg="red", bold=True)
     click.echo(f"  identity   {st.identity}")
     click.echo(f"  channel    {st.channel}")
     click.echo(f"  credential {st.credential}")
     if daemon is not None:
-        click.secho(f"  daemon     {daemon.summary()}", fg=None if healthy else "red")
+        click.secho(f"  daemon     {daemon.summary()}", fg=None if receiving else "red")
+    if st.wake_trigger is not None:
+        click.echo(f"  wake       {st.wake_trigger}")
+    else:
+        click.secho(
+            "  wake       NONE — mentions are stored and no agent is woken. Set\n"
+            '             notify_command = "comms wake" in ~/.comms/config.toml;\n'
+            "             until then `comms inbox` is the only way they are seen.",
+            fg="red",
+        )
     if not healthy:
         sys.exit(EXIT_FAULT)
 

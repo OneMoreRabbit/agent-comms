@@ -21,7 +21,7 @@ from agent_comms.errors import (
     QueueGapError,
 )
 from agent_comms.hub import Hub, Registration
-from tests.conftest import FakeTransport
+from tests.conftest import FakeTransport, without_wake_trigger
 
 
 # -- 1. credential missing vs comms disabled ---------------------------------
@@ -251,7 +251,8 @@ def test_doctor_reports_every_check_not_just_the_first(running_daemon, monkeypat
     report = operations.preflight(transport_factory=lambda c: FakeTransport())
     names = [n for n, _, _ in report.checks]
     assert names == ["enabled", "credential", "identity", "subscription",
-                     "event queue", "deliverable", "directory", "seat build", "daemon"]
+                     "event queue", "deliverable", "directory", "seat build", "daemon",
+                     "wake trigger"]
     assert report.ok
     assert report.warnings == []
     assert any("Honoured" in n for n in report.notes)
@@ -670,3 +671,82 @@ def test_daemon_flags_that_ask_for_different_things_are_refused(seat):
                                 standalone_mode=False)
     assert isinstance(result.exception, click.UsageError)
     assert "Pick one" in str(result.exception)
+
+
+# -- the last mile: a seat that receives and wakes nobody (0.50.2) -------------
+
+def test_doctor_fails_when_no_wake_trigger_is_configured(seat):
+    """The defect arch found on 2026-09-13: every check passed on a seat that
+    stored every mention and woke nobody. A green doctor over that is §9's first
+    failure — a check that declines to run under the condition it exists to catch.
+    """
+    without_wake_trigger()
+    report = operations.preflight(transport_factory=lambda c: FakeTransport())
+    wake = [c for c in report.checks if c[0] == "wake trigger"]
+    assert wake, "doctor does not check the wake trigger at all"
+    name, passed, detail = wake[0]
+    assert passed is False
+    assert report.ok is False, "doctor passed overall on a seat that wakes nobody"
+    assert "notify_command" in detail and "comms wake" in detail, \
+        "the failure must name the remedy, not just the symptom"
+
+
+def test_doctor_passes_once_a_trigger_is_set(seat, monkeypatch):
+    """And it must go quiet when satisfied — §9's other half."""
+    monkeypatch.setenv("AGENT_COMMS_NOTIFY", "comms wake")
+    report = operations.preflight(transport_factory=lambda c: FakeTransport())
+    name, passed, detail = [c for c in report.checks if c[0] == "wake trigger"][0]
+    assert passed is True
+    assert "comms wake" in detail
+
+
+def test_status_is_not_ready_when_nothing_is_woken(seat):
+    """`status` answers 'is comms working?'. Receiving and never waking is not."""
+    without_wake_trigger()
+    st = operations.status()
+    assert st.wake_trigger is None
+
+
+def test_status_exit_code_distinguishes_woken_from_not(seat, monkeypatch):
+    """An installer's verification must be able to catch this mechanically."""
+    from click.testing import CliRunner
+
+    from agent_comms import cli
+    from agent_comms.store import DaemonState
+
+    # A healthy daemon, so the only thing under test is the wake trigger.
+    monkeypatch.setattr(
+        operations, "status",
+        lambda **kw: operations.Status(
+            enabled=True, detail="", tag="ready", identity="i", channel="c",
+            credential="x", ready=True,
+            daemon=DaemonState(running=True, pid=1,
+                               last_tick=__import__("datetime").datetime.now(
+                                   tz=__import__("datetime").timezone.utc)),
+            wake_trigger=None,
+        ),
+    )
+    result = CliRunner().invoke(cli.main, ["status"])
+    assert result.exit_code == cli.EXIT_FAULT
+    assert "NOTHING IS WOKEN" in result.output
+    assert "comms wake" in result.output
+
+
+def test_daemon_records_the_missing_trigger_at_startup(seat):
+    """The log must say it once, at the top, since it governs every later line."""
+    without_wake_trigger()
+    from agent_comms.store import Store
+
+    operations.run_daemon(transport_factory=lambda c: FakeTransport(), max_iterations=1)
+    events = (seat / ".comms" / "events.log").read_text()
+    assert "no wake trigger configured" in events
+
+
+def test_daemon_still_runs_without_a_trigger(seat):
+    """Degraded is not broken: refusing to start would take away the half that
+    works, and `comms inbox` is a real fallback."""
+    without_wake_trigger()
+    stored = operations.run_daemon(
+        transport_factory=lambda c: FakeTransport(), max_iterations=1
+    )
+    assert stored == 0  # ran to completion rather than raising
