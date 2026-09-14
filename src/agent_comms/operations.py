@@ -420,6 +420,67 @@ class UnknownRecipient(CommsError):
     tag = "unknown-recipient"
 
 
+#: A Zulip mention as it is actually written: `@**name**`. Deliberately only this
+#: form. Bare `@name` in prose is prose — deciding what counts is the guesswork
+#: `send` refuses to do, and it is wrong silently when it decides badly. `@**…**`
+#: is unambiguous: the sender has already said "this is an address".
+_MENTION = re.compile(r"@\*\*([^*\n]+)\*\*")
+
+
+@dataclass
+class Posted:
+    """What the hub said, and anything the sender needs to know about it.
+
+    `warnings` is empty on the normal path. It carries the case the ArcPlatform
+    finding named: a mention that renders perfectly and reaches nobody.
+    """
+
+    response: dict
+    warnings: list[str] = field(default_factory=list)
+
+
+def unreachable_mentions(hub: Hub, content: str) -> list[str]:
+    """Names mentioned in the body that this channel cannot deliver to.
+
+    The check the client already knew how to make and never ran on this path.
+    `addressable_names()` and the recipient resolver have carried the right
+    answer — and the right wording — since 0.40; they were reachable only when a
+    recipient arrived as a *parameter*. So the one way a seat naturally addresses
+    someone, `@**name**` typed into the text, was the one way nothing validated.
+
+    Cost so far: `blocks-android` on 2026-09-10 and `orchestrator` on 2026-09-13.
+    Both rendered correctly, both returned `sent`, both reached nobody, and both
+    were noticed by a third party days later rather than by the sender.
+
+    Warn, do not refuse (the reporter's own preference, and right): the message
+    is usually still worth posting to the channel, and what the sender needs is
+    to learn *at the moment of sending* that one addressee will not see it, so
+    they can route another way.
+    """
+    named = [m.group(1).strip() for m in _MENTION.finditer(content)]
+    if not named:
+        return []
+    reachable = {n.casefold() for n in hub.addressable_names()}
+    seen, missing = set(), []
+    for name in named:
+        key = name.casefold()
+        if key in reachable or key in seen:
+            continue
+        seen.add(key)
+        missing.append(name)
+    return missing
+
+
+def _mention_warnings(hub: Hub, content: str, channel: str) -> list[str]:
+    """One line per unreachable mention, in the resolver's own words."""
+    return [
+        f"'{name}' is mentioned in the body but is not in channel '{channel}', so that "
+        f"mention renders correctly and reaches nobody. The message was posted; reach "
+        f"{name} another way."
+        for name in unreachable_mentions(hub, content)
+    ]
+
+
 def send(
     content: str,
     to: str | None = None,
@@ -436,11 +497,17 @@ def send(
     `@**<recipient>**` mention, so both of the two routes a recipient matches on
     are covered without the sender knowing which.
 
-    **The body is never examined and never rewritten.** An earlier version
-    scanned message text for `@name` and converted it, which is guesswork about
-    prose — it has to decide what is a mention, what is an email address, what is
-    already correct, and it is wrong silently when it decides badly. Addressing
-    is structure, so it travels in a flag, not in the text.
+    **The body is never rewritten.** An earlier version scanned message text for
+    `@name` and converted it, which is guesswork about prose — it has to decide
+    what is a mention, what is an email address, what is already correct, and it
+    is wrong silently when it decides badly. Addressing is structure, so it
+    travels in a flag, not in the text.
+
+    **It is read for exactly one thing** (0.52.0): an explicit `@**name**` is
+    checked against the channel, and an unreachable one is returned as a warning
+    on `Posted.warnings`. That is not the guesswork above — `@**…**` is the
+    sender saying "this is an address", so there is nothing to infer. See
+    `unreachable_mentions`.
 
     The named seat is checked against the hub before anything is posted: it must
     exist in the realm and be subscribed to this channel. A message to a seat
@@ -470,7 +537,9 @@ def send(
     hub = Hub(transport_factory(credential), settings, credential)
     recipient = _resolve_recipient(settings, hub, recipient)
 
-    return hub.send(settings.channel, topic, addressed(recipient, content))
+    warnings = _mention_warnings(hub, content, settings.channel)
+    response = hub.send(settings.channel, topic, addressed(recipient, content))
+    return Posted(response=response, warnings=warnings)
 
 
 def _resolve_recipient(settings: Settings, hub: Hub, name: str) -> str:
@@ -550,11 +619,11 @@ def reply(
         raise CommsError(f"no message {message_id} in the local store")
     credential = load_credential(settings.identity)
     hub = Hub(transport_factory(credential), settings, credential)
-    result = hub.send(
-        target.channel or settings.channel, target.topic, addressed(target.sender, content)
-    )
+    channel = target.channel or settings.channel
+    warnings = _mention_warnings(hub, content, channel)
+    result = hub.send(channel, target.topic, addressed(target.sender, content))
     store.mark_read(message_id)
-    return result
+    return Posted(response=result, warnings=warnings)
 
 
 def wake_agent(

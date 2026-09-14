@@ -430,3 +430,56 @@ def test_a_hold_notice_mentions_the_sender(seat, tmp_path, monkeypatch):
     )
     assert transport.sent[-1]["content"].startswith("@**agent-eco-arch** ")
     assert transport.sent[-1]["topic"] == "agent-comms: do a thing"
+
+
+# -- the mention guard, wired to send and reply (0.52.0) ----------------------
+
+def test_unreachable_body_mention_warns_but_still_posts(seat):
+    """The ArcPlatform finding: `@**orchestrator**` rendered, returned `sent`,
+    reached nobody. The check existed and this path never ran it."""
+    transport = FakeTransport()  # realm has blocks-android; channel does not
+    posted = operations.send("notes for @**blocks-android** here", to="agent-skeleton",
+                             subject="release", transport_factory=lambda c: transport)
+    assert transport.sent, "the message must still be posted — warn, do not refuse"
+    assert len(posted.warnings) == 1
+    assert "blocks-android" in posted.warnings[0]
+    assert "reaches nobody" in posted.warnings[0]
+
+
+def test_reachable_body_mention_is_silent(seat):
+    """§9's other half: a guard that fires on the normal path is noise."""
+    transport = FakeTransport()
+    posted = operations.send("ping @**agent-skeleton** about it", to="agent-skeleton",
+                             subject="s", transport_factory=lambda c: transport)
+    assert posted.warnings == []
+
+
+def test_bare_at_name_in_prose_is_still_prose(seat):
+    """The guesswork `send` refuses to do. Only `@**...**` is an address."""
+    transport = FakeTransport()
+    posted = operations.send("ask @blocks-android or email a@b.com", to="agent-skeleton",
+                             subject="s", transport_factory=lambda c: transport)
+    assert posted.warnings == []
+
+
+def test_reply_validates_the_body_too(seat):
+    """`reply` goes through the same Hub.send, and was equally unguarded."""
+    transport = FakeTransport(event_batches=[{"result": "success", "events": [
+        {"id": 77, "type": "message", "flags": ["mentioned"], "message": {
+            "id": 77, "sender_full_name": "agent-eco-arch", "display_recipient": "agent-eco",
+            "subject": "agent-comms: q", "content": "?", "timestamp": 1, "stream_id": 7}},
+    ]}])
+    operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
+    posted = operations.reply(77, "cc @**blocks-android**",
+                              transport_factory=lambda c: transport)
+    assert len(posted.warnings) == 1
+    assert "blocks-android" in posted.warnings[0]
+
+
+def test_each_unreachable_name_is_named_once(seat):
+    """Repeating one name three times is one problem, not three warnings."""
+    transport = FakeTransport()
+    posted = operations.send("@**blocks-android** @**blocks-android** @**blocks-service**",
+                             to="agent-skeleton", subject="s",
+                             transport_factory=lambda c: transport)
+    assert len(posted.warnings) == 2
