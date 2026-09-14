@@ -128,8 +128,21 @@ def show(message_id: int) -> None:
 @click.argument("content")
 def reply(message_id: int, content: str) -> None:
     """Reply in the mention's own topic."""
-    operations.reply(message_id, content)
-    click.echo("sent")
+    posted = operations.reply(message_id, content)
+    _say_sent(posted, "replied")
+
+
+def _say_sent(posted, word: str = "sent") -> None:
+    """Confirm the post, then say who will not see it.
+
+    Warnings go to stderr and the word still goes to stdout: the message WAS
+    posted, so a caller parsing stdout must still read success. What changes is
+    that the sender now learns at the moment of sending — the only moment the
+    information is worth anything — rather than from a third party days later.
+    """
+    click.echo(word)
+    for warning in posted.warnings:
+        click.secho(f"warning: {warning}", fg="yellow", err=True)
 
 
 @main.command()
@@ -149,12 +162,16 @@ def send(to: str, subject: str | None, topic: str | None, content: str) -> None:
     gives the topic `agent-skeleton: the ask` and a real `@**agent-skeleton**`
     mention — both routes a recipient matches on, so it does not matter which.
 
-    The body is never read or rewritten: a seat name typed in prose is prose.
+    The body is never rewritten: a seat name typed in prose is prose, and
+    addressing travels in the flag, not the text. It IS now read for one thing —
+    an explicit `@**name**` is checked for reachability, and you get a warning on
+    stderr if that name cannot see this channel. The message still posts.
+
     The name in --to is checked against the hub first, and a seat that does not
     exist or is not in this channel is refused rather than posted to.
     """
-    operations.send(content, to=to, subject=subject, topic=topic)
-    click.echo("sent")
+    posted = operations.send(content, to=to, subject=subject, topic=topic)
+    _say_sent(posted)
 
 
 @main.command()
