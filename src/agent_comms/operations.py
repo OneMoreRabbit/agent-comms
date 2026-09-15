@@ -28,8 +28,11 @@ from .errors import (
     CommsError,
     ConflictingWakeTriggers,
     CredentialMissing,
+    CredentialUnreadable,
     DaemonAlreadyRunning,
     DaemonWillNotStop,
+    InsecureTransportRefused,
+    NotSubscribed,
     QueueGapError,
 )
 from .hub import Hub, Registration, Transport, build_transport
@@ -955,6 +958,83 @@ def restart_daemon(log_path: str | None = None, timeout: float = 10.0, **kw) -> 
     """
     replaced, _ = stop_daemon(timeout=timeout, **kw)
     return replaced, detach_daemon(log_path, **kw)
+
+
+#: Faults a restart cannot fix. Respawning on these is a crash loop that buries
+#: the reason in a scrolling log — worse than stopping with it on screen, because
+#: the operator then has a supervisor reporting activity and a seat receiving
+#: nothing. Every one of these needs a person: a credential, a config line, or a
+#: decision.
+UNFIXABLE_BY_RESTART = (
+    CommsDisabled,
+    CredentialMissing,
+    CredentialUnreadable,
+    InsecureTransportRefused,
+    NotSubscribed,
+    ConflictingWakeTriggers,
+    DaemonAlreadyRunning,
+)
+
+
+def supervise_daemon(
+    max_restarts: int | None = None,
+    backoff_start: float = 1.0,
+    backoff_max: float = 60.0,
+    **kw,
+) -> int:
+    """Run the daemon, and start it again if it exits. Returns the restart count.
+
+    **This is not full supervision and the help says so.** It survives the daemon
+    *crashing*. It does not survive being killed, the container restarting or the
+    host rebooting — and nothing inside the container can, because there is no
+    init in a devagent seat to own it (measured: no systemd, no cron, PID 1 is
+    sshd). A self-respawning parent has the same lifetime as the thing it
+    supervises. The durable answer is a host-side unit, which is asked for in
+    `comms-daemon-supervision`; this closes the gap the client can close.
+
+    Two properties make it worth having rather than a loop anyone could write:
+
+    - **It refuses to restart on a fault a restart cannot fix.** A bad
+      credential, comms disabled, an unsubscribed bot or two wake triggers are
+      re-raised, not retried. A crash loop turns a legible error into noise and
+      reports activity while the seat receives nothing.
+    - **It backs off**, doubling to a cap, so a transient network fault does not
+      become a hot loop against the hub — and it resets the delay after a run
+      that lasted, because a daemon that ran for an hour and died is a different
+      event from one failing instantly.
+
+    `max_restarts` bounds the loop for tests; unbounded in a seat.
+    """
+    settings = load_settings(**kw)
+    store = Store(settings.state_dir)
+    store.ensure()
+
+    restarts, delay = 0, backoff_start
+    while True:
+        started = time.monotonic()
+        try:
+            run_daemon(**kw)
+        except UNFIXABLE_BY_RESTART:
+            # Loud and final. The supervisor's job is to keep a working daemon
+            # running, not to keep an unworkable one company.
+            raise
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:  # noqa: BLE001 — anything else is worth retrying
+            store.record("warn", f"daemon exited ({type(exc).__name__}: {exc}); supervisor restarting")
+        else:
+            store.record("warn", "daemon returned; supervisor restarting")
+
+        if max_restarts is not None and restarts >= max_restarts:
+            return restarts
+
+        # A run that lasted was healthy until it was not: start the next backoff
+        # from the bottom. Only repeated fast failures are worth slowing down.
+        if time.monotonic() - started >= backoff_max:
+            delay = backoff_start
+        time.sleep(delay)
+        delay = min(delay * 2, backoff_max)
+        restarts += 1
 
 
 def _record_exits(store: Store) -> None:

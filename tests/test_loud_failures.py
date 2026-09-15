@@ -750,3 +750,63 @@ def test_daemon_still_runs_without_a_trigger(seat):
         transport_factory=lambda c: FakeTransport(), max_iterations=1
     )
     assert stored == 0  # ran to completion rather than raising
+
+
+# -- --supervise: restart what a restart can fix, and only that (0.51.1) -------
+
+def test_supervise_restarts_a_daemon_that_exits(seat, monkeypatch):
+    """The whole point: a daemon that dies comes back without a person."""
+    calls = {"n": 0}
+
+    def flaky(**kw):
+        calls["n"] += 1
+        raise RuntimeError("connection reset")
+
+    monkeypatch.setattr(operations, "run_daemon", flaky)
+    monkeypatch.setattr(operations.time, "sleep", lambda s: None)
+    restarts = operations.supervise_daemon(max_restarts=3, backoff_start=0)
+    assert restarts == 3
+    assert calls["n"] == 4  # the original run plus three restarts
+
+
+def test_supervise_refuses_to_loop_on_a_fault_a_restart_cannot_fix(seat, monkeypatch):
+    """A crash loop buries the reason and reports activity while nothing is received."""
+    from agent_comms.errors import CredentialMissing
+
+    def broken(**kw):
+        raise CredentialMissing("no credential for this seat")
+
+    monkeypatch.setattr(operations, "run_daemon", broken)
+    with pytest.raises(CredentialMissing):
+        operations.supervise_daemon(max_restarts=5, backoff_start=0)
+
+
+def test_supervise_records_each_restart(seat, monkeypatch):
+    """A restart nobody can see is a daemon that looks like it never died."""
+    monkeypatch.setattr(operations, "run_daemon",
+                        lambda **kw: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(operations.time, "sleep", lambda s: None)
+    operations.supervise_daemon(max_restarts=1, backoff_start=0)
+    events = (seat / ".comms" / "events.log").read_text()
+    assert "supervisor restarting" in events
+
+
+def test_supervise_backs_off_and_resets_after_a_long_run(seat, monkeypatch):
+    """Fast repeated failures slow down; a daemon that ran for ages then died
+    starts again promptly — those are different events."""
+    slept = []
+    monkeypatch.setattr(operations.time, "sleep", slept.append)
+    monkeypatch.setattr(operations, "run_daemon",
+                        lambda **kw: (_ for _ in ()).throw(RuntimeError("boom")))
+    operations.supervise_daemon(max_restarts=4, backoff_start=1.0, backoff_max=8.0)
+    assert slept == [1.0, 2.0, 4.0, 8.0], slept
+
+
+def test_supervise_conflicts_with_the_other_daemon_flags(seat):
+    from click.testing import CliRunner
+
+    from agent_comms import cli
+
+    result = CliRunner().invoke(cli.main, ["daemon", "--supervise", "--detach"],
+                                standalone_mode=False)
+    assert isinstance(result.exception, click.UsageError)

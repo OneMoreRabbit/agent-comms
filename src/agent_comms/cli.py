@@ -207,24 +207,34 @@ def wake(message_id: int | None) -> None:
 @click.option("--once", is_flag=True, help="One poll cycle, then exit. For testing.")
 @click.option("--detach", is_flag=True,
               help="Run in the background, surviving the shell that started it.")
+@click.option("--supervise", is_flag=True,
+              help="Run in the foreground and restart the daemon if it exits.")
 @click.option("--stop", is_flag=True,
               help="Stop this seat's daemon and wait until its lock is free.")
 @click.option("--restart", is_flag=True,
               help="Stop it if running, then start a fresh detached one.")
 @click.option("--log", type=click.Path(), default=None,
               help="Where a detached daemon's stdout/stderr go (default ~/.comms/daemon.out).")
-def daemon(once: bool, detach: bool, stop: bool, restart: bool, log: str | None) -> None:
+def daemon(once: bool, detach: bool, supervise: bool, stop: bool, restart: bool,
+           log: str | None) -> None:
     """Hold the outbound connection and record what arrives.
 
     One long-lived process per comms-enabled seat. It never writes into the
     agent's working session: mentions go to the local store, and the seat's
     designated comms conversation reads them from there.
 
+    **--supervise restarts the daemon if it EXITS. That is all it does.** It does
+    not survive being killed, the container restarting or the host rebooting —
+    nothing inside the container can, because a devagent seat has no init to own
+    it (no systemd, no cron, PID 1 is sshd). The durable answer is a host-side
+    unit, asked for in `comms-daemon-supervision`. --supervise closes the part
+    the client can close, and refuses to restart on a fault a restart cannot fix
+    (bad credential, comms disabled, two wake triggers) rather than crash-looping
+    over the reason.
+
     **--detach is not supervision, and neither is --restart.** Both survive the
-    shell that started them; neither survives a container restart or a kill, and
-    nothing here notices a dead daemon or brings it back. --restart saves the
-    operator a two-step by hand, no more. Real supervision belongs to the
-    deployer — see the daemon-supervision need raised with ansible-platform.
+    shell that started them; neither survives a container restart or a kill.
+    --restart saves the operator a two-step by hand, no more.
 
     The daemon --restart starts is always **detached**, whatever the old one ran
     under. How a daemon is hosted is declared by whoever starts it, so this does
@@ -232,7 +242,8 @@ def daemon(once: bool, detach: bool, stop: bool, restart: bool, log: str | None)
     which it gave you instead.
     """
     chosen = [n for n, on in
-              (("--once", once), ("--detach", detach), ("--stop", stop), ("--restart", restart))
+              (("--once", once), ("--detach", detach), ("--supervise", supervise),
+               ("--stop", stop), ("--restart", restart))
               if on]
     if len(chosen) > 1:
         raise click.UsageError(
@@ -253,6 +264,11 @@ def daemon(once: bool, detach: bool, stop: bool, restart: bool, log: str | None)
         replaced, pid = operations.restart_daemon(log)
         was = "restarted" if replaced else "started (nothing was running)"
         click.echo(f"daemon {was}, pid {pid}, detached. Check it with: comms status")
+        return
+
+    if supervise:
+        restarts = operations.supervise_daemon()
+        click.echo(f"supervisor stopped after {restarts} restart(s)")
         return
 
     if detach:
