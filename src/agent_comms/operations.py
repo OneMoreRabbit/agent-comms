@@ -1132,15 +1132,20 @@ def run_daemon(
     store.save_position(registration.queue_id, registration.last_event_id)
 
     stored, iterations, backoff = 0, 0, 1
+    last_backstop = time.monotonic()
+    gap_recovery = False
     while max_iterations is None or iterations < max_iterations:
         iterations += 1
         try:
             events = hub.get_events(registration)
             backoff = 1
         except QueueGapError as exc:
-            store.record("warn", f"{exc} Re-registering.")
+            # No longer "messages are lost": note it, re-register, then read
+            # channel history forward on the next pass through the loop.
+            store.record("warn", f"{exc} Re-registering and backfilling.")
             registration = _register(hub, store)
-            continue
+            gap_recovery = True
+            events = []
         except KeyboardInterrupt:  # pragma: no cover - operator stop
             store.record("info", "daemon stopped by operator")
             break
@@ -1150,7 +1155,13 @@ def run_daemon(
             backoff = min(backoff * 2, 60)
             continue
 
-        for event in events:
+        def handle_event(event: dict) -> None:
+            """One message, whether the queue delivered it or history did.
+
+            Backfill calls this too, so a recovered message is permission-checked,
+            stored, refused or notified exactly like a live one.
+            """
+            nonlocal stored
             # The permission check asks the hub, so it can fail — and this loop
             # sits outside the guard around `get_events`. Unguarded, a single
             # transport hiccup would end the daemon, which is the silent-death
@@ -1179,7 +1190,7 @@ def run_daemon(
                 permitted=_permitted,
             )
             if mention is None:
-                continue
+                return
             store.append(mention)
             stored += 1
             if not mention.authorised:
@@ -1192,13 +1203,46 @@ def run_daemon(
                 # sender is told once, so nothing is silent and a wrong
                 # directory is recoverable.
                 if undetermined:
-                    continue  # held, already logged; no bounce for a non-answer
+                    return  # held, already logged; no bounce for a non-answer
                 _refuse_sender(settings, store, mention, directory, hub,
                                bounced, transport_factory)
-                continue
+                return
             _notify(settings, store, mention)
             if on_mention is not None:
                 on_mention(mention)
+
+        for event in events:
+            handle_event(event)
+
+        # The doorbell rang, but the queue is not the record. Anything that
+        # arrived while it was down is in channel history and nowhere else, so
+        # read forward from the last message actually handled.
+        if gap_recovery:
+            gap_recovery = False
+            _catch_up(hub, store, handle_event, "queue was replaced")
+
+        # Check the doorstep regardless. Two failures hide from the queue alone:
+        # a connection that hangs without erroring, and a queue replaced between
+        # ticks. Both look exactly like a quiet channel.
+        if time.monotonic() - last_backstop >= BACKSTOP_SECS:
+            last_backstop = time.monotonic()
+            before = store.last_message_id()
+            found = _catch_up(hub, store, handle_event, "backstop")
+            if found:
+                newest = store.last_message_id()
+                stale = [m for m in store.all()
+                         if before < m.id <= newest
+                         and (time.time() - m.timestamp) > MISSED_AFTER_SECS]
+                if stale:
+                    # Not a race: these were sitting in history while the queue
+                    # said nothing. The queue is not delivering, so replace it
+                    # rather than trusting it for another ten minutes.
+                    store.record(
+                        "warn",
+                        f"the event queue missed {len(stale)} message(s) that channel "
+                        "history had; it is not delivering. Re-registering.",
+                    )
+                    registration = _register(hub, store)
 
         # Every tick, not only when a message arrives. Zulip sends a heartbeat
         # about once a minute (measured: ~54s), so this loop turns over even on
@@ -1208,6 +1252,61 @@ def run_daemon(
         store.save_position(registration.queue_id, registration.last_event_id)
 
     return stored
+
+
+#: How often to read channel history regardless of what the queue said. The
+#: queue is a doorbell; this is checking the doorstep. Ten minutes: often enough
+#: that a dead doorbell is caught within one, rare enough to be one API call an
+#: hour's worth of nothing.
+BACKSTOP_SECS = 600
+
+#: A message must be this old before its absence from the queue is evidence the
+#: queue is broken. Without it, a message arriving between the doorbell firing
+#: and the backstop reading would look like a missed notification, and the daemon
+#: would tear down a healthy queue on an ordinary timing race.
+MISSED_AFTER_SECS = 60
+
+
+def _event_from_message(msg: dict) -> dict:
+    """Shape a history message like the event the queue would have delivered.
+
+    So a backfilled message goes through exactly the same permission check,
+    storage, refusal and notify path as a live one. A second code path for
+    recovered messages is how recovery quietly behaves differently from normal
+    receipt — and the difference only shows up in the case nobody tests.
+
+    `flags` carries `mentioned` when this seat is named, which is what the queue
+    would have set; addressing itself is re-derived downstream from the topic and
+    body, so nothing here decides who a message is for.
+    """
+    return {"id": msg.get("id"), "type": "message", "flags": msg.get("flags") or [],
+            "message": msg}
+
+
+def _catch_up(hub: Hub, store: Store, handle, reason: str) -> int:
+    """Read everything after the last handled message and run it through `handle`.
+
+    Returns how many were recovered. Says so in the log either way: "backfilled
+    0" is the evidence that a gap cost nothing, and it is the line that turns
+    "any messages sent meanwhile are lost" into a measured claim.
+    """
+    since = store.last_message_id()
+    if since <= 0:
+        # Nothing handled yet. A full history replay on a fresh seat would
+        # notify the agent about every message ever sent to the channel, which
+        # is worse than the gap. Start from now.
+        return 0
+    try:
+        missed = hub.messages_after(since)
+    except Exception as exc:  # noqa: BLE001 - the queue path still works
+        store.record("warn", f"{reason}: could not read channel history to catch up ({exc})")
+        return 0
+    for msg in missed:
+        handle(_event_from_message(msg))
+    store.record("info" if missed else "info",
+                 f"{reason}: backfilled {len(missed)} message(s) from channel history "
+                 f"after id {since}")
+    return len(missed)
 
 
 def _register(hub: Hub, store: Store) -> Registration:

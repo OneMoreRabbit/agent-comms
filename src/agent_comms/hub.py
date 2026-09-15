@@ -11,6 +11,7 @@ honest. The interesting one is `verify_lifespan`: see its docstring.
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -362,6 +363,42 @@ class Hub:
             for u in users.get("members", []) if u.get("full_name")
         } if users.get("result") == "success" else {}
         return sorted(by_name.get(n, n) for n in self.channel_roster())
+
+    def messages_after(self, message_id: int, limit: int = 200) -> list[dict]:
+        """Every message in this channel after `message_id`, oldest first.
+
+        **The durable half of receiving.** An event queue is a doorbell: Zulip
+        discards it after a period of inactivity and there is no id-based
+        subscription to ask for instead — `register` accepts an `anchor` and
+        ignores it, returning only a queue id and an event counter (measured
+        against the live hub, 2026-09-15). So the queue can never be the record
+        of what arrived.
+
+        Channel history can. It does not expire, and a message id is a permanent
+        address: `anchor` + `num_after` returns everything since, whatever
+        happened to any queue in between.
+
+        Note `anchor` takes a **message** id, not the `last_event_id` this client
+        stores for queue resumption. They are different number spaces — on this
+        seat, event id 44 and message id 1292 at the same moment — and confusing
+        them would anchor a backfill twelve hundred messages into the past.
+        """
+        result = self._t.call_endpoint(
+            url="messages",
+            method="GET",
+            request={
+                "anchor": message_id,
+                "num_before": 0,
+                "num_after": limit,
+                "narrow": json.dumps([{"operator": "channel", "operand": self._settings.channel}]),
+                "apply_markdown": "false",
+            },
+        )
+        messages = result.get("messages") or []
+        # `anchor` is inclusive, so the anchor message itself comes back. Drop it:
+        # we have already handled it, and re-handling would re-notify the agent.
+        return [m for m in messages if m.get("id", 0) > message_id]
+
 
     def send(self, channel: str, topic: str, content: str) -> dict:
         """Post as this seat's bot. Attribution is automatic and not optional."""
