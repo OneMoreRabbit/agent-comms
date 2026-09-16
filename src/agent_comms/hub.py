@@ -350,7 +350,7 @@ class Hub:
 
         The second half is the one that bites. Measured on this hub:
         `blocks-android` is a real bot and is *not* subscribed to `agent-eco`, so
-        a mention of it from here renders perfectly and reaches nobody — which is
+        a mention of it from here renders perfectly and notifies nobody — which is
         indistinguishable from success. That is the failure of 2026-09-10.
 
         Reachability is not permission: the comms directory decides whether a

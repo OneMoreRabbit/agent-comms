@@ -435,7 +435,7 @@ class Posted:
     """What the hub said, and anything the sender needs to know about it.
 
     `warnings` is empty on the normal path. It carries the case the ArcPlatform
-    finding named: a mention that renders perfectly and reaches nobody.
+    finding named: a mention that renders perfectly and notifies nobody.
     """
 
     response: dict
@@ -478,7 +478,7 @@ def _mention_warnings(hub: Hub, content: str, channel: str) -> list[str]:
     """One line per unreachable mention, in the resolver's own words."""
     return [
         f"'{name}' is mentioned in the body but is not in channel '{channel}', so that "
-        f"mention renders correctly and reaches nobody. The message was posted; reach "
+        f"mention notifies nobody. The message was posted; reach "
         f"{name} another way."
         for name in unreachable_mentions(hub, content)
     ]
@@ -579,7 +579,7 @@ def _resolve_recipient(settings: Settings, hub: Hub, name: str) -> str:
     if exists:
         raise UnknownRecipient(
             f"'{name}' exists on the hub but is not in channel '{settings.channel}', so a "
-            "mention of it here would render correctly and reach nobody. Reach it through "
+            "mention of it here would render correctly and notify nobody. Reach it through "
             "a channel you both sit in, or ask the estate to subscribe it. "
             f"Reachable from here: {others}."
         )
