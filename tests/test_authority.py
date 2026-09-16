@@ -443,7 +443,12 @@ def test_unreachable_body_mention_warns_but_still_posts(seat):
     assert transport.sent, "the message must still be posted — warn, do not refuse"
     assert len(posted.warnings) == 1
     assert "blocks-android" in posted.warnings[0]
-    assert "reaches nobody" in posted.warnings[0]
+    assert "notifies nobody" in posted.warnings[0]
+    assert "reaches nobody" not in posted.warnings[0], (
+        "measured 2026-09-15: agent-eco is a PUBLIC channel, so a non-subscriber can "
+        "still read it — blocks-android read and answered one. The mention notifies "
+        "nobody; claiming it reaches nobody overclaims."
+    )
 
 
 def test_reachable_body_mention_is_silent(seat):

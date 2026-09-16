@@ -268,6 +268,33 @@ class Store:
             encoding="utf-8",
         )
 
+    def last_message_id(self) -> int:
+        """The highest Zulip message id this seat has actually handled.
+
+        **The durable receive marker, and the only one that survives a queue.**
+        `last_event_id` is queue-local: it resets whenever a queue is discarded,
+        so it cannot say where to resume from — which is exactly when resuming
+        matters. A message id is permanent and channel-wide.
+
+        Read from the message log rather than kept as a separate counter, so it
+        cannot disagree with what was stored. 0 when nothing has arrived, which
+        makes a first run a full catch-up rather than a special case.
+        """
+        best = 0
+        if not self.messages.exists():
+            return best
+        for line in self.messages.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                mid = json.loads(line).get("id")
+            except json.JSONDecodeError:
+                continue
+            if isinstance(mid, int) and mid > best:
+                best = mid
+        return best
+
     def load_position(self) -> dict | None:
         if not self.state.exists():
             return None

@@ -750,3 +750,213 @@ def test_daemon_still_runs_without_a_trigger(seat):
         transport_factory=lambda c: FakeTransport(), max_iterations=1
     )
     assert stored == 0  # ran to completion rather than raising
+
+
+# -- --supervise: restart what a restart can fix, and only that (0.51.1) -------
+
+def test_supervise_restarts_a_daemon_that_exits(seat, monkeypatch):
+    """The whole point: a daemon that dies comes back without a person."""
+    calls = {"n": 0}
+
+    def flaky(**kw):
+        calls["n"] += 1
+        raise RuntimeError("connection reset")
+
+    monkeypatch.setattr(operations, "run_daemon", flaky)
+    monkeypatch.setattr(operations.time, "sleep", lambda s: None)
+    restarts = operations.supervise_daemon(max_restarts=3, backoff_start=0)
+    assert restarts == 3
+    assert calls["n"] == 4  # the original run plus three restarts
+
+
+def test_supervise_refuses_to_loop_on_a_fault_a_restart_cannot_fix(seat, monkeypatch):
+    """A crash loop buries the reason and reports activity while nothing is received."""
+    from agent_comms.errors import CredentialMissing
+
+    def broken(**kw):
+        raise CredentialMissing("no credential for this seat")
+
+    monkeypatch.setattr(operations, "run_daemon", broken)
+    with pytest.raises(CredentialMissing):
+        operations.supervise_daemon(max_restarts=5, backoff_start=0)
+
+
+def test_supervise_records_each_restart(seat, monkeypatch):
+    """A restart nobody can see is a daemon that looks like it never died."""
+    monkeypatch.setattr(operations, "run_daemon",
+                        lambda **kw: (_ for _ in ()).throw(RuntimeError("boom")))
+    monkeypatch.setattr(operations.time, "sleep", lambda s: None)
+    operations.supervise_daemon(max_restarts=1, backoff_start=0)
+    events = (seat / ".comms" / "events.log").read_text()
+    assert "supervisor restarting" in events
+
+
+def test_supervise_backs_off_and_resets_after_a_long_run(seat, monkeypatch):
+    """Fast repeated failures slow down; a daemon that ran for ages then died
+    starts again promptly — those are different events."""
+    slept = []
+    monkeypatch.setattr(operations.time, "sleep", slept.append)
+    monkeypatch.setattr(operations, "run_daemon",
+                        lambda **kw: (_ for _ in ()).throw(RuntimeError("boom")))
+    operations.supervise_daemon(max_restarts=4, backoff_start=1.0, backoff_max=8.0)
+    assert slept == [1.0, 2.0, 4.0, 8.0], slept
+
+
+def test_supervise_conflicts_with_the_other_daemon_flags(seat):
+    from click.testing import CliRunner
+
+    from agent_comms import cli
+
+    result = CliRunner().invoke(cli.main, ["daemon", "--supervise", "--detach"],
+                                standalone_mode=False)
+    assert isinstance(result.exception, click.UsageError)
+
+
+# -- the queue is a doorbell; history is the record (0.52.2) -------------------
+
+def _history_msg(mid, ts, topic="agent-comms: from history", sender="agent-eco-arch"):
+    return {"id": mid, "sender_full_name": sender, "display_recipient": "agent-eco",
+            "subject": topic, "content": "body", "timestamp": ts, "stream_id": 7,
+            "flags": ["mentioned"]}
+
+
+class HistoryTransport(FakeTransport):
+    """A hub that also answers `GET messages`, like the real one."""
+
+    def __init__(self, history=None, **kw):
+        super().__init__(**kw)
+        self.history = history or []
+        self.history_calls = []
+
+    def get_events(self, **kwargs):
+        """Raise a queued exception, so a gap can be simulated as it really is."""
+        if self.event_batches and isinstance(self.event_batches[0], Exception):
+            raise self.event_batches.pop(0)
+        return super().get_events(**kwargs)
+
+    def call_endpoint(self, url, method="GET", request=None):
+        if url == "messages" and method == "GET":
+            self.history_calls.append(request)
+            anchor = int(request["anchor"])
+            return {"result": "success",
+                    "messages": [m for m in self.history if m["id"] >= anchor]}
+        return super().call_endpoint(url, method, request)
+
+
+def test_last_message_id_is_the_durable_marker(seat):
+    """last_event_id dies with the queue; a message id does not."""
+    from agent_comms.store import Store
+
+    store = Store(seat / ".comms")
+    assert store.last_message_id() == 0
+    transport = HistoryTransport(event_batches=[{"result": "success", "events": [
+        {"id": 1, "type": "message", "flags": ["mentioned"],
+         "message": _history_msg(500, 1)},
+    ]}])
+    operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
+    assert store.last_message_id() == 500
+
+
+def test_a_lost_queue_no_longer_loses_messages(seat):
+    """The whole point. Queue dies, history still has them, so nothing is lost."""
+    from agent_comms.errors import QueueGapError
+    from agent_comms.store import Store
+
+    store = Store(seat / ".comms")
+    transport = HistoryTransport(
+        history=[_history_msg(601, 10), _history_msg(602, 11)],
+        event_batches=[{"result": "success", "events": [
+            {"id": 1, "type": "message", "flags": ["mentioned"],
+             "message": _history_msg(600, 9)}]}],
+    )
+    operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
+    assert store.last_message_id() == 600
+
+    # Now the queue is collected; the daemon re-registers and backfills.
+    transport.event_batches = [QueueGapError("queue gone."),
+                               {"result": "success", "events": []}]
+    operations.run_daemon(transport_factory=lambda c: transport, max_iterations=2)
+    ids = {m.id for m in store.all()}
+    assert {601, 602} <= ids, "messages sent while the queue was dead were lost"
+    assert "backfilled 2 message(s)" in (seat / ".comms" / "events.log").read_text()
+
+
+def test_the_anchor_message_is_not_handled_twice(seat):
+    """`anchor` is inclusive. Re-handling it would re-notify the agent."""
+    from agent_comms.store import Store
+
+    store = Store(seat / ".comms")
+    transport = HistoryTransport(
+        history=[_history_msg(700, 10)],
+        event_batches=[{"result": "success", "events": [
+            {"id": 1, "type": "message", "flags": ["mentioned"],
+             "message": _history_msg(700, 10)}]}],
+    )
+    operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
+    before = len(store.all())
+    operations._catch_up(
+        operations.Hub(transport, operations.load_settings(),
+                       operations.load_credential(operations.load_settings().identity)),
+        store, lambda e: None, "test")
+    assert len(store.all()) == before
+
+
+def test_a_fresh_seat_does_not_replay_all_history(seat):
+    """Backfilling from id 0 would notify the agent about every message ever sent."""
+    from agent_comms.store import Store
+
+    store = Store(seat / ".comms")
+    transport = HistoryTransport(history=[_history_msg(i, 1) for i in range(800, 900)])
+    hub = operations.Hub(transport, operations.load_settings(),
+                         operations.load_credential(operations.load_settings().identity))
+    assert operations._catch_up(hub, store, lambda e: None, "fresh") == 0
+    assert transport.history_calls == [], "a fresh seat must not read history at all"
+
+
+def test_the_backstop_catches_a_queue_that_stopped_delivering(seat, monkeypatch):
+    """A hung connection errors nothing and looks exactly like a quiet channel.
+    Only reading the doorstep tells the difference."""
+    import time as _time
+
+    from agent_comms.store import Store
+
+    store = Store(seat / ".comms")
+    old = _time.time() - 600  # comfortably past MISSED_AFTER_SECS
+    transport = HistoryTransport(
+        history=[_history_msg(901, old)],
+        event_batches=[{"result": "success", "events": [
+            {"id": 1, "type": "message", "flags": ["mentioned"],
+             "message": _history_msg(900, old)}]}],
+    )
+    operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
+
+    # The queue now says nothing, but history has a message it never delivered.
+    monkeypatch.setattr(operations, "BACKSTOP_SECS", 0)
+    operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
+
+    events = (seat / ".comms" / "events.log").read_text()
+    assert 901 in {m.id for m in store.all()}, "the backstop did not recover it"
+    assert "is not delivering" in events, "a dead queue must be replaced, not trusted"
+
+
+def test_the_backstop_does_not_cry_wolf_on_a_timing_race(seat, monkeypatch):
+    """A message arriving between the doorbell and the backstop is normal.
+    Tearing down a healthy queue for that would make things worse."""
+    import time as _time
+
+    from agent_comms.store import Store
+
+    store = Store(seat / ".comms")
+    transport = HistoryTransport(
+        history=[_history_msg(1001, _time.time())],  # just now
+        event_batches=[{"result": "success", "events": [
+            {"id": 1, "type": "message", "flags": ["mentioned"],
+             "message": _history_msg(1000, _time.time())}]}],
+    )
+    operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
+    monkeypatch.setattr(operations, "BACKSTOP_SECS", 0)
+    operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
+
+    events = (seat / ".comms" / "events.log").read_text()
+    assert 1001 in {m.id for m in store.all()}, "it should still be recovered"
+    assert "is not delivering" not in events, "a fresh message is a race, not a fault"

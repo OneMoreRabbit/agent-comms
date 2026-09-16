@@ -28,8 +28,11 @@ from .errors import (
     CommsError,
     ConflictingWakeTriggers,
     CredentialMissing,
+    CredentialUnreadable,
     DaemonAlreadyRunning,
     DaemonWillNotStop,
+    InsecureTransportRefused,
+    NotSubscribed,
     QueueGapError,
 )
 from .hub import Hub, Registration, Transport, build_transport
@@ -432,7 +435,7 @@ class Posted:
     """What the hub said, and anything the sender needs to know about it.
 
     `warnings` is empty on the normal path. It carries the case the ArcPlatform
-    finding named: a mention that renders perfectly and reaches nobody.
+    finding named: a mention that renders perfectly and notifies nobody.
     """
 
     response: dict
@@ -475,7 +478,7 @@ def _mention_warnings(hub: Hub, content: str, channel: str) -> list[str]:
     """One line per unreachable mention, in the resolver's own words."""
     return [
         f"'{name}' is mentioned in the body but is not in channel '{channel}', so that "
-        f"mention renders correctly and reaches nobody. The message was posted; reach "
+        f"mention notifies nobody. The message was posted; reach "
         f"{name} another way."
         for name in unreachable_mentions(hub, content)
     ]
@@ -576,7 +579,7 @@ def _resolve_recipient(settings: Settings, hub: Hub, name: str) -> str:
     if exists:
         raise UnknownRecipient(
             f"'{name}' exists on the hub but is not in channel '{settings.channel}', so a "
-            "mention of it here would render correctly and reach nobody. Reach it through "
+            "mention of it here would render correctly and notify nobody. Reach it through "
             "a channel you both sit in, or ask the estate to subscribe it. "
             f"Reachable from here: {others}."
         )
@@ -957,6 +960,83 @@ def restart_daemon(log_path: str | None = None, timeout: float = 10.0, **kw) -> 
     return replaced, detach_daemon(log_path, **kw)
 
 
+#: Faults a restart cannot fix. Respawning on these is a crash loop that buries
+#: the reason in a scrolling log — worse than stopping with it on screen, because
+#: the operator then has a supervisor reporting activity and a seat receiving
+#: nothing. Every one of these needs a person: a credential, a config line, or a
+#: decision.
+UNFIXABLE_BY_RESTART = (
+    CommsDisabled,
+    CredentialMissing,
+    CredentialUnreadable,
+    InsecureTransportRefused,
+    NotSubscribed,
+    ConflictingWakeTriggers,
+    DaemonAlreadyRunning,
+)
+
+
+def supervise_daemon(
+    max_restarts: int | None = None,
+    backoff_start: float = 1.0,
+    backoff_max: float = 60.0,
+    **kw,
+) -> int:
+    """Run the daemon, and start it again if it exits. Returns the restart count.
+
+    **This is not full supervision and the help says so.** It survives the daemon
+    *crashing*. It does not survive being killed, the container restarting or the
+    host rebooting — and nothing inside the container can, because there is no
+    init in a devagent seat to own it (measured: no systemd, no cron, PID 1 is
+    sshd). A self-respawning parent has the same lifetime as the thing it
+    supervises. The durable answer is a host-side unit, which is asked for in
+    `comms-daemon-supervision`; this closes the gap the client can close.
+
+    Two properties make it worth having rather than a loop anyone could write:
+
+    - **It refuses to restart on a fault a restart cannot fix.** A bad
+      credential, comms disabled, an unsubscribed bot or two wake triggers are
+      re-raised, not retried. A crash loop turns a legible error into noise and
+      reports activity while the seat receives nothing.
+    - **It backs off**, doubling to a cap, so a transient network fault does not
+      become a hot loop against the hub — and it resets the delay after a run
+      that lasted, because a daemon that ran for an hour and died is a different
+      event from one failing instantly.
+
+    `max_restarts` bounds the loop for tests; unbounded in a seat.
+    """
+    settings = load_settings(**kw)
+    store = Store(settings.state_dir)
+    store.ensure()
+
+    restarts, delay = 0, backoff_start
+    while True:
+        started = time.monotonic()
+        try:
+            run_daemon(**kw)
+        except UNFIXABLE_BY_RESTART:
+            # Loud and final. The supervisor's job is to keep a working daemon
+            # running, not to keep an unworkable one company.
+            raise
+        except KeyboardInterrupt:
+            raise
+        except Exception as exc:  # noqa: BLE001 — anything else is worth retrying
+            store.record("warn", f"daemon exited ({type(exc).__name__}: {exc}); supervisor restarting")
+        else:
+            store.record("warn", "daemon returned; supervisor restarting")
+
+        if max_restarts is not None and restarts >= max_restarts:
+            return restarts
+
+        # A run that lasted was healthy until it was not: start the next backoff
+        # from the bottom. Only repeated fast failures are worth slowing down.
+        if time.monotonic() - started >= backoff_max:
+            delay = backoff_start
+        time.sleep(delay)
+        delay = min(delay * 2, backoff_max)
+        restarts += 1
+
+
 def _record_exits(store: Store) -> None:
     """Make the daemon say so when it dies, however it dies.
 
@@ -1052,15 +1132,20 @@ def run_daemon(
     store.save_position(registration.queue_id, registration.last_event_id)
 
     stored, iterations, backoff = 0, 0, 1
+    last_backstop = time.monotonic()
+    gap_recovery = False
     while max_iterations is None or iterations < max_iterations:
         iterations += 1
         try:
             events = hub.get_events(registration)
             backoff = 1
         except QueueGapError as exc:
-            store.record("warn", f"{exc} Re-registering.")
+            # No longer "messages are lost": note it, re-register, then read
+            # channel history forward on the next pass through the loop.
+            store.record("warn", f"{exc} Re-registering and backfilling.")
             registration = _register(hub, store)
-            continue
+            gap_recovery = True
+            events = []
         except KeyboardInterrupt:  # pragma: no cover - operator stop
             store.record("info", "daemon stopped by operator")
             break
@@ -1070,7 +1155,13 @@ def run_daemon(
             backoff = min(backoff * 2, 60)
             continue
 
-        for event in events:
+        def handle_event(event: dict) -> None:
+            """One message, whether the queue delivered it or history did.
+
+            Backfill calls this too, so a recovered message is permission-checked,
+            stored, refused or notified exactly like a live one.
+            """
+            nonlocal stored
             # The permission check asks the hub, so it can fail — and this loop
             # sits outside the guard around `get_events`. Unguarded, a single
             # transport hiccup would end the daemon, which is the silent-death
@@ -1099,7 +1190,7 @@ def run_daemon(
                 permitted=_permitted,
             )
             if mention is None:
-                continue
+                return
             store.append(mention)
             stored += 1
             if not mention.authorised:
@@ -1112,13 +1203,46 @@ def run_daemon(
                 # sender is told once, so nothing is silent and a wrong
                 # directory is recoverable.
                 if undetermined:
-                    continue  # held, already logged; no bounce for a non-answer
+                    return  # held, already logged; no bounce for a non-answer
                 _refuse_sender(settings, store, mention, directory, hub,
                                bounced, transport_factory)
-                continue
+                return
             _notify(settings, store, mention)
             if on_mention is not None:
                 on_mention(mention)
+
+        for event in events:
+            handle_event(event)
+
+        # The doorbell rang, but the queue is not the record. Anything that
+        # arrived while it was down is in channel history and nowhere else, so
+        # read forward from the last message actually handled.
+        if gap_recovery:
+            gap_recovery = False
+            _catch_up(hub, store, handle_event, "queue was replaced")
+
+        # Check the doorstep regardless. Two failures hide from the queue alone:
+        # a connection that hangs without erroring, and a queue replaced between
+        # ticks. Both look exactly like a quiet channel.
+        if time.monotonic() - last_backstop >= BACKSTOP_SECS:
+            last_backstop = time.monotonic()
+            before = store.last_message_id()
+            found = _catch_up(hub, store, handle_event, "backstop")
+            if found:
+                newest = store.last_message_id()
+                stale = [m for m in store.all()
+                         if before < m.id <= newest
+                         and (time.time() - m.timestamp) > MISSED_AFTER_SECS]
+                if stale:
+                    # Not a race: these were sitting in history while the queue
+                    # said nothing. The queue is not delivering, so replace it
+                    # rather than trusting it for another ten minutes.
+                    store.record(
+                        "warn",
+                        f"the event queue missed {len(stale)} message(s) that channel "
+                        "history had; it is not delivering. Re-registering.",
+                    )
+                    registration = _register(hub, store)
 
         # Every tick, not only when a message arrives. Zulip sends a heartbeat
         # about once a minute (measured: ~54s), so this loop turns over even on
@@ -1128,6 +1252,62 @@ def run_daemon(
         store.save_position(registration.queue_id, registration.last_event_id)
 
     return stored
+
+
+#: How often to read channel history regardless of what the queue said. The
+#: queue is a doorbell; this is checking the doorstep. Five minutes (operator,
+#: 2026-09-16; was ten): it bounds how long a dead doorbell can go unnoticed,
+#: and that is the number worth spending an API call on. Twelve calls an hour
+#: against a hub this seat already long-polls continuously is not a cost.
+BACKSTOP_SECS = 300
+
+#: A message must be this old before its absence from the queue is evidence the
+#: queue is broken. Without it, a message arriving between the doorbell firing
+#: and the backstop reading would look like a missed notification, and the daemon
+#: would tear down a healthy queue on an ordinary timing race.
+MISSED_AFTER_SECS = 60
+
+
+def _event_from_message(msg: dict) -> dict:
+    """Shape a history message like the event the queue would have delivered.
+
+    So a backfilled message goes through exactly the same permission check,
+    storage, refusal and notify path as a live one. A second code path for
+    recovered messages is how recovery quietly behaves differently from normal
+    receipt — and the difference only shows up in the case nobody tests.
+
+    `flags` carries `mentioned` when this seat is named, which is what the queue
+    would have set; addressing itself is re-derived downstream from the topic and
+    body, so nothing here decides who a message is for.
+    """
+    return {"id": msg.get("id"), "type": "message", "flags": msg.get("flags") or [],
+            "message": msg}
+
+
+def _catch_up(hub: Hub, store: Store, handle, reason: str) -> int:
+    """Read everything after the last handled message and run it through `handle`.
+
+    Returns how many were recovered. Says so in the log either way: "backfilled
+    0" is the evidence that a gap cost nothing, and it is the line that turns
+    "any messages sent meanwhile are lost" into a measured claim.
+    """
+    since = store.last_message_id()
+    if since <= 0:
+        # Nothing handled yet. A full history replay on a fresh seat would
+        # notify the agent about every message ever sent to the channel, which
+        # is worse than the gap. Start from now.
+        return 0
+    try:
+        missed = hub.messages_after(since)
+    except Exception as exc:  # noqa: BLE001 - the queue path still works
+        store.record("warn", f"{reason}: could not read channel history to catch up ({exc})")
+        return 0
+    for msg in missed:
+        handle(_event_from_message(msg))
+    store.record("info" if missed else "info",
+                 f"{reason}: backfilled {len(missed)} message(s) from channel history "
+                 f"after id {since}")
+    return len(missed)
 
 
 def _register(hub: Hub, store: Store) -> Registration:
