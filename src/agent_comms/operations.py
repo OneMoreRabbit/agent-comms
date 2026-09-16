@@ -1255,10 +1255,11 @@ def run_daemon(
 
 
 #: How often to read channel history regardless of what the queue said. The
-#: queue is a doorbell; this is checking the doorstep. Ten minutes: often enough
-#: that a dead doorbell is caught within one, rare enough to be one API call an
-#: hour's worth of nothing.
-BACKSTOP_SECS = 600
+#: queue is a doorbell; this is checking the doorstep. Five minutes (operator,
+#: 2026-09-16; was ten): it bounds how long a dead doorbell can go unnoticed,
+#: and that is the number worth spending an API call on. Twelve calls an hour
+#: against a hub this seat already long-polls continuously is not a cost.
+BACKSTOP_SECS = 300
 
 #: A message must be this old before its absence from the queue is evidence the
 #: queue is broken. Without it, a message arriving between the doorbell firing
