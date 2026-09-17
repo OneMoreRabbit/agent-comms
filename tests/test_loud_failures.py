@@ -241,12 +241,10 @@ def test_doctor_treats_disabled_as_a_state_not_a_failure(seat):
 def test_doctor_reports_every_check_not_just_the_first(running_daemon, monkeypatch):
     # The seat build is a real subprocess otherwise, so this test would report
     # whatever build the machine running it happens to carry.
-    monkeypatch.setattr("agent_comms.operations.seat_version_now",
-                        lambda: __import__("agent_comms.seat", fromlist=["x"]).SeatVersion(
-                            seat="0.5.1", contract="0.5.1"))
-    monkeypatch.setattr("agent_comms.operations.seat_status_now",
-                        lambda: __import__("agent_comms.seat", fromlist=["x"]).SeatStatus(
-                            verdict="addressable", runtime="claude", target="rc:0.0", awake=True))
+    monkeypatch.setattr("agent_comms.operations.seat_state_now",
+                        lambda: __import__("agent_comms.seat", fromlist=["x"]).SeatState(
+                            answer="yes", reason="a message sent now would reach the agent",
+                            runtime="claude", sessions=1, version="1.0.2", contract="1.0"))
     """An operator debugging a seat wants the whole picture."""
     report = operations.preflight(transport_factory=lambda c: FakeTransport())
     names = [n for n, _, _ in report.checks]
@@ -261,9 +259,10 @@ def test_doctor_reports_every_check_not_just_the_first(running_daemon, monkeypat
 # -- attribution: the bot must be who the vault thinks it is -----------------
 
 def test_component_bot_name_is_accepted_silently(running_daemon, monkeypatch):
-    monkeypatch.setattr("agent_comms.operations.seat_status_now",
-                        lambda: __import__("agent_comms.seat", fromlist=["x"]).SeatStatus(
-                            verdict="addressable", runtime="claude", target="rc:0.0", awake=True))
+    monkeypatch.setattr("agent_comms.operations.seat_state_now",
+                        lambda: __import__("agent_comms.seat", fromlist=["x"]).SeatState(
+                            answer="yes", reason="a message sent now would reach the agent",
+                            runtime="claude", sessions=1, version="1.0.2", contract="1.0"))
     """ADR-0009 §7a: a component bot appears only in its project's channel, so
     the seat name alone is unambiguous there. Warning about it would be noise."""
     report = operations.preflight(
@@ -960,3 +959,30 @@ def test_the_backstop_does_not_cry_wolf_on_a_timing_race(seat, monkeypatch):
     events = (seat / ".comms" / "events.log").read_text()
     assert 1001 in {m.id for m in store.all()}, "it should still be recovered"
     assert "is not delivering" not in events, "a fresh message is a race, not a fault"
+
+
+def test_a_losing_daemon_does_not_erase_the_winners_pid(seat):
+    """Measured on this seat 2026-09-17: a second daemon started by the estate's
+    install left a 0-byte lock. `status` then said "pid None" and
+    `comms daemon --stop` could not signal what it could not name.
+
+    Cause: the lock was opened with "w", which truncates BEFORE the flock is
+    attempted — so the contender that loses destroys the winner's identity on its
+    way out. Take the lock first; write only once it is ours."""
+    from agent_comms.errors import DaemonAlreadyRunning
+    from agent_comms.store import Store
+
+    store = Store(seat / ".comms")
+    held = store.acquire_daemon_lock()
+    try:
+        recorded = (seat / ".comms" / "daemon.lock").read_text().strip()
+        assert recorded, "the holder must record its pid"
+
+        with pytest.raises(DaemonAlreadyRunning):
+            store.acquire_daemon_lock()
+
+        after = (seat / ".comms" / "daemon.lock").read_text().strip()
+        assert after == recorded, "a refused contender must not erase the holder's pid"
+        assert store.daemon_state().pid == int(recorded)
+    finally:
+        held.close()
