@@ -1,344 +1,247 @@
-"""The seat surface — `devagent-seat-contract` 0.5.
+"""The agent-seat application, as this client sees it.
 
-One question, one owner, one answer: **can this seat be spoken to?** The seat
-answers it; we do not. Everything this client used to infer — pane scans,
-process trees, readiness heuristics, codex loaded-thread guesses — is gone,
-replaced by `seat status --json` (ADR-0011).
+**One interface, and this is it.** `devagent-seat-contract` 1.0: comms hands the
+seat a message and reads the answer. It does not judge or analyse the state of an
+agent session — not liveness, not runtime, not attendance, not session counts —
+and it does not reach around the seat for anything the seat did not say.
 
-The hard rule that keeps the seam real: **we never second-guess the verdict.**
-If it says addressable and delivery fails, that is a bug reported to
-`agent-skeleton`, not one worked around here. A quiet local fallback would
-rebuild the four inference layers behind a nicer facade.
+*What this module replaced, and why the deletion is the point.* Through 0.5x this
+client carried a per-runtime sender table, a pinned-conversation field, per-runtime
+session counts and a four-state verdict machine, and it asked `seat status` before
+delivering and then acted on the answer. Each of those was this client forming its
+own opinion about something the seat owns; the last was a race — two truths with a
+gap between them, and the gap is where a message is lost (contract §3). All of it
+is gone rather than adapted.
 """
 
 from __future__ import annotations
 
 import json
-import os
-import shutil
 import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
-#: Exit codes from `seat status`. The contract's stable surface: reasons are
-#: prose and may be reworded, verdict strings are a convenience, exit codes are
-#: the interface. An exit we do not recognise is `undetermined`, never fine.
-ADDRESSABLE = 0
-NOT_ADDRESSABLE = 10
-BROKEN = 20
-UNDETERMINED = 30
+#: Delivery statuses, from the contract's table. `success` is the field to branch
+#: on; these are for deciding what to do NEXT, which is this client's business.
+DELIVERED = "delivered"
+QUEUED = "queued"
+NO_SESSION = "no-session"
+FAILED = "failed"
+BROKEN = "broken"
+UNKNOWN = "unknown"
 
-VERDICTS = {
-    ADDRESSABLE: "addressable",
-    NOT_ADDRESSABLE: "not-addressable",
-    BROKEN: "broken",
-    UNDETERMINED: "undetermined",
-}
+#: The seat's body limit (contract: 65536 bytes, never silently truncated).
+MAX_BODY_BYTES = 65536
 
-@dataclass
-class SeatStatus:
-    """What the seat says about itself."""
-
-    verdict: str
-    reason: str = ""
-    runtime: str = ""
-    #: Live but not attending. `None` means the seat did not say.
-    awake: bool | None = None
-    #: Where to send: a tmux target for claude, the thread id for codex.
-    target: str = ""
-    pinned: str | None = None
-    #: How many agent sessions are running, per runtime. `None` for a runtime
-    #: the seat could not ask, which is **not** the same as 0.
-    sessions: dict = field(default_factory=dict)
-    raw: dict = field(default_factory=dict)
-
-    @property
-    def addressable(self) -> bool:
-        return self.verdict == "addressable"
-
-    @property
-    def session_running(self) -> int | None:
-        """Sessions running for the runtime this seat declares, or `None` if unknown."""
-        value = self.sessions.get(self.runtime)
-        return value if isinstance(value, int) else None
-
-    @property
-    def waiting(self) -> bool:
-        """Deliverable, but nothing is running to read it yet.
-
-        A pinned codex thread takes a message whether or not the thread is
-        loaded — codex has its own queue and the message waits there until the
-        thread next runs (`agent-skeleton-addressable-logic` 0.1, measured on
-        their seat with the app-server stopped). So the verdict is `addressable`
-        either way, and the exit code cannot tell the two apart.
-
-        The **session count** can, and it is a declared field rather than prose:
-        zero sessions for the declared runtime means the message will wait. That
-        is worth telling a sender, because the remedy is theirs — wake the seat —
-        and because silence for an hour otherwise looks like a fault.
-        """
-        return self.deliverable and self.session_running == 0
-
-    @property
-    def attending(self) -> bool:
-        """Is the agent attending? Anything but a clear yes is a no.
-
-        `awake: null` means the seat could not ask the runtime, and that is held
-        for the same reason `undetermined` is: every failure in the catalogue
-        began as something nobody could determine and was treated as fine.
-        """
-        return self.awake is True
-
-    @property
-    def deliverable(self) -> bool:
-        """Addressable *and* attending.
-
-        Operator ruling, 2026-09-09: hold delivery until wake. A sleeping
-        session is deliverable in principle and not now, so a message for it
-        waits — which is what this client already does for a dormant seat.
-
-        **`awake` is read from `seat status --json`.** It was a separate
-        `seat awake` call until 2026-09-11, because the status field had been set
-        by a codex branch that never reached the app-server, so a live thread
-        read asleep. agent-skeleton merged the two onto one shared check and they
-        now answer identically, so the second call was work for nothing.
-        """
-        return self.addressable and self.attending
-
-    def hold_reason(self) -> str:
-        """Why a message is being held, in the seat's own words where it has any."""
-        if self.addressable and self.awake is False:
-            return (
-                f"the {self.runtime or 'agent'} session is asleep — addressable but not "
-                "attending. Held until it wakes; waking is the operator's (ADR-0009 §7e)."
-            )
-        detail = self.reason or "no reason given"
-        return f"the seat reports {self.verdict}: {detail}"
-
-
-@dataclass
-class Persistence:
-    """What the seat says about how long its session lasts.
-
-    Declared in `~/.seat/session.yml` (contract 0.5). We asked for this in
-    ADR-0011 step 0 because it decides what "queued" means to a sender —
-    minutes, or until somebody notices — and nothing else can tell them.
-    """
-
-    survives: tuple[str, ...] = ()
-    lost_on: tuple[str, ...] = ()
-
-    def summary(self) -> str:
-        if not self.survives and not self.lost_on:
-            return ""
-        parts = []
-        if self.survives:
-            parts.append(f"survives {', '.join(self.survives)}")
-        if self.lost_on:
-            parts.append(f"lost on {', '.join(self.lost_on)}")
-        return "; ".join(parts)
-
-
-#: The seat contract this client is written against. Consumed per its own
-#: guidance: compare on `.seat`, because a build below 0.3.1 could misreport the
-#: contract it implements — 0.3.0 shipped saying `contract 0.5` after the
-#: renumber, having held the two as separate literals.
-MINIMUM_SEAT = "0.5.1"
-
-
-@dataclass
-class SeatVersion:
-    """Which build of `seat` this is. Contractual from 0.3.3."""
-
-    seat: str = ""
-    contract: str = ""
-    raw: str = ""
-
-    @property
-    def known(self) -> bool:
-        return bool(self.seat)
-
-    def below(self, minimum: str = MINIMUM_SEAT) -> bool:
-        """Is this build older than the one this client is written against?
-
-        Compared as integer tuples, so `0.3.10` sorts above `0.3.9` — the trap
-        that made us propose `0.3.0` for our own release when we were at 0.17.
-        An unparseable version is not treated as old: it is unknown, and the
-        caller says so rather than acting on a guess.
-        """
-        def parts(v: str) -> tuple[int, ...] | None:
-            try:
-                return tuple(int(x) for x in v.split("."))
-            except ValueError:
-                return None
-
-        mine, theirs = parts(self.seat), parts(minimum)
-        if mine is None or theirs is None:
-            return False
-        return mine < theirs
-
-    def summary(self) -> str:
-        if not self.known:
-            return "seat build unknown — `seat --version` did not report one"
-        line = f"seat {self.seat} (contract {self.contract or 'unstated'})"
-        if self.below():
-            line += (
-                f" — older than {MINIMUM_SEAT}, which this client is written against. "
-                "No call or field changed, so it works. Two things an older build "
-                "cannot do: vouch for WHICH claude process the declared target holds "
-                "(0.4.0 records the pid it started, so below that a message can be "
-                "typed into a stale instance), and report a pinned codex thread as "
-                "deliverable while nothing is loaded (0.5.1 — below it, a seat that "
-                "would have taken the message says it would be lost)."
-            )
-        return line
-
-
-def version(timeout: int = 20) -> SeatVersion:
-    """Ask the seat which build it is.
-
-    Read leniently on purpose. From 0.3.1 `--json` emits the object and nothing
-    else, but 0.3.0 printed the two prose lines *first* and the object after —
-    so during a staged rollout both shapes are on real seats at once. Scanning
-    for the object rather than parsing the whole stream reads either.
-
-    That is tolerance of an older build, not a workaround of a live defect: the
-    defect is fixed, and this exists so a half-upgraded estate reports honestly
-    instead of reporting nothing.
-    """
-    if not seat_available():
-        raise SeatUnavailable(
-            "this seat has no `seat` command, so it cannot say which build it is."
-        )
-    try:
-        result = subprocess.run(
-            ["seat", "--version", "--json"],
-            text=True, capture_output=True, timeout=timeout, check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return SeatVersion(raw=f"`seat --version` did not run: {exc}")
-
-    out = (result.stdout or "").strip()
-    for line in reversed(out.splitlines()):
-        line = line.strip()
-        if line.startswith("{"):
-            try:
-                payload = json.loads(line)
-            except ValueError:
-                continue
-            return SeatVersion(
-                seat=str(payload.get("seat") or ""),
-                contract=str(payload.get("contract") or ""),
-                raw=out,
-            )
-
-    # No object anywhere: fall back to the guaranteed plain form, `seat <v>`.
-    for line in out.splitlines():
-        if line.strip().startswith("seat "):
-            return SeatVersion(seat=line.strip().split()[1], raw=out)
-    return SeatVersion(raw=out)
+#: Which outcomes are worth trying again, and which are not. This is the retry
+#: decision the operator ruled is ours: the queue is this client's, so the seat's
+#: exit status is an INPUT here, not merely a report for a human.
+#:
+#: - `no-session` — nothing running yet. A session may come up; the message waits.
+#: - `unknown` — the seat could not ask its runtime. Not an answer, so not a no.
+#: - `failed` at exit 10 — the attempt was made and did not work. Transient until
+#:   proven otherwise.
+#:
+#: Not retried: `broken` needs a person (contract §4 — not exactly one session),
+#: and retrying would spin against a state no retry can change. `failed` at exit 2
+#: is a usage error — OUR defect, not the seat's, and repeating a malformed call
+#: is how a bug becomes a flood.
+RETRYABLE = frozenset({NO_SESSION, UNKNOWN})
 
 
 class SeatUnavailable(Exception):
-    """This seat has no `seat` command, so nothing can be confirmed.
+    """The `seat` command could not be run at all — absent, or it would not answer.
 
-    Not a fallback trigger. A seat that cannot answer is a seat we do not
-    deliver into — the message is held and says why, exactly as it is for a
-    seat that answers "not addressable".
+    Distinct from every status the seat itself reports. A seat that answers
+    `broken` is working correctly and telling us something; a seat we cannot
+    invoke is a different fault with a different remedy.
     """
 
 
-def seat_available() -> bool:
-    return shutil.which("seat") is not None
+@dataclass
+class Delivery:
+    """What the seat said about one message.
 
-
-def status(timeout: int = 20) -> SeatStatus:
-    """Ask the seat whether it can be spoken to.
-
-    Anything we cannot read cleanly is `undetermined`, which the contract is
-    explicit must be treated exactly as `not-addressable`. Every failure in the
-    catalogue began as something undetermined and treated as fine.
+    Mirrors the contract's `--json` object exactly, with nothing added and nothing
+    inferred. `message` is the seat's own sentence and is shown to people verbatim
+    — it is not parsed, and it is not a stable identifier.
     """
-    if not seat_available():
-        raise SeatUnavailable(
-            "this seat has no `seat` command, so it cannot say whether it can receive "
-            "a message. It needs the agent-skeleton image carrying "
-            "devagent-seat-contract 0.5. Holding the message until it does."
+
+    success: bool
+    status: str
+    message: str = ""
+    runtime: str = ""
+    seat: str = ""
+    exit_code: int = 0
+
+    @property
+    def retryable(self) -> bool:
+        """Should this client try again later?
+
+        `failed` is split by exit code: 10 is the seat's attempt failing, which is
+        worth another go; 2 is a usage error, which is ours and never is.
+        """
+        if self.success:
+            return False
+        if self.status == FAILED:
+            return self.exit_code != 2
+        return self.status in RETRYABLE
+
+    @property
+    def needs_a_person(self) -> bool:
+        """`broken` — the seat's invariant is violated and no retry fixes it."""
+        return self.status == BROKEN
+
+    def summary(self) -> str:
+        """One line for a log or a sender, in the seat's own words where it has them."""
+        seat = f" [{self.seat}]" if self.seat else ""
+        return f"{self.status}: {self.message}{seat}" if self.message else f"{self.status}{seat}"
+
+
+def deliver(body: str, timeout: int = 30) -> Delivery:
+    """Hand one message to the seat. The only way this client delivers anything.
+
+    The body goes on **stdin**, never as an argument — the seat refuses an argument
+    with exit 2, and it is right to. Everything this client delivers is
+    sender-authored text from the hub: backticks, `$( )`, quotes and newlines occur
+    routinely, and they survive a pipe and not a command line. This client asked
+    for the stdin form during the 1.0 review for exactly that reason.
+
+    Raises `SeatUnavailable` if `seat` cannot be run. Every other outcome — including
+    every failure the seat reports — comes back as a `Delivery`, because those are
+    answers, not breakages.
+    """
+    encoded = body.encode("utf-8")
+    if len(encoded) > MAX_BODY_BYTES:
+        # Checked here so the caller gets a Delivery rather than an exception, and
+        # so the byte count is ours to report. The seat would also refuse it; this
+        # saves a round trip and says the same thing.
+        return Delivery(
+            success=False,
+            status=FAILED,
+            message=(
+                f"the message is {len(encoded)} bytes and the seat's limit is "
+                f"{MAX_BODY_BYTES}. Not truncated — a shortened message that "
+                "reported success is worse than one that did not arrive."
+            ),
+            exit_code=2,
         )
 
     try:
         result = subprocess.run(
-            ["seat", "status", "--json"],
-            text=True, capture_output=True, timeout=timeout, check=False,
+            ["seat", "msg", "--json"],
+            input=encoded,
+            capture_output=True,
+            timeout=timeout,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return SeatStatus(verdict="undetermined", reason=f"`seat status` did not run: {exc}")
+    except FileNotFoundError as exc:
+        raise SeatUnavailable(
+            "the `seat` command is not on this seat, so nothing can be delivered. "
+            "agent-comms talks to the agent-seat application and to nothing else "
+            "(devagent-seat-contract 1.0)."
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise SeatUnavailable(
+            f"`seat msg` did not answer within {timeout}s. The message was not "
+            "delivered and has not been reported either way — it stays this "
+            "client's to retry."
+        ) from exc
 
+    return _parse(result.stdout, result.stderr, result.returncode)
+
+
+def _parse(stdout: bytes, stderr: bytes, code: int) -> Delivery:
+    """Read the seat's answer.
+
+    The contract promises `--json` is always valid JSON on every path including
+    failures. Read leniently anyway: if it is not, that is the seat's defect to
+    report, and swallowing the exit code to raise a parse error would lose the one
+    fact we did get.
+    """
+    raw = (stdout or b"").decode("utf-8", "replace").strip()
     try:
-        payload = json.loads(result.stdout)
-    except ValueError:
-        return SeatStatus(
-            verdict="undetermined",
-            reason=(
-                "`seat status --json` did not return readable JSON "
-                f"(exit {result.returncode}): "
-                f"{(result.stderr or result.stdout or '').strip()[:200]}"
+        payload = json.loads(raw) if raw else {}
+    except json.JSONDecodeError:
+        payload = {}
+
+    if not isinstance(payload, dict) or "status" not in payload:
+        detail = (stderr or b"").decode("utf-8", "replace").strip() or raw or "no output"
+        return Delivery(
+            success=False,
+            status=UNKNOWN,
+            message=(
+                f"`seat msg --json` exited {code} without a readable answer: "
+                f"{detail[:300]}. The contract requires valid JSON on every path, "
+                "so this is a seat defect — raise it rather than working around it."
             ),
+            exit_code=code,
         )
 
-    # **The exit code is the verdict.** The contract says so from 0.5.1:
-    # "branch on the exit code, not this string". A string can be reworded and
-    # a reason is explicitly for people; an exit code is the stable surface.
-    # The string is still read, and a disagreement is reported rather than
-    # silently resolved — two sources for one fact is how this client got into
-    # trouble before.
-    verdict = VERDICTS.get(result.returncode, "undetermined")
-    declared = payload.get("verdict")
-    reason = payload.get("reason") or ""
-    if declared and declared != verdict:
-        reason = (
-            f"the seat exited {result.returncode} ({verdict}) but its JSON says "
-            f"{declared!r}; taking the exit code. Original reason: {reason}"
-        )
-    awake = payload.get("awake")
-    sessions = payload.get("sessions")
-    return SeatStatus(
-        verdict=verdict,
-        reason=reason,
-        runtime=payload.get("runtime") or "",
-        awake=awake if isinstance(awake, bool) else None,
-        target=payload.get("target") or "",
-        pinned=payload.get("pinned"),
-        sessions=sessions if isinstance(sessions, dict) else {},
-        raw=payload,
+    return Delivery(
+        success=bool(payload.get("success")),
+        status=str(payload.get("status") or UNKNOWN),
+        message=str(payload.get("message") or ""),
+        runtime=str(payload.get("runtime") or ""),
+        seat=str(payload.get("seat") or ""),
+        exit_code=code,
     )
 
 
-def persistence(path: str | None = None) -> Persistence:
-    """Read the seat's declared session persistence.
+@dataclass
+class SeatState:
+    """`seat status` — advisory only, and never part of delivering.
 
-    Parsed by hand rather than with PyYAML: the two keys are flat lists in a
-    file the seat owns and documents. Absence is not an error — an older seat
-    simply does not say, and a sender is told less rather than told wrongly.
+    Kept for `comms doctor` and for a person asking whether a seat needs
+    attention. **Never call this and then call `deliver`**: the contract forbids
+    it (§3), because the two answers can disagree in the gap between them and that
+    gap is where a message is lost. It is why the old ask-then-act path is gone.
     """
-    path = path or os.path.join(os.path.expanduser("~"), ".seat", "session.yml")
-    try:
-        text = open(path, encoding="utf-8").read()
-    except OSError:
-        return Persistence()
 
-    found, section = {}, False
-    for line in text.splitlines():
-        if line.startswith("persistence:"):
-            section = True
-            continue
-        if section:
-            if line and not line.startswith((" ", "\t")):
-                break
-            stripped = line.strip()
-            for key in ("survives", "lost_on"):
-                if stripped.startswith(f"{key}:"):
-                    raw = stripped.split(":", 1)[1].strip().strip("[]")
-                    found[key] = tuple(
-                        v.strip().strip("'\"") for v in raw.split(",") if v.strip()
-                    )
-    return Persistence(survives=found.get("survives", ()), lost_on=found.get("lost_on", ()))
+    answer: str = ""
+    reason: str = ""
+    runtime: str = ""
+    seat: str = ""
+    sessions: int | None = None
+    remote_control_url: str = ""
+    version: str = ""
+    contract: str = ""
+    exit_code: int = 30
+
+    @property
+    def ok(self) -> bool:
+        return self.answer == "yes"
+
+    def summary(self) -> str:
+        return f"{self.answer or 'cannot tell'}: {self.reason}" if self.reason else (self.answer or "cannot tell")
+
+
+def state(timeout: int = 20) -> SeatState:
+    """Ask the seat how it is. Advisory — see `SeatState`."""
+    try:
+        result = subprocess.run(
+            ["seat", "status", "--json"], capture_output=True, timeout=timeout
+        )
+    except FileNotFoundError as exc:
+        raise SeatUnavailable("the `seat` command is not on this seat") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise SeatUnavailable(f"`seat status` did not answer within {timeout}s") from exc
+
+    raw = (result.stdout or b"").decode("utf-8", "replace").strip()
+    try:
+        payload = json.loads(raw) if raw else {}
+    except json.JSONDecodeError:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    sessions = payload.get("sessions")
+    return SeatState(
+        answer=str(payload.get("answer") or ""),
+        reason=str(payload.get("reason") or ""),
+        runtime=str(payload.get("runtime") or ""),
+        seat=str(payload.get("seat") or ""),
+        sessions=sessions if isinstance(sessions, int) else None,
+        remote_control_url=str(payload.get("remote_control_url") or ""),
+        version=str(payload.get("version") or ""),
+        contract=str(payload.get("contract") or ""),
+        exit_code=result.returncode,
+    )

@@ -35,6 +35,12 @@ class Mention:
     #: having got it into a session. A message queued while the seat was dormant
     #: stays undelivered until the seat wakes.
     delivered: bool = False
+    #: How many delivery attempts this message has had. Bounded retry: a message
+    #: that fails for a reason no retry can change must stop being retried, or the
+    #: queue spins forever and buries everything else. Found by testing against a
+    #: real seat — an oversized body answers `failed` at exit 10, which reads as
+    #: retryable and would fail identically every time.
+    attempts: int = 0
     #: Is the sender one this seat accepts direction from (ADR-0009 §9)?
     #: An unauthorised message is still stored and shown — the agent must be able
     #: to report it — but it is never presented as an instruction.
@@ -216,6 +222,17 @@ class Store:
         """
         return [m for m in self.all() if not m.delivered]
 
+    def record_attempt(self, message_id: int) -> int:
+        """Count one delivery attempt, and return the new total."""
+        total = 0
+        rows = self.all()
+        for m in rows:
+            if m.id == message_id:
+                m.attempts += 1
+                total = m.attempts
+        self._rewrite(rows)
+        return total
+
     def mark_delivered(self, message_id: int) -> bool:
         rows = self.all()
         found = False
@@ -312,24 +329,6 @@ class Store:
     def set_sleeping(self, value: bool) -> None:
         self.ensure()
         marker = self.root / "sleeping"
-        if value:
-            marker.touch()
-        elif marker.exists():
-            marker.unlink()
-
-    def sleeping_waiting(self) -> bool:
-        """Have we already told senders their messages are waiting to be read?
-
-        Distinct from `sleeping`: that one means nothing was delivered at all.
-        This one means delivery worked and nothing is running to read it — a
-        pinned codex thread with no session. Two different things to be told,
-        and each is said once.
-        """
-        return (self.root / "waiting").exists()
-
-    def set_sleeping_waiting(self, value: bool) -> None:
-        self.ensure()
-        marker = self.root / "waiting"
         if value:
             marker.touch()
         elif marker.exists():

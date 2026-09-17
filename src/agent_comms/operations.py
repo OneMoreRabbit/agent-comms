@@ -36,10 +36,8 @@ from .errors import (
     QueueGapError,
 )
 from .hub import Hub, Registration, Transport, build_transport
-from .seat import SeatStatus, SeatUnavailable
-from .seat import persistence as seat_persistence
-from .seat import status as seat_status_now
-from .seat import version as seat_version_now
+from .seat import SeatUnavailable
+from .seat import state as seat_state_now
 from .wake import WakeError, wake
 from .store import DaemonState, Mention, Store
 
@@ -183,13 +181,12 @@ def preflight(
     # went unnoticed for 21 minutes in the live incident. We no longer answer it
     # ourselves — this is a passthrough of the seat's verdict, so the estate has
     # one source for the fact rather than two that can disagree.
+    # `seat status` is ADVISORY (contract §3) and this is the only place this
+    # client may use it: a health check for a person, never a pre-check before
+    # delivering. Delivery asks `seat msg` and reads its answer, full stop.
     try:
-        sess = seat_status_now()
-        detail = f"seat status: {sess.verdict}" + (f" — {sess.reason}" if sess.reason else "")
-        ok = sess.deliverable
-        if sess.addressable:
-            detail += f" | awake: {sess.awake}"
-        report.add("deliverable", ok, detail)
+        sess = seat_state_now()
+        report.add("deliverable", sess.ok, sess.summary())
     except SeatUnavailable as exc:
         report.add("deliverable", False, str(exc))
 
@@ -230,11 +227,19 @@ def preflight(
     # consumed because a mixed estate is the normal state during a rollout: a
     # verdict is only as good as the build that produced it, and until 0.3.1 a
     # seat could misreport the contract it implemented.
+    # Which seat build answered, read from the same advisory call rather than a
+    # second one. A mixed estate is normal during a rollout and a verdict is only
+    # as good as the build behind it.
     try:
-        build = seat_version_now()
-        report.add("seat build", build.known, build.summary())
-        if build.known and build.below():
-            report.warnings.append(build.summary())
+        build = seat_state_now()
+        known = bool(build.version and build.contract)
+        report.add("seat build", known,
+                   f"seat {build.version or '?'} (contract {build.contract or '?'})")
+        if known and not build.contract.startswith("1."):
+            report.warnings.append(
+                f"this seat implements contract {build.contract}; agent-comms 1.x "
+                "requires 1.0 and cannot deliver to an older seat."
+            )
     except SeatUnavailable as exc:
         report.add("seat build", False, str(exc))
 
@@ -634,72 +639,154 @@ def wake_agent(
     transport_factory: Callable[[Credential], Transport] = build_transport,
     **kw,
 ) -> str:
-    """Deliver a mention to the running agent, reporting a failure to the sender.
+    """Hand one message to the seat, and decide what happens if it does not land.
 
-    §7b.5: a wake that fails is loud. A sender who is told nothing waits forever
-    on a seat that never woke — and under §7e "no session yet" is normal, so
-    silence is genuinely ambiguous between asleep and broken. Queuing announces
-    itself once and then stays quiet until the next successful delivery, because
-    a sleeping seat repeating itself is noise.
+    **One call, no pre-check.** The contract forbids asking `seat status` and then
+    acting on it (§3): two truths with a gap between them, and the gap is where a
+    message is lost. This client did exactly that until 1.0.
+
+    **The queue is ours and so is the retry** (operator, 2026-09-17). The seat is
+    stateless about delivery — it does not store, retry or queue, and an
+    undelivered message remains ours. So the seat's answer is an *input to a
+    decision* here, not merely a report for a human:
+
+    - delivered / queued  → success, marked, done. `queued` is codex taking it for
+      a thread that is not loaded; it is not a degraded delivery.
+    - no-session / unknown → keep it, retry later, tell the sender once.
+    - failed (exit 10)     → the attempt failed; same treatment.
+    - broken               → a person must look. Not retried: nothing a retry can
+      change, and spinning would bury the reason.
+    - failed (exit 2)      → a usage error, which is OUR defect. Never retried; a
+      malformed call repeated is how a bug becomes a flood.
     """
     settings = load_settings(**kw)
     store = Store(settings.state_dir)
     store.ensure()
+    mid = mention.get("id")
 
-    status = None
     try:
-        status = seat_status_now()
-    except SeatUnavailable as exc:
-        outcome = f"queued: {exc}"
-    else:
-        try:
-            outcome = wake(mention, status, seat_persistence())
-        except WakeError as exc:
-            store.record("warn", f"delivery failed for message {mention.get('id')}: {exc}")
-            _tell_sender(settings, store, mention,
-                         f"could not deliver that to my agent: {exc}", transport_factory)
-            raise
+        result = wake(mention)
+    except WakeError as exc:
+        # The seat could not be invoked at all — a different fault from anything
+        # the seat reports. The message stays ours and stays queued.
+        store.record("warn", f"delivery could not be attempted for {mid}: {exc}")
+        _announce_held(settings, store, mention, str(exc), transport_factory)
+        return f"queued: {exc}"
 
-    queued = outcome.startswith("queued")
-    store.record("info" if not queued else "warn", f"wake: {outcome}")
+    if result.success:
+        store.mark_delivered(mid) if mid is not None else None
+        store.set_sleeping(False)
+        store.record("info", f"wake: {result.summary()}")
+        return result.summary()
 
-    if queued:
-        # **Not deliverable, and the sender is told why in the seat's own words.**
-        # Said once per dormant spell: a seat repeating "still asleep" at every
-        # message is the noise that teaches people to skip the notice.
-        if not store.sleeping():
-            store.set_sleeping(True)
-            reason = status.hold_reason() if status is not None else outcome[len("queued: "):]
-            _tell_sender(
-                settings, store, mention,
-                f"**not deliverable right now** — {reason}\n\n"
-                "Your message is stored on this seat and will be taken up when the seat "
-                "can take it (ADR-0009 §7e: a message never starts an agent). Saying so "
-                "once rather than repeating it while the seat stays this way.",
-                transport_factory,
-            )
-        return outcome
+    store.record("warn", f"wake: {result.summary()}")
 
-    store.set_sleeping(False)
-
-    # **Delivered, but nothing is running to read it.** A pinned codex thread
-    # takes a message whether or not anything is loaded — it waits in codex's
-    # own queue — so this is a successful delivery with a delay the sender
-    # cannot otherwise see. The remedy is theirs, so give it to them.
-    if status is not None and status.waiting and not store.sleeping_waiting():
-        store.set_sleeping_waiting(True)
-        _tell_sender(
+    if result.needs_a_person:
+        # §4: not exactly one session, or no runtime declared. Loud, once, and
+        # never retried — the seat is telling us a person has to intervene.
+        _announce_held(
             settings, store, mention,
-            f"**queued — no {status.runtime} session is running on this seat.** The "
-            "message reached the thread's queue and will be read when the seat next "
-            f"wakes; nothing is lost. To have it read now, the seat needs waking "
-            f"(`seat start {status.runtime}`) — waking is the operator's, not mine "
-            "(ADR-0009 §7e). Saying so once rather than at every message.",
+            f"**this seat is broken and a person must look at it** — {result.message}\n\n"
+            "Your message is stored here and is not lost. It will not be retried "
+            "until the seat is fixed, because no retry can change this state.",
             transport_factory,
         )
-    elif status is not None and not status.waiting:
-        store.set_sleeping_waiting(False)
-    return outcome
+        return result.summary()
+
+    if not result.retryable:
+        # exit 2 — we called the seat wrongly. Ours to fix, and loud about it.
+        store.record("warn", f"NOT retrying {mid}: {result.status} exit {result.exit_code} "
+                             "is a usage error in this client, not a seat fault")
+        _tell_sender(settings, store, mention,
+                     f"could not deliver that to my agent: {result.message}",
+                     transport_factory)
+        return result.summary()
+
+    _announce_held(settings, store, mention, result.message, transport_factory)
+    return result.summary()
+
+
+def _announce_held(
+    settings: Settings,
+    store: Store,
+    mention: dict,
+    reason: str,
+    transport_factory: Callable[[Credential], Transport],
+) -> None:
+    """Tell the sender once that their message is held, not lost.
+
+    **Once per spell, not per message.** A seat repeating "still not deliverable"
+    at every message is the noise that teaches people to skip the notice, and the
+    notice is the thing that stops a sender waiting forever on a seat that never
+    woke (ADR-0009 §7e: a message never starts an agent).
+    """
+    if store.sleeping():
+        return
+    store.set_sleeping(True)
+    _tell_sender(
+        settings, store, mention,
+        f"**not deliverable right now** — {reason}\n\n"
+        "Your message is stored on this seat and will be retried. Saying so once "
+        "rather than repeating it while the seat stays this way.",
+        transport_factory,
+    )
+
+
+def retry_undelivered(
+    transport_factory: Callable[[Credential], Transport] = build_transport,
+    limit: int = 20,
+    **kw,
+) -> int:
+    """Try the queue again. Returns how many landed this pass.
+
+    This is the other half of owning the queue: without it, "stored and will be
+    retried" would be a claim nothing honoured, which is the shape this estate has
+    spent a fortnight removing.
+
+    **Oldest first, and it stops at the first still-undeliverable message.** A
+    conversation delivered out of order is worse than one delivered late, and if
+    the seat cannot take one it will not take the next either — walking the whole
+    queue to collect identical refusals is noise and load for nothing.
+    """
+    settings = load_settings(**kw)
+    store = Store(settings.state_dir)
+    pending = [m for m in store.undelivered() if m.authorised][:limit]
+    if not pending:
+        return 0
+
+    landed = 0
+    for mention in pending:
+        try:
+            result = wake(asdict(mention))
+        except WakeError:
+            break  # the seat is not reachable at all; nothing else will land either
+        attempts = store.record_attempt(mention.id)
+        if not result.success:
+            if not result.retryable:
+                # broken, or our own usage error. Leave it stored and stop: both
+                # need attention rather than another attempt.
+                store.record("warn", f"retry: giving up on {mention.id} — "
+                                     f"{result.summary()} is not retryable")
+                break
+            if attempts >= MAX_DELIVERY_ATTEMPTS:
+                # Retryable by status, but not in fact. Say so once, loudly, and
+                # leave it stored — a person can see it in `comms inbox`, and the
+                # queue behind it stops being held hostage.
+                store.record(
+                    "warn",
+                    f"retry: message {mention.id} has failed {attempts} times and is "
+                    f"no longer being retried — {result.summary()}. It is still "
+                    "stored and visible in `comms inbox`.",
+                )
+                store.mark_delivered(mention.id)  # out of the queue, not lost
+            break
+        store.mark_delivered(mention.id)
+        landed += 1
+
+    if landed:
+        store.set_sleeping(False)
+        store.record("info", f"retry: delivered {landed} held message(s)")
+    return landed
 
 
 def _refuse_sender(
@@ -1226,6 +1313,14 @@ def run_daemon(
         # ticks. Both look exactly like a quiet channel.
         if time.monotonic() - last_backstop >= BACKSTOP_SECS:
             last_backstop = time.monotonic()
+            # The queue is ours, so something has to work it. Without this,
+            # "stored and will be retried" is a claim nothing honours — the shape
+            # this estate has spent a fortnight removing. Same timer as the
+            # backstop: both ask "what did the fast path miss?".
+            try:
+                retry_undelivered(transport_factory=transport_factory, **kw)
+            except CommsError as exc:
+                store.record("warn", f"retry pass failed: {exc}")
             before = store.last_message_id()
             found = _catch_up(hub, store, handle_event, "backstop")
             if found:
@@ -1260,6 +1355,16 @@ def run_daemon(
 #: and that is the number worth spending an API call on. Twelve calls an hour
 #: against a hub this seat already long-polls continuously is not a cost.
 BACKSTOP_SECS = 300
+
+#: How many times a held message is retried before this client stops and says so.
+#:
+#: Bounded because "retryable" is a judgement about a STATUS, not a guarantee the
+#: cause is temporary. Measured against a real seat 1.0.2: an oversized body
+#: answers `failed` at exit 10 — retryable by the status table, and identical
+#: every time. Unbounded retry would spin on it forever and bury the queue behind
+#: it. Six attempts across the retry cadence is long enough for a seat to be
+#: restarted and short enough that a permanent failure surfaces the same day.
+MAX_DELIVERY_ATTEMPTS = 6
 
 #: A message must be this old before its absence from the queue is evidence the
 #: queue is broken. Without it, a message arriving between the doorbell firing

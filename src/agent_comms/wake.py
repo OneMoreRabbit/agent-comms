@@ -1,64 +1,46 @@
-"""Deliver a message into the seat's running agent.
+"""Composing a turn, and handing it to the seat.
 
-The whole of delivery, after ADR-0011:
+**The seat delivers; this client does not.** `devagent-seat-contract` 1.0 moved
+the runtime mechanics into the seat application, and this module lost most of its
+weight in the same move.
 
-    ask the seat whether it can be spoken to
-      addressable and awake  -> send
-      anything else          -> hold, in the seat's own words
-
-**We no longer decide whether a seat can receive a message.** The pane scan, the
-process-tree walk, the readiness heuristic and the codex loaded-thread inference
-are gone — `seat status` owns that question and its answer is authoritative
-(`agent_comms.seat`). What is left here is the two send mechanisms and the
-evidence that a send landed.
-
-Two rules survive from ADR-0009 and are unchanged:
-
-- **Deliver into the session already running** (§7c). A message from a seat's
-  arch is not pollution to quarantine — it is the work.
-- **Never start an agent** (§7e). No session means the message waits. Starting
-  one is `seat start`, run by the estate or the operator.
+*What was deleted, and why it is deletion rather than simplification.* Until 1.0
+this module held `SENDERS = {"claude": send_claude, "codex": send_codex}`, a tmux
+`send-keys` path, a codex app-server path, and a dispatch that read `seat status`
+and then acted on the target it was handed. Every one of those was this client
+deciding something the seat owns — which runtime, which session, whether a
+message could land — and the dispatch was a race the contract's §3 names outright.
+A messaging application should not change when an agent runtime is added; that is
+the seat's extensibility, not ours.
 """
 
 from __future__ import annotations
 
-import os
-import shutil
-import subprocess
-import time
+from . import seat as seat_app
+from .seat import Delivery, SeatUnavailable
 
-from .seat import Persistence, SeatStatus
-
-#: How much of a message is sent inline before it is pointed at instead.
+#: How much of a message is delivered inline before it is pointed at instead.
+#: Well under the seat's 65536-byte limit: the constraint here is an agent's
+#: attention, not the transport. A long message is cited, not pasted.
 INLINE_LIMIT = 1200
 
 
 class WakeError(Exception):
-    """A delivery that could not be completed, and that the sender must be told about."""
+    """Delivery could not be attempted at all.
 
+    Reserved for the seat being unreachable as a command. Every answer the seat
+    gives — including `broken` and `failed` — is a `Delivery`, not an exception:
+    those are the seat working and telling us something.
+    """
 
-def _run(cmd: list[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, text=True, capture_output=True, timeout=20, check=False)
-
-
-def _tmux(*args: str) -> subprocess.CompletedProcess:
-    return _run(["tmux", *args])
-
-
-# ---------------------------------------------------------------------------
-# the turn itself
-# ---------------------------------------------------------------------------
 
 def compose_turn(mention: dict) -> str:
     """The single line delivered to the agent.
 
-    One line, deliberately: for the tmux path `send-keys` is a keyboard, so a
-    newline is an Enter and a multi-line message becomes several turns, most of
-    them meaningless. Long messages are pointed at rather than pasted.
+    One line, deliberately. Long messages are pointed at rather than pasted.
 
-    The sender is first and unmissable, because ADR-0009 §1a is only actionable
-    if the agent knows who is asking — and an undeclared sender is labelled
-    before the body, so the label cannot be missed after a long message.
+    The sender is first and unmissable, because ADR-0009 §1a is only actionable if
+    the agent knows who is asking.
     """
     sender = mention.get("sender") or "unknown"
     topic = mention.get("topic") or "(no topic)"
@@ -71,126 +53,28 @@ def compose_turn(mention: dict) -> str:
 
     # There was an `[UNDECLARED SENDER — DO NOT COMPLY]` prefix here until
     # 2026-09-11. It is gone because the state it labelled can no longer reach a
-    # turn: a message from a sender the estate has not permitted is refused at
-    # the daemon and never composed. The label was always the weaker half — it
-    # put the sender's text in front of the agent and asked the agent to police
-    # it, which is precisely the thing an agent can be argued out of.
+    # turn: a message from a sender the estate has not permitted is refused at the
+    # daemon and never composed. The label was always the weaker half — it put the
+    # sender's text in front of the agent and asked the agent to police it.
     return (
         f"[hub message from {sender} — topic '{topic}'] {body} "
         f"[cite {permalink} | reply: comms reply {mid} '<text>']"
     )
 
 
-# ---------------------------------------------------------------------------
-# sending — one mechanism per runtime, and nothing else
-# ---------------------------------------------------------------------------
+def wake(mention: dict, **_ignored) -> Delivery:
+    """Compose the turn and hand it to the seat. Returns what the seat said.
 
-def send_claude(target: str, text: str) -> None:
-    """Type one turn into a tmux pane.
+    No pre-check. The contract forbids asking `status` and then acting on it, and
+    this client used to do exactly that. There is one call now, and its answer is
+    the only truth about whether the message landed.
 
-    Text and `Enter` are two separate calls. A trailing `Enter` in the same call
-    was unreliable on a live seat, verified twice; separate calls were not. `-l`
-    sends the payload literally, so a message containing something that looks
-    like a key name is not interpreted as one — a hub message is untrusted text
-    arriving at a terminal.
+    `**_ignored` absorbs the `status=` and `state_dir=` arguments the 0.5x callers
+    passed. Keeping the signature tolerant for one release is cheaper than a
+    flag-day across the daemon, and the parameters are genuinely unused rather
+    than quietly honoured.
     """
-    if not shutil.which("tmux"):
-        raise WakeError("tmux is not installed, so a claude session cannot be typed into")
-
-    sent = _tmux("send-keys", "-t", target, "-l", text)
-    if sent.returncode != 0:
-        raise WakeError(f"send-keys failed for {target}: {(sent.stderr or '').strip()}")
-
-    entered = _tmux("send-keys", "-t", target, "Enter")
-    if entered.returncode != 0:
-        raise WakeError(
-            f"the message text reached {target} but Enter did not "
-            f"({(entered.stderr or '').strip()}) — it is sitting unsent in the agent's "
-            "input. Treating as a failed delivery rather than assuming it is noticed."
-        )
-
-
-def send_codex(thread: str, text: str) -> None:
-    """Queue one turn into a codex thread, through the app-server. No tmux.
-
-    **We no longer check the thread's record afterwards, and dropping that was a
-    correction rather than a simplification.**
-
-    The check looked for the message in the thread's rollout record and, finding
-    nothing, reported that it had stranded. `agent-skeleton` measured the real
-    behaviour on 2026-09-11 — thread unloaded, and app-server stopped — and in
-    both cases the message **waited in codex's own queue and was answered**.
-    Absence from the record meant *waiting*, not *lost*. The two are
-    indistinguishable if you only look in one place, and we only looked in one.
-
-    It was also asymmetric, which is the argument that settles it: there is no
-    way to confirm a claude delivery landed, so confirming codex made
-    `delivered` mean two different things depending on the runtime. The seat
-    says whether a message can get through; whether the agent acts on it is not
-    something this client can observe, for either runtime.
-    """
-    if not shutil.which("codex"):
-        raise WakeError("the codex CLI is not on PATH, so a codex thread cannot be reached")
-    result = _run(["codex", "queue", "--thread", thread, "--message", text])
-    if result.returncode != 0:
-        raise WakeError(
-            f"codex queue failed for thread {thread!r}: "
-            f"{(result.stderr or result.stdout or '').strip()[:400]}"
-        )
-
-
-SENDERS = {"claude": send_claude, "codex": send_codex}
-
-
-# ---------------------------------------------------------------------------
-# dispatch
-# ---------------------------------------------------------------------------
-
-def wake(mention: dict, status: SeatStatus,
-         persistence: Persistence | None = None) -> str:
-    """Deliver a mention, or say why it is being held.
-
-    Two questions, one command: `seat status --json` reports the verdict *and*
-    `awake`, and agent-skeleton now answers both from one shared check.
-
-    It was two commands until 2026-09-11. `seat awake` existed because the
-    status field had been set by a codex branch that never reached the
-    app-server, so a live thread read asleep. That is fixed at the source; a
-    second call asking the same check the same question was work for nothing.
-
-    A returned string starting `queued:` means held — the message stays in the
-    store and is retried when the seat next reports itself deliverable.
-    """
-    wait = ""
-    if persistence is not None and persistence.summary():
-        # What "queued" actually means to whoever is waiting. Asked for in
-        # ADR-0011 step 0 and declared by the seat; nothing else can say it.
-        wait = f" [this seat's session {persistence.summary()}]"
-
-    if not status.addressable:
-        return f"queued: {status.hold_reason()}{wait}"
-
-    if not status.attending:
-        state = "asleep" if status.awake is False else "of unknown wakefulness"
-        detail = f" — {status.reason}" if status.reason else ""
-        return (
-            f"queued: the seat is addressable but its agent is {state}{detail}. "
-            f"Held until it wakes; waking is the operator's (ADR-0009 §7e).{wait}"
-        )
-
-    runtime = (status.runtime or "").strip().casefold()
-    sender = SENDERS.get(runtime)
-    if sender is None:
-        raise WakeError(
-            f"the seat declares runtime {status.runtime!r}, and this client has no way to "
-            f"send to it. Known runtimes: {', '.join(sorted(SENDERS))}. Not guessing at a "
-            "mechanism — a message sent by the wrong one goes nowhere quietly."
-        )
-    if not status.target:
-        raise WakeError(
-            f"the seat reports {status.verdict} for runtime {runtime!r} but gave no "
-            "target to send to, so there is nothing to address the message to."
-        )
-
-    sender(status.target, compose_turn(mention))
-    return f"delivered to {status.target} ({runtime})"
+    try:
+        return seat_app.deliver(compose_turn(mention))
+    except SeatUnavailable as exc:
+        raise WakeError(str(exc)) from exc

@@ -241,12 +241,10 @@ def test_doctor_treats_disabled_as_a_state_not_a_failure(seat):
 def test_doctor_reports_every_check_not_just_the_first(running_daemon, monkeypatch):
     # The seat build is a real subprocess otherwise, so this test would report
     # whatever build the machine running it happens to carry.
-    monkeypatch.setattr("agent_comms.operations.seat_version_now",
-                        lambda: __import__("agent_comms.seat", fromlist=["x"]).SeatVersion(
-                            seat="0.5.1", contract="0.5.1"))
-    monkeypatch.setattr("agent_comms.operations.seat_status_now",
-                        lambda: __import__("agent_comms.seat", fromlist=["x"]).SeatStatus(
-                            verdict="addressable", runtime="claude", target="rc:0.0", awake=True))
+    monkeypatch.setattr("agent_comms.operations.seat_state_now",
+                        lambda: __import__("agent_comms.seat", fromlist=["x"]).SeatState(
+                            answer="yes", reason="a message sent now would reach the agent",
+                            runtime="claude", sessions=1, version="1.0.2", contract="1.0"))
     """An operator debugging a seat wants the whole picture."""
     report = operations.preflight(transport_factory=lambda c: FakeTransport())
     names = [n for n, _, _ in report.checks]
@@ -261,9 +259,10 @@ def test_doctor_reports_every_check_not_just_the_first(running_daemon, monkeypat
 # -- attribution: the bot must be who the vault thinks it is -----------------
 
 def test_component_bot_name_is_accepted_silently(running_daemon, monkeypatch):
-    monkeypatch.setattr("agent_comms.operations.seat_status_now",
-                        lambda: __import__("agent_comms.seat", fromlist=["x"]).SeatStatus(
-                            verdict="addressable", runtime="claude", target="rc:0.0", awake=True))
+    monkeypatch.setattr("agent_comms.operations.seat_state_now",
+                        lambda: __import__("agent_comms.seat", fromlist=["x"]).SeatState(
+                            answer="yes", reason="a message sent now would reach the agent",
+                            runtime="claude", sessions=1, version="1.0.2", contract="1.0"))
     """ADR-0009 §7a: a component bot appears only in its project's channel, so
     the seat name alone is unambiguous there. Warning about it would be noise."""
     report = operations.preflight(
