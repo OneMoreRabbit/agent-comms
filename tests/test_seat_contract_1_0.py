@@ -22,9 +22,19 @@ from agent_comms.seat import Delivery, SeatUnavailable
 from agent_comms.wake import WakeError, compose_turn, wake
 
 
-def fake_seat(monkeypatch, payload: dict, code: int = 0, stderr: bytes = b"", capture=None):
-    """Stand in for the `seat` command, recording how it was called."""
+def fake_seat(monkeypatch, payload: dict, code: int = 0, stderr: bytes = b"",
+              capture=None, contract: str = "1.0"):
+    """Stand in for the `seat` command, recording how it was called.
+
+    Answers `seat --version --json` too, because delivery gates on the contract
+    major before it sends anything — a pre-1.0 seat has no `seat msg` at all.
+    """
+    seat_app._contract_checked = None
+
     def run(cmd, input=None, capture_output=True, timeout=None):
+        if "--version" in cmd:
+            return subprocess.CompletedProcess(
+                cmd, 0, json.dumps({"seat": "1.0.2", "contract": contract}).encode(), b"")
         if capture is not None:
             capture["cmd"] = cmd
             capture["input"] = input
@@ -53,6 +63,8 @@ def test_delivery_never_pre_checks_with_status(monkeypatch):
     """Contract §3: two truths that can disagree in the gap between them, and the
     gap is where a message is lost. This client asked status-then-acted until 1.0."""
     calls = []
+
+    seat_app._contract_checked = "1.0"  # already established; not the subject here
 
     def run(cmd, input=None, capture_output=True, timeout=None):
         calls.append(cmd)
@@ -125,6 +137,7 @@ def test_an_oversized_body_fails_and_is_never_truncated(monkeypatch):
     """65536 bytes. A shortened message reporting success is worse than one that
     did not arrive."""
     called = {"n": 0}
+    seat_app._contract_checked = "1.0"
 
     def run(cmd, **kw):
         called["n"] += 1
@@ -140,6 +153,8 @@ def test_an_oversized_body_fails_and_is_never_truncated(monkeypatch):
 def test_unreadable_output_is_reported_as_a_seat_defect(monkeypatch):
     """The contract promises valid JSON on every path. If it is not, say so rather
     than inventing a verdict."""
+    seat_app._contract_checked = "1.0"
+
     def run(cmd, input=None, capture_output=True, timeout=None):
         return subprocess.CompletedProcess(cmd, 10, b"not json at all", b"boom")
     monkeypatch.setattr(seat_app.subprocess, "run", run)
@@ -151,6 +166,8 @@ def test_unreadable_output_is_reported_as_a_seat_defect(monkeypatch):
 def test_a_missing_seat_command_is_not_a_delivery_answer(monkeypatch):
     """A seat that answers `broken` is working. A seat we cannot invoke is a
     different fault with a different remedy, so it is an exception, not a status."""
+    seat_app._contract_checked = None
+
     def run(cmd, **kw):
         raise FileNotFoundError("seat")
     monkeypatch.setattr(seat_app.subprocess, "run", run)
@@ -231,6 +248,8 @@ def test_a_broken_seat_is_not_hammered(seat, monkeypatch):
                          content="x", timestamp=1, permalink="", reason="mentioned"))
     calls = {"n": 0}
 
+    seat_app._contract_checked = "1.0"
+
     def run(cmd, input=None, capture_output=True, timeout=None):
         calls["n"] += 1
         return subprocess.CompletedProcess(
@@ -262,3 +281,45 @@ def test_a_permanently_failing_message_stops_being_retried(seat, monkeypatch):
     events = (seat / ".comms" / "events.log").read_text()
     assert "no longer being retried" in events
     assert "still" in events and "comms inbox" in events, "and it must say where it went"
+
+
+def test_a_pre_1_0_seat_is_refused_loudly(monkeypatch):
+    """Ruled 2026-09-17: comms 1.x hard-requires contract 1.0 and fails loudly
+    rather than carrying both paths.
+
+    Measured the same day on a real 0.5.1 seat, and the reason it must be loud:
+    `seat msg` there prints the seat's own help and EXITS 0. Nothing in the shell
+    says anything went wrong. Without this check the only symptom is unparseable
+    output, which this client would report as a seat defect — blaming the wrong
+    component for an upgrade-ordering mistake."""
+    from agent_comms.seat import SeatTooOld
+
+    seat_app._contract_checked = None
+    monkeypatch.setattr(seat_app.subprocess, "run", lambda cmd, **kw:
+                        subprocess.CompletedProcess(
+                            cmd, 0, json.dumps({"seat": "0.5.1", "contract": "0.5.1"}).encode(), b""))
+
+    with pytest.raises(SeatTooOld) as caught:
+        seat_app.deliver("body")
+    assert "0.5.1" in str(caught.value) and "1.x" in str(caught.value)
+    assert "exiting 0" in str(caught.value), "say why silence is not evidence of success"
+
+
+def test_the_contract_is_checked_once_not_per_message(monkeypatch):
+    """A seat's build does not change under a running daemon. Re-asking per
+    message would add a subprocess to the hot path to re-learn a constant."""
+    calls = []
+    seat_app._contract_checked = None
+
+    def run(cmd, input=None, capture_output=True, timeout=None):
+        calls.append(cmd[1] if len(cmd) > 1 else cmd[0])
+        if "--version" in cmd:
+            return subprocess.CompletedProcess(
+                cmd, 0, json.dumps({"seat": "1.0.2", "contract": "1.0"}).encode(), b"")
+        return subprocess.CompletedProcess(
+            cmd, 0, json.dumps({"success": True, "status": "delivered"}).encode(), b"")
+
+    monkeypatch.setattr(seat_app.subprocess, "run", run)
+    for _ in range(3):
+        seat_app.deliver("body")
+    assert calls.count("--version") == 1, f"asked {calls.count('--version')} times"

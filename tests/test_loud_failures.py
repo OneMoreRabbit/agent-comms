@@ -959,3 +959,30 @@ def test_the_backstop_does_not_cry_wolf_on_a_timing_race(seat, monkeypatch):
     events = (seat / ".comms" / "events.log").read_text()
     assert 1001 in {m.id for m in store.all()}, "it should still be recovered"
     assert "is not delivering" not in events, "a fresh message is a race, not a fault"
+
+
+def test_a_losing_daemon_does_not_erase_the_winners_pid(seat):
+    """Measured on this seat 2026-09-17: a second daemon started by the estate's
+    install left a 0-byte lock. `status` then said "pid None" and
+    `comms daemon --stop` could not signal what it could not name.
+
+    Cause: the lock was opened with "w", which truncates BEFORE the flock is
+    attempted — so the contender that loses destroys the winner's identity on its
+    way out. Take the lock first; write only once it is ours."""
+    from agent_comms.errors import DaemonAlreadyRunning
+    from agent_comms.store import Store
+
+    store = Store(seat / ".comms")
+    held = store.acquire_daemon_lock()
+    try:
+        recorded = (seat / ".comms" / "daemon.lock").read_text().strip()
+        assert recorded, "the holder must record its pid"
+
+        with pytest.raises(DaemonAlreadyRunning):
+            store.acquire_daemon_lock()
+
+        after = (seat / ".comms" / "daemon.lock").read_text().strip()
+        assert after == recorded, "a refused contender must not erase the holder's pid"
+        assert store.daemon_state().pid == int(recorded)
+    finally:
+        held.close()

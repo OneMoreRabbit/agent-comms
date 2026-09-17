@@ -48,6 +48,26 @@ MAX_BODY_BYTES = 65536
 RETRYABLE = frozenset({NO_SESSION, UNKNOWN})
 
 
+#: The contract major this client is built against. comms 1.x speaks `seat msg`
+#: and nothing else; a pre-1.0 seat has no such command.
+REQUIRED_CONTRACT_MAJOR = "1"
+
+
+class SeatTooOld(Exception):
+    """This seat implements a contract older than this client can speak.
+
+    **Ruled 2026-09-17**: comms 1.0.0 hard-requires contract 1.0 and fails loudly
+    rather than carrying both paths, with the seat-then-comms upgrade ordering
+    living in the deployer's runbook where it can be checked.
+
+    Measured the same day, and the reason it must be loud: a 0.5.1 seat given
+    `seat msg` prints its own help and **exits 0**. Nothing in the shell says a
+    thing went wrong, and without this check the only symptom is unparseable
+    output — which this client would otherwise report as a *seat defect*, blaming
+    the wrong component for an ordering mistake.
+    """
+
+
 class SeatUnavailable(Exception):
     """The `seat` command could not be run at all — absent, or it would not answer.
 
@@ -97,6 +117,57 @@ class Delivery:
         return f"{self.status}: {self.message}{seat}" if self.message else f"{self.status}{seat}"
 
 
+_contract_checked: str | None = None
+
+
+def require_contract(timeout: int = 20) -> str:
+    """Refuse to deliver through a seat older than contract 1.0. Returns its version.
+
+    Asked once per process: the seat build does not change under a running daemon,
+    and re-asking on every message would add a subprocess to the hot path to
+    re-learn a constant.
+    """
+    global _contract_checked
+    if _contract_checked is not None:
+        return _contract_checked
+
+    try:
+        result = subprocess.run(
+            ["seat", "--version", "--json"], capture_output=True, timeout=timeout
+        )
+    except FileNotFoundError as exc:
+        raise SeatUnavailable(
+            "the `seat` command is not on this seat, so nothing can be delivered."
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise SeatUnavailable(f"`seat --version` did not answer within {timeout}s") from exc
+
+    raw = (result.stdout or b"").decode("utf-8", "replace").strip()
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        payload = {}
+    contract = str(payload.get("contract") or "") if isinstance(payload, dict) else ""
+
+    if not contract.split(".")[0] == REQUIRED_CONTRACT_MAJOR:
+        raise SeatTooOld(
+            f"this seat implements devagent-seat-contract {contract or 'an unreadable version'}, "
+            f"and agent-comms {_client_version()} requires {REQUIRED_CONTRACT_MAJOR}.x. "
+            "It has no `seat msg`, so nothing can be delivered here. Upgrade the seat "
+            "application first — seat-then-comms is the deployer's ordering — and note "
+            "that a pre-1.0 seat answers `seat msg` by printing its help and exiting 0, "
+            "so this check is the only thing that catches it."
+        )
+
+    _contract_checked = contract
+    return contract
+
+
+def _client_version() -> str:
+    from . import __version__
+    return __version__
+
+
 def deliver(body: str, timeout: int = 30) -> Delivery:
     """Hand one message to the seat. The only way this client delivers anything.
 
@@ -110,6 +181,8 @@ def deliver(body: str, timeout: int = 30) -> Delivery:
     every failure the seat reports — comes back as a `Delivery`, because those are
     answers, not breakages.
     """
+    require_contract()
+
     encoded = body.encode("utf-8")
     if len(encoded) > MAX_BODY_BYTES:
         # Checked here so the caller gets a Delivery rather than an exception, and

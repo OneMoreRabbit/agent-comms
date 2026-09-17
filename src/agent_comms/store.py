@@ -175,7 +175,14 @@ class Store:
 
         self.ensure()
         lock_path = self.root / "daemon.lock"
-        handle = lock_path.open("w", encoding="utf-8")
+        # **Open without truncating.** `open("w")` truncates before the flock is
+        # attempted, so a LOSING contender destroys the WINNER's pid on its way
+        # out — the running daemon keeps the lock and loses its own identity.
+        # Measured on this seat 2026-09-17: a second daemon started by the estate's
+        # install left a 0-byte lock, `status` reported "pid None", and
+        # `daemon --stop` could not signal what it could not name. Take the lock
+        # first; truncate and write only once it is ours.
+        handle = lock_path.open("a+", encoding="utf-8")
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
@@ -185,6 +192,8 @@ class Store:
                 "means two event queues, so every mention would be stored and handed to "
                 "notify_command twice. Replace it in one step: comms daemon --restart"
             ) from None
+        handle.seek(0)
+        handle.truncate()
         handle.write(str(os.getpid()))
         handle.flush()
         return handle
