@@ -323,3 +323,36 @@ def test_the_contract_is_checked_once_not_per_message(monkeypatch):
     for _ in range(3):
         seat_app.deliver("body")
     assert calls.count("--version") == 1, f"asked {calls.count('--version')} times"
+
+
+def test_the_suite_can_never_reach_a_real_binary(seat):
+    """Containment, asserted rather than assumed — this has now drifted twice.
+
+    2026-09-13: the suite's notify_command was the real `comms wake`, and six
+    fixture mentions were typed into the running agent session. Shimmed `comms`.
+
+    2026-09-21: 1.0.0 moved delivery from notify_command to `seat msg`, and the
+    shim did not follow. Any test reaching seat.deliver() typed its fixture into
+    the live session again — found by tracing subprocess.run and seeing
+    ['seat','msg','--json'] leave the suite. The trigger was my own wiring:
+    retry_undelivered runs on the daemon's backstop timer, so a test that fires
+    the backstop delivers for real.
+
+    Both times the containment was correct for the delivery path that existed
+    when it was written, and silently wrong after the path moved. So assert the
+    property — no real binary is reachable — rather than the mechanism.
+    """
+    import shutil
+    import subprocess as sp
+
+    for binary in ("comms", "seat"):
+        resolved = shutil.which(binary)
+        assert resolved is not None, f"{binary} should resolve to the shim, not be absent"
+        assert ".test-bin" in resolved, (
+            f"{binary} resolves to {resolved}, which is a REAL binary. A test that "
+            "shells out to it reaches the live seat and types fixtures into a "
+            "running agent session."
+        )
+        out = sp.run([binary, "msg"], capture_output=True)
+        assert out.returncode == 127, f"{binary} shim must refuse, got {out.returncode}"
+        assert b"test shim refused" in out.stderr
