@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import time
 
 import pytest
 
@@ -30,14 +31,23 @@ def fake_seat(monkeypatch, payload: dict, code: int = 0, stderr: bytes = b"",
     major before it sends anything — a pre-1.0 seat has no `seat msg` at all.
     """
     seat_app._contract_checked = None
+    real_run = subprocess.run
 
-    def run(cmd, input=None, capture_output=True, timeout=None):
+    def run(cmd, *a, **kw):
+        # **Only `seat` is faked.** `seat_app.subprocess` and
+        # `operations.subprocess` are the SAME module object, so patching the
+        # attribute replaces subprocess.run for the whole process — including
+        # notify_command, which is how the retired-message summary is delivered.
+        # A fake that swallows every subprocess makes unrelated behaviour silently
+        # untestable, and it cost an hour before it was spotted.
+        if not (isinstance(cmd, (list, tuple)) and cmd and cmd[0] == "seat"):
+            return real_run(cmd, *a, **kw)
         if "--version" in cmd:
             return subprocess.CompletedProcess(
                 cmd, 0, json.dumps({"seat": "1.0.2", "contract": contract}).encode(), b"")
         if capture is not None:
             capture["cmd"] = cmd
-            capture["input"] = input
+            capture["input"] = kw.get("input") if "input" in kw else (a[0] if a else None)
         out = json.dumps(payload).encode() if payload is not None else b""
         return subprocess.CompletedProcess(cmd, code, out, stderr)
     monkeypatch.setattr(seat_app.subprocess, "run", run)
@@ -201,7 +211,8 @@ def test_a_held_message_stays_queued_and_is_retried(seat, monkeypatch):
     transport = FakeTransport(event_batches=[{"result": "success", "events": [
         {"id": 1, "type": "message", "flags": ["mentioned"], "message": {
             "id": 500, "sender_full_name": "agent-eco-arch", "display_recipient": "agent-eco",
-            "subject": "agent-comms: q", "content": "?", "timestamp": 1, "stream_id": 7}},
+            "subject": "agent-comms: q", "content": "?",
+            "timestamp": int(time.time()), "stream_id": 7}},
     ]}])
 
     # First the seat has nothing running, so it holds.
@@ -229,7 +240,8 @@ def test_retry_stops_at_the_first_message_that_will_not_land(seat, monkeypatch):
     store = Store(seat / ".comms")
     for mid in (10, 11, 12):
         store.append(Mention(id=mid, sender="agent-eco-arch", channel="agent-eco",
-                             topic="t", content="x", timestamp=1, permalink="",
+                             topic="t", content="x", timestamp=int(time.time()),
+                             permalink="",
                              reason="mentioned"))
     fake_seat(monkeypatch, {"success": False, "status": "no-session", "message": "none"},
               code=10)
@@ -245,7 +257,7 @@ def test_a_broken_seat_is_not_hammered(seat, monkeypatch):
 
     store = Store(seat / ".comms")
     store.append(Mention(id=20, sender="agent-eco-arch", channel="agent-eco", topic="t",
-                         content="x", timestamp=1, permalink="", reason="mentioned"))
+                         content="x", timestamp=int(time.time()), permalink="", reason="mentioned"))
     calls = {"n": 0}
 
     seat_app._contract_checked = "1.0"
@@ -270,7 +282,7 @@ def test_a_permanently_failing_message_stops_being_retried(seat, monkeypatch):
 
     store = Store(seat / ".comms")
     store.append(Mention(id=30, sender="agent-eco-arch", channel="agent-eco", topic="t",
-                         content="x", timestamp=1, permalink="", reason="mentioned"))
+                         content="x", timestamp=int(time.time()), permalink="", reason="mentioned"))
     fake_seat(monkeypatch, {"success": False, "status": "failed",
                             "message": "body is 70000 bytes; the limit is 65536"}, code=10)
 
@@ -356,3 +368,90 @@ def test_the_suite_can_never_reach_a_real_binary(seat):
         out = sp.run([binary, "msg"], capture_output=True)
         assert out.returncode == 127, f"{binary} shim must refuse, got {out.returncode}"
         assert b"test shim refused" in out.stderr
+
+
+# -- the 72h staleness bound (1.1.0) -----------------------------------------
+
+def _aged(store, mid, days, sender="agent-eco-arch"):
+    import time as _t
+    from agent_comms.store import Mention
+    store.append(Mention(id=mid, sender=sender, channel="agent-eco", topic="t",
+                         content="x", timestamp=int(_t.time() - days * 86400),
+                         permalink="", reason="mentioned"))
+
+
+def test_a_message_past_the_bound_is_never_delivered_as_a_turn(seat, monkeypatch):
+    """The incident this exists for: on 2026-09-21 twenty messages aged 10-17 days
+    arrived as live turns, including a finding AND its retraction, and three
+    revisions of one ADR. An agent obeying in order acts on two withdrawn
+    positions before reaching the live one."""
+    from agent_comms import operations
+    from agent_comms.store import Store
+
+    store = Store(seat / ".comms")
+    _aged(store, 900, days=17)
+    _aged(store, 901, days=10)
+    fake_seat(monkeypatch, {"success": True, "status": "delivered"}, code=0)
+
+    operations.retry_undelivered()
+
+    assert store.undelivered() == [], "stale messages must leave the delivery queue"
+    assert {m.id for m in store.all()} == {900, 901}, "and must NOT be discarded"
+    events = (seat / ".comms" / "events.log").read_text()
+    assert "past the 72h staleness bound" in events
+    assert "comms inbox" in events
+
+
+def test_a_message_inside_the_bound_still_delivers(seat, monkeypatch):
+    """The bound must not swallow live traffic — §9's other half."""
+    from agent_comms import operations
+    from agent_comms.store import Store
+
+    store = Store(seat / ".comms")
+    _aged(store, 910, days=1)
+    fake_seat(monkeypatch, {"success": True, "status": "delivered"}, code=0)
+    assert operations.retry_undelivered() == 1
+    assert store.undelivered() == []
+
+
+def test_stale_messages_are_retired_before_any_delivery_attempt(seat, monkeypatch):
+    """A stale message would very likely deliver — that IS the danger, because it
+    arrives looking current. Retire before attempting, so it cannot reach a
+    session even once."""
+    from agent_comms import operations
+    from agent_comms.store import Store
+
+    store = Store(seat / ".comms")
+    _aged(store, 920, days=17)
+    calls = []
+    seat_app._contract_checked = "1.0"
+
+    def run(cmd, input=None, capture_output=True, timeout=None, **kw):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(
+            cmd, 0, json.dumps({"success": True, "status": "delivered"}).encode(), b"")
+
+    monkeypatch.setattr(seat_app.subprocess, "run", run)
+    operations.retry_undelivered()
+    assert not any("msg" in str(c) for c in calls), f"attempted delivery: {calls}"
+
+
+def test_one_summary_turn_not_n_replays(seat, monkeypatch):
+    """§7e's intent kept — the seat still LEARNS of them — without N stale
+    instructions arriving as live ones."""
+    from agent_comms import operations
+    from agent_comms.store import Store
+
+    store = Store(seat / ".comms")
+    for i, d in enumerate((17, 12, 5, 4)):
+        _aged(store, 930 + i, days=d)
+    fake_seat(monkeypatch, {"success": True, "status": "delivered"}, code=0)
+    operations.retry_undelivered()
+
+    notified = (seat / ".comms" / "notified.jsonl")
+    body = notified.read_text() if notified.exists() else ""
+    assert body.count("[comms]") == 1, "exactly one summary turn"
+    assert "4 message(s)" in body and "17" in body
+    assert "NOT instructions" in body and "superseded" in body, \
+        "the summary must warn that later messages may have superseded these"
+    assert "comms inbox" in body
