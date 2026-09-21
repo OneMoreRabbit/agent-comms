@@ -732,6 +732,67 @@ def _announce_held(
     )
 
 
+def _retire_stale(settings: Settings, store: Store, held: list, **kw) -> int:
+    """Take messages past the bound out of the delivery queue. Returns how many.
+
+    They stay in the store and stay readable in `comms inbox` — retired from
+    *delivery*, not discarded. ADR-0009 §7e's intent is that a seat waking later
+    still learns of what arrived, and it does: one summary turn, below.
+    """
+    now = time.time()
+    stale = [m for m in held if (now - m.timestamp) > STALENESS_BOUND_SECS]
+    if not stale:
+        return 0
+
+    for mention in stale:
+        store.mark_delivered(mention.id)
+
+    oldest = max((now - m.timestamp) for m in stale) / 86400
+    senders = sorted({m.sender for m in stale})
+    store.record(
+        "warn",
+        f"retired {len(stale)} held message(s) past the {STALENESS_BOUND_SECS // 3600}h "
+        f"staleness bound — oldest {oldest:.1f} days. Not delivered as turns; still "
+        "readable in `comms inbox`.",
+    )
+    _summarise_retired(settings, store, stale, oldest, senders, **kw)
+    return len(stale)
+
+
+def _summarise_retired(settings, store, stale, oldest, senders, **kw) -> None:
+    """One turn saying what was held — never N turns replaying it.
+
+    **The floor, and deliberately not more.** A count and an age range do not say
+    which of them superseded which, and the realistic backlog is a conversation
+    whose later messages invalidate its earlier ones — a finding and its
+    retraction, an instruction and its three revisions. So the summary says
+    plainly that they may contradict each other and that the store, not this
+    line, is the record. Telling the agent *less* than it needs, loudly, beats
+    replaying them and letting it act on a withdrawn position.
+    """
+    if not settings.notify_command:
+        return
+    buckets = {">14 days": 0, "7-14 days": 0, "3-7 days": 0}
+    now = time.time()
+    for m in stale:
+        d = (now - m.timestamp) / 86400
+        buckets[">14 days" if d > 14 else "7-14 days" if d > 7 else "3-7 days"] += 1
+    spread = ", ".join(f"{n} {k}" for k, n in buckets.items() if n)
+    text = (
+        f"[comms] {len(stale)} message(s) arrived while this seat could not take them "
+        f"and are too old to deliver as turns ({spread}; oldest {oldest:.1f} days; "
+        f"from {', '.join(senders)}). They are NOT instructions — later messages in the "
+        "same conversations may already have superseded them. Read them with "
+        "`comms inbox` and check anything they ask against this seat's current state "
+        "before acting."
+    )
+    try:
+        subprocess.run(settings.notify_command, shell=True, input=text,
+                       text=True, capture_output=True, timeout=30)
+    except Exception as exc:  # noqa: BLE001
+        store.record("warn", f"could not deliver the retired-message summary: {exc}")
+
+
 def retry_undelivered(
     transport_factory: Callable[[Credential], Transport] = build_transport,
     limit: int = 20,
@@ -750,7 +811,17 @@ def retry_undelivered(
     """
     settings = load_settings(**kw)
     store = Store(settings.state_dir)
-    pending = [m for m in store.undelivered() if m.authorised][:limit]
+    held = [m for m in store.undelivered() if m.authorised]
+
+    # **Age it out before trying it.** A message past the bound would very
+    # likely deliver — that is exactly the danger, because it arrives looking
+    # current. Retire it here, before any attempt, so nothing stale can reach a
+    # session even once.
+    retired = _retire_stale(settings, store, held, **kw)
+    if retired:
+        held = [m for m in store.undelivered() if m.authorised]
+
+    pending = held[:limit]
     if not pending:
         return 0
 
@@ -1355,6 +1426,27 @@ def run_daemon(
 #: and that is the number worth spending an API call on. Twelve calls an hour
 #: against a hub this seat already long-polls continuously is not a cost.
 BACKSTOP_SECS = 300
+
+#: How old a held message may be and still be delivered as a live turn.
+#:
+#: **72 hours** — ruled by the arch seat 2026-09-21, stated here because the
+#: contract states it, not chosen by this client. It covers a seat down over a
+#: weekend with a day's grace; beyond it a message has crossed from instruction
+#: to historical record.
+#:
+#: *The incident that earned it, and the reason the number is not the point.* On
+#: 2026-09-21 this seat's own queue drained after an upgrade: twenty messages,
+#: aged 10 to 17 days, arrived as live turns. Among them a HIGH-SEVERITY finding
+#: and its retraction one message later, and three successive revisions of one
+#: ADR — each reading as current. An agent obeying them in order acts on two
+#: withdrawn positions before reaching the live one. The same drain then hit
+#: every seat in the estate when they upgraded, because a pre-1.0.3 seat could
+#: not receive, so nothing in its store had ever been marked delivered.
+#:
+#: This is NOT the attempts bound. The two are orthogonal: attempts stops a
+#: message that always fails, age stops a message that would now succeed and
+#: should not.
+STALENESS_BOUND_SECS = 72 * 3600
 
 #: How many times a held message is retried before this client stops and says so.
 #:

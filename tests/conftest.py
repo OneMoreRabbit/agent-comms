@@ -139,14 +139,27 @@ def seat(tmp_path, monkeypatch):
     # session.
     shim = home / ".test-bin"
     shim.mkdir()
-    (shim / "comms").write_text(
-        "#!/bin/sh\n"
-        "# Test shim. The real client must never be reachable from the suite.\n"
-        "echo \"test shim refused: comms $*\" >&2\n"
-        "exit 127\n",
-        encoding="utf-8",
-    )
-    (shim / "comms").chmod(0o755)
+    # **Every real binary this client shells out to, not just the notify path.**
+    # 2026-09-13 shimmed `comms` because notify_command was how the suite reached
+    # the live seat. 1.0.0 moved delivery to `seat msg`, and the shim did not
+    # follow — so from 1.0.0 any test that reaches seat.deliver() typed its
+    # fixture into the running agent session. Measured 2026-09-21 by tracing
+    # subprocess.run: two `['seat','msg','--json']` calls per backstop test,
+    # matching exactly the two fixture messages that kept arriving.
+    #
+    # The trigger was my own wiring: retry_undelivered runs on the daemon's
+    # backstop timer, so a test that fires the backstop now delivers for real.
+    # Listing the binaries explicitly, so adding a third shell-out without
+    # shimming it fails loudly here rather than in somebody's session.
+    for binary in ("comms", "seat"):
+        (shim / binary).write_text(
+            "#!/bin/sh\n"
+            "# Test shim. No real binary is reachable from the suite.\n"
+            f"echo \"test shim refused: {binary} $*\" >&2\n"
+            "exit 127\n",
+            encoding="utf-8",
+        )
+        (shim / binary).chmod(0o755)
     monkeypatch.setenv("PATH", f"{shim}:{os.environ.get('PATH', '')}")
 
     monkeypatch.setattr("pathlib.Path.home", classmethod(lambda cls: home))
