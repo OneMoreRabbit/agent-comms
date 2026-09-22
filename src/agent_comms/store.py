@@ -162,7 +162,62 @@ class Store:
             except ValueError:
                 last_tick = None
 
-        return DaemonState(running=running, pid=pid if running else None, last_tick=last_tick)
+        detail = ""
+        if running and pid is None:
+            # The lock file is empty but somebody holds the lock. The kernel
+            # still knows who, so ask it (see `lock_holder_pid`).
+            pid = self.lock_holder_pid()
+            if pid is not None:
+                detail = "pid read from the kernel's lock table; the lock file is empty"
+
+        return DaemonState(running=running, pid=pid if running else None,
+                           last_tick=last_tick, detail=detail)
+
+    def lock_holder_pid(self) -> int | None:
+        """Ask the OS which process holds the daemon lock.
+
+        The lock file's contents are a **copy** the daemon wrote about itself;
+        the kernel is the owner of the fact. When the copy is missing — an
+        empty lock file — the answer is still knowable, so derive it from the
+        owner rather than telling a person to go hunting.
+
+        This exists because the alternative people reach for is a pattern
+        match, and a pattern match here is dangerous: a seat's tmux server was
+        started as `tmux new -ds comms ... comms daemon`, so its OWN argv
+        contains `comms daemon`. `pkill -f "comms daemon"` matches the server
+        and takes every session inside it. That cost thirteen seats their
+        sessions on 2026-09-21. An inode is exact; a pattern is a guess.
+
+        Returns None where the answer cannot be had (no `/proc/locks`, no
+        matching entry) — never a guess.
+        """
+        lock_path = self.root / "daemon.lock"
+        try:
+            st = os.stat(lock_path)
+            lines = Path("/proc/locks").read_text().splitlines()
+        except OSError:
+            return None
+
+        exact = "%02x:%02x:%d" % (os.major(st.st_dev), os.minor(st.st_dev), st.st_ino)
+        by_inode = None
+        for line in lines:
+            parts = line.split()
+            # ... FLOCK ADVISORY WRITE <pid> <maj:min:inode> <start> <end>
+            if len(parts) < 6 or parts[1] != "FLOCK":
+                continue
+            try:
+                pid = int(parts[4])
+            except ValueError:
+                continue
+            where = parts[5]
+            if where == exact:
+                return pid
+            if where.rsplit(":", 1)[-1] == str(st.st_ino):
+                # Same inode, device spelled differently — a mount namespace
+                # reports its own numbers. Keep it as the fallback rather than
+                # the answer, so an exact match always wins.
+                by_inode = pid
+        return by_inode
 
     def acquire_daemon_lock(self):
         """Take the single-daemon lock, or raise `DaemonAlreadyRunning`.

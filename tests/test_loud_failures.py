@@ -986,3 +986,87 @@ def test_a_losing_daemon_does_not_erase_the_winners_pid(seat):
         assert store.daemon_state().pid == int(recorded)
     finally:
         held.close()
+
+
+# -- the empty lock, and never advising a pattern kill (orchestrator need) -----
+#
+# Filed 2026-09-21: `comms daemon --stop` refuses when daemon.lock is present
+# but empty, and the remedy it printed was `pgrep -f 'comms daemon'`. A seat's
+# tmux server carries `comms daemon` in its OWN argv, so the pattern matches the
+# server; the orchestrator's pkill fallback took the sessions of thirteen seats.
+# These four fail against the pre-change client.
+
+def test_empty_lock_does_not_stop_stop_from_working(seat, monkeypatch):
+    """The lock file is a COPY of the pid. The kernel is the owner of the fact.
+
+    Pre-change this raised DaemonWillNotStop with nothing signalled.
+    """
+    from agent_comms.store import Store
+
+    store = Store(seat / ".comms")
+    held = store.acquire_daemon_lock()
+    holder = int((seat / ".comms" / "daemon.lock").read_text())
+    (seat / ".comms" / "daemon.lock").write_text("")  # the defect, exactly
+
+    signalled = []
+
+    def release(pid, sig):
+        signalled.append(pid)
+        held.close()
+
+    monkeypatch.setattr(operations.os, "kill", release)
+    stopped, pid = operations.stop_daemon(timeout=5.0)
+
+    assert stopped is True
+    assert pid == holder
+    assert signalled == [holder], "signalled the wrong process, or none at all"
+
+
+def test_status_names_the_pid_when_the_lock_file_is_empty(seat):
+    """`running (pid None)` is the state that makes a person reach for pkill."""
+    from agent_comms.store import Store
+
+    store = Store(seat / ".comms")
+    held = store.acquire_daemon_lock()
+    try:
+        expected = int((seat / ".comms" / "daemon.lock").read_text())
+        (seat / ".comms" / "daemon.lock").write_text("")
+        state = store.daemon_state()
+        assert state.running is True
+        assert state.pid == expected
+        assert "lock file is empty" in state.detail
+    finally:
+        held.close()
+
+
+def test_lock_holder_is_never_guessed(seat, monkeypatch):
+    """No holder findable → None. A guess here is what kills sessions."""
+    from pathlib import Path
+
+    from agent_comms.store import Store
+
+    store = Store(seat / ".comms")
+    store.ensure()
+    monkeypatch.setattr(Path, "read_text",
+                        lambda self, *a, **k: (_ for _ in ()).throw(OSError("no /proc/locks")))
+    assert store.lock_holder_pid() is None
+
+
+def test_the_refusal_never_recommends_a_pattern_kill(seat, monkeypatch):
+    """Both sources exhausted: say so, name the file, forbid the pattern."""
+    from agent_comms.errors import DaemonWillNotStop
+    from agent_comms.store import Store
+
+    held = Store(seat / ".comms").acquire_daemon_lock()
+    try:
+        monkeypatch.setattr(Store, "lock_holder_pid", lambda self: None)
+        (seat / ".comms" / "daemon.lock").write_text("")
+        with pytest.raises(DaemonWillNotStop) as caught:
+            operations.stop_daemon(timeout=0.3)
+    finally:
+        held.close()
+
+    said = str(caught.value)
+    assert "pgrep" not in said, "still recommending a pattern match"
+    assert "NEVER match on the command line" in said
+    assert "fuser" in said or "lsof" in said, "must name an exact way to find it"

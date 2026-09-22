@@ -989,10 +989,21 @@ def stop_daemon(timeout: float = 10.0, **kw) -> tuple[bool, int | None]:
     if not state.running:
         return False, None
     if state.pid is None:
+        # Both sources are exhausted: the lock file is empty AND the kernel's
+        # lock table could not name a holder. Say so and stop. It must NOT
+        # suggest a pattern match — `pkill -f "comms daemon"` matches the tmux
+        # server's own argv and takes every session on the seat with it. That
+        # advice used to live in this message and it cost thirteen seats their
+        # sessions (orchestrator need, 2026-09-21).
+        lock = settings.state_dir / "daemon.lock"
         raise DaemonWillNotStop(
-            "a daemon holds this seat's lock but its pid is unreadable, so there is "
-            f"nothing to signal. Find it with: pgrep -f 'comms daemon', then kill it, "
-            f"and check {settings.state_dir / 'daemon.lock'} is writable."
+            f"something holds {lock} but neither the lock file nor the kernel's lock "
+            "table can name it, so there is nothing safe to signal. Find the holder "
+            f"exactly, by that one file:\n"
+            f"    fuser -v {lock}        # or: lsof {lock}\n"
+            "then stop that pid. NEVER match on the command line: a seat's tmux server "
+            "carries 'comms daemon' in its own argv, so pkill -f would kill the server "
+            "and every session inside it."
         )
 
     pid = state.pid
