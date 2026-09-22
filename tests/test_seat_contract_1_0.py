@@ -449,15 +449,44 @@ def test_no_agent_means_the_seats_default_and_adds_no_flag(monkeypatch):
     assert seen["cmd"] == ["seat", "msg", "--json"]
 
 
-def test_contract_1_1_passes_the_major_gate(monkeypatch):
-    """1.1 is additive inside major 1: re-pin freely, no gate change."""
+@pytest.mark.parametrize("reported", ["1.0", "1.1", "1.1-draft", "1.2.3", "1"])
+def test_the_gate_accepts_any_major_1(monkeypatch, reported):
+    """Accept-any-major-1, never a string match on "1.0".
+
+    1.1 is additive, so a seat reporting it is strictly MORE capable, not less.
+    A gate that matched the string would refuse the better seat — the same defect
+    class we found in their draft, pointing the other way. `1.1-draft` is the
+    real spelling both test seats report today, measured, not assumed.
+    """
     import json as _json
 
     class _R:
-        stdout = _json.dumps({"contract": "1.1"}).encode()
+        stdout = _json.dumps({"contract": reported}).encode()
         stderr = b""
         returncode = 0
 
     monkeypatch.setattr(seat_app, "_contract_checked", None)
     monkeypatch.setattr(seat_app.subprocess, "run", lambda *a, **k: _R())
-    assert seat_app.require_contract() == "1.1"
+    assert seat_app.require_contract() == reported
+
+
+@pytest.mark.parametrize("reported", ["0.5.1", "2.0", "10.0", ""])
+def test_the_gate_refuses_anything_that_is_not_major_1(monkeypatch, reported):
+    """Pre-1.0 has no `seat msg`; major 2 may have changed terms.
+
+    `10.0` is here for the trap the obvious fix walks into: a gate that
+    STARTSWITH "1" accepts major 10, which is not major 1.
+    """
+    import json as _json
+
+    from agent_comms.seat import SeatTooOld
+
+    class _R:
+        stdout = _json.dumps({"contract": reported}).encode()
+        stderr = b""
+        returncode = 0
+
+    monkeypatch.setattr(seat_app, "_contract_checked", None)
+    monkeypatch.setattr(seat_app.subprocess, "run", lambda *a, **k: _R())
+    with pytest.raises(SeatTooOld):
+        seat_app.require_contract()
