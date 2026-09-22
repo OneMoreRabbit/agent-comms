@@ -120,3 +120,20 @@ class DaemonWillNotStop(CommsError):
     """
 
     tag = "daemon-will-not-stop"
+
+
+class ChannelNotReachable(CommsError):
+    """A send was aimed at a channel this bot is not subscribed to.
+
+    **Refused, never posted.** Subscription is the routing mechanism: the event
+    queue carries no narrow, so a seat receives exactly what its bot holds. A
+    message posted into a channel we do not hold would go out and its reply
+    would never come back — we could not read the topic we had just started.
+
+    Cross-project conversations live ENTIRELY in the RECIPIENT's channel, one
+    topic, with the sender's bot subscribed there (comms-design §5a). Posting
+    without that subscription is silent non-delivery one layer up, which is the
+    property this whole design exists to remove.
+    """
+
+    tag = "channel-not-reachable"

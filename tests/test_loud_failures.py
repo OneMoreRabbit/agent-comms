@@ -249,6 +249,10 @@ def test_doctor_reports_every_check_not_just_the_first(running_daemon, monkeypat
     report = operations.preflight(transport_factory=lambda c: FakeTransport())
     names = [n for n, _, _ in report.checks]
     assert names == ["enabled", "credential", "identity", "subscription",
+                     # "reachable channels" added 2026-09-22: a routing record naming a
+                     # channel this bot is not subscribed to is silent non-delivery
+                     # waiting to happen, and doctor is where it is found out.
+                     "reachable channels",
                      "event queue", "deliverable", "directory", "seat build", "daemon",
                      "wake trigger"]
     assert report.ok
@@ -1070,3 +1074,83 @@ def test_the_refusal_never_recommends_a_pattern_kill(seat, monkeypatch):
     assert "pgrep" not in said, "still recommending a pattern match"
     assert "NEVER match on the command line" in said
     assert "fuser" in said or "lsof" in said, "must name an exact way to find it"
+
+
+# -- cross-project: subscription IS the routing mechanism (§5a) ----------------
+#
+# Measured 2026-09-22: a message posted in a channel this bot does not hold
+# produces NO EVENT AT ALL — not a refusal, not a stored record, not a log line.
+# Silence at the transport layer, before any permission check runs. These gates
+# are the only place in the estate that fact is visible.
+
+def test_a_send_refuses_a_channel_whose_replies_we_could_not_read(seat, monkeypatch):
+    """Posting there would start a topic we cannot follow."""
+    from agent_comms.errors import ChannelNotReachable
+    from agent_comms.hub import Hub
+
+    monkeypatch.setattr(Hub, "subscribed_channels", lambda self: frozenset({"agent-eco"}))
+    monkeypatch.setattr(operations, "_resolve_recipient", lambda s, h, n: n)
+
+    with pytest.raises(ChannelNotReachable) as caught:
+        operations.send("hello", to="orch-arch", subject="x", channel="orchestrator",
+                        transport_factory=lambda c: FakeTransport())
+
+    said = str(caught.value)
+    assert "not subscribed to 'orchestrator'" in said
+    assert "agent-eco" in said, "must say what it CAN reach, not only what it cannot"
+    assert "§5a" in said or "RECIPIENT's channel" in said
+
+
+def test_a_send_to_a_held_channel_is_not_refused(seat, monkeypatch):
+    """The gate must not fire on the ordinary case, or it stops being read."""
+    from agent_comms.hub import Hub
+
+    monkeypatch.setattr(Hub, "subscribed_channels",
+                        lambda self: frozenset({"agent-eco", "orchestrator"}))
+    monkeypatch.setattr(operations, "_resolve_recipient", lambda s, h, n: n)
+    posted = operations.send("hello", to="orch-arch", subject="x", channel="orchestrator",
+                             transport_factory=lambda c: FakeTransport())
+    assert posted.response
+
+
+def test_doctor_fails_when_a_routed_channel_is_unreachable(seat, monkeypatch):
+    """A transports record naming a channel we do not hold is a message that
+    will post and never be answered. Doctor is where that is found out."""
+    import json
+
+    from agent_comms.hub import Hub
+
+    (seat / ".comms").mkdir(parents=True, exist_ok=True)
+    (seat / ".comms" / "routes.json").write_text(json.dumps({"routes": [
+        {"id": "bakehouse.orchestrator.arch",
+         "transports": {"comms": {"channel": "orchestrator", "bot": "orch-arch"}}}]}))
+
+    monkeypatch.setattr(Hub, "subscribed_channels", lambda self: frozenset({"agent-eco"}))
+    monkeypatch.setattr("agent_comms.operations.seat_state_now",
+                        lambda: __import__("agent_comms.seat", fromlist=["x"]).SeatState(
+                            answer="yes", reason="r", runtime="claude", sessions=1,
+                            version="1.0.2", contract="1.0"))
+    report = operations.preflight(transport_factory=lambda c: FakeTransport())
+
+    check = next(c for c in report.checks if c[0] == "reachable channels")
+    assert check[1] is False
+    assert "orchestrator" in check[2]
+
+
+def test_doctor_passes_when_every_routed_channel_is_held(seat, monkeypatch):
+    import json
+
+    from agent_comms.hub import Hub
+
+    (seat / ".comms").mkdir(parents=True, exist_ok=True)
+    (seat / ".comms" / "routes.json").write_text(json.dumps({"routes": [
+        {"transports": {"comms": {"channel": "agent-eco"}}}]}))
+
+    monkeypatch.setattr(Hub, "subscribed_channels", lambda self: frozenset({"agent-eco"}))
+    monkeypatch.setattr("agent_comms.operations.seat_state_now",
+                        lambda: __import__("agent_comms.seat", fromlist=["x"]).SeatState(
+                            answer="yes", reason="r", runtime="claude", sessions=1,
+                            version="1.0.2", contract="1.0"))
+    report = operations.preflight(transport_factory=lambda c: FakeTransport())
+
+    assert next(c for c in report.checks if c[0] == "reachable channels")[1] is True

@@ -24,6 +24,7 @@ from .config import Credential, Settings, load_credential, load_settings
 from .directory import Directory
 from .directory import load as load_directory
 from .errors import (
+    ChannelNotReachable,
     CommsDisabled,
     CommsError,
     ConflictingWakeTriggers,
@@ -165,6 +166,32 @@ def preflight(
         report.add("subscription", False, str(exc))
         return report
 
+    # Every channel the directory says we must reach, checked against the ones
+    # this bot actually holds. A transports record naming a channel we are not
+    # subscribed to is silent non-delivery waiting to happen: the send would
+    # succeed and the reply would never arrive.
+    try:
+        held = hub.subscribed_channels()
+    except CommsError as exc:
+        report.add("reachable channels", False, str(exc))
+        held = frozenset()
+    else:
+        wanted = _transport_channels(settings)
+        missing = sorted(c for c in wanted if c not in held)
+        if missing:
+            report.add(
+                "reachable channels", False,
+                f"the routing records name channel(s) this bot cannot reach: "
+                f"{', '.join(missing)}. A message addressed there would post and its "
+                f"reply would never come back. Subscribed to: {', '.join(sorted(held))}.")
+        elif wanted:
+            report.add("reachable channels", True,
+                       f"every routed channel is subscribed: {', '.join(sorted(wanted))}")
+        else:
+            report.note("reachable channels",
+                        "no routing records are cached yet, so there is nothing to check "
+                        "beyond this seat's own channel")
+
     try:
         registration = hub.register_queue()
     except CommsError as exc:
@@ -286,6 +313,27 @@ def _wake_summary(settings: Settings) -> str:
         "(the estate installs this file; ansible-platform owns it on a provisioned "
         "seat). Until then, mentions are only visible to `comms inbox`."
     )
+
+
+def _transport_channels(settings: Settings) -> set[str]:
+    """Channels named by cached routing records, plus this seat's own.
+
+    Read from the local config the periodic layer writes. Absent means nothing
+    has been fetched yet, which is a note rather than a failure — there is
+    genuinely nothing to check.
+    """
+    channels = {settings.channel.strip().casefold()}
+    cache = settings.state_dir / "routes.json"
+    try:
+        import json as _json
+        records = _json.loads(cache.read_text(encoding="utf-8")).get("routes", [])
+    except (OSError, ValueError, AttributeError):
+        return channels
+    for record in records:
+        name = ((record or {}).get("transports") or {}).get("comms", {}).get("channel")
+        if name:
+            channels.add(str(name).strip().casefold())
+    return channels
 
 
 def _permalink(site: str, event_msg: dict) -> str:
@@ -494,6 +542,7 @@ def send(
     to: str | None = None,
     subject: str | None = None,
     topic: str | None = None,
+    channel: str | None = None,
     transport_factory: Callable[[Credential], Transport] = build_transport,
     **kw,
 ) -> dict:
@@ -545,9 +594,42 @@ def send(
     hub = Hub(transport_factory(credential), settings, credential)
     recipient = _resolve_recipient(settings, hub, recipient)
 
-    warnings = _mention_warnings(hub, content, settings.channel)
-    response = hub.send(settings.channel, topic, addressed(recipient, content))
+    channel = channel or settings.channel
+    require_reachable(hub, channel)
+
+    warnings = _mention_warnings(hub, content, channel)
+    response = hub.send(channel, topic, addressed(recipient, content))
     return Posted(response=response, warnings=warnings)
+
+
+def require_reachable(hub: Hub, channel: str) -> None:
+    """Refuse to post into a channel this bot is not subscribed to.
+
+    **Subscription is the routing mechanism and nothing declares it.** The event
+    queue carries no narrow, so a seat receives exactly what its bot holds.
+    Measured 2026-09-22: a message posted in a channel this bot does not hold
+    produces no event at all — not a refusal, not a stored record, not a log
+    line. Silence at the transport layer, before any permission check.
+
+    So posting into an unsubscribed channel would send a message whose reply we
+    could never read: we would start a topic we cannot follow. Cross-project
+    conversations live entirely in the RECIPIENT's channel with the sender's bot
+    subscribed there (comms-design §5a) — this is the check that makes that a
+    requirement rather than a hope.
+    """
+    held = hub.subscribed_channels()
+    if channel.strip().casefold() in held:
+        return
+    raise ChannelNotReachable(
+        f"this seat's bot is not subscribed to '{channel}', so a message posted "
+        "there would go out and its reply would never come back — the event "
+        "queue carries no narrow, so a seat receives exactly what its bot holds "
+        "and nothing else.\n"
+        f"  subscribed to: {', '.join(sorted(held)) or '(nothing)'}\n"
+        "  A cross-project conversation lives in the RECIPIENT's channel and the "
+        "sender's bot must be subscribed there (comms-design §5a). Subscribe it, "
+        "or address an agent whose channel this seat already holds."
+    )
 
 
 def _resolve_recipient(settings: Settings, hub: Hub, name: str) -> str:
