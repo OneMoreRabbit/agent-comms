@@ -176,7 +176,8 @@ def test_the_credential_file_is_the_name_the_estate_declares():
     next to it, and every answer is degraded with nobody able to see why.
     Constitution §11 — the estate declares this, we do not guess it.
     """
-    assert R.CREDENTIAL_FILE.name == "estate-directory-read"
+    assert R.CREDENTIAL_FILE.name == "estate-directory-seat"
+    assert R.FALLBACK_CREDENTIAL_FILE.name == "estate-directory-read"
     assert R.ADDRESS_FILE.name == "estate-directory-address"
     assert R.CREDENTIAL_FILE.parent == R.ADDRESS_FILE.parent
 
@@ -285,3 +286,42 @@ def test_a_fallback_after_a_real_failure_IS_degraded(directory, monkeypatch):
     """The other direction has to hold too, or the flag means nothing."""
     monkeypatch.setattr(R, "_post", _refuses(401, {"error": "unauthenticated"}))
     assert R.Resolver(local_agents=AGENTS).resolve("arch", caller="c").degraded is True
+
+
+@pytest.mark.parametrize("code,status,retryable", [
+    (404, "unknown", False),
+    (409, "not-registered", True),
+    (200, "resolved", False),
+])
+def test_an_answer_is_read_whatever_http_status_carries_it(directory, monkeypatch,
+                                                           code, status, retryable):
+    """The contract defines the answer; HTTP is transport.
+
+    Measured against the live directory: `unknown` arrives on 404 WITH
+    near-misses, and `not-registered` on 409. Branching on the code first threw
+    both away and degraded instead — losing the near-misses that make a typo one
+    edit from fixed, and claiming resolution was not being served when it was.
+    """
+    body = {"kind": "resolution-result", "contract": "0.1",
+            "success": status == "resolved", "status": status, "requested": "x",
+            "near_misses": ["bakehouse.orchestrator.estate-directory"],
+            "retryable": retryable}
+    if status == "resolved":
+        body["canonical_id"] = "bakehouse.agent-eco.arch"
+    monkeypatch.setattr(R, "_post", _refuses(code, body))
+    answer = R.Resolver(local_agents=AGENTS).resolve("x", caller="c")
+
+    assert answer.status == status
+    assert answer.degraded is False, "a real answer must never be reported as degraded"
+    assert answer.retryable is retryable
+
+
+def test_near_misses_survive_a_404(directory, monkeypatch):
+    """A typo is one edit from fixed, but only if the near-misses reach a person."""
+    monkeypatch.setattr(R, "_post", _refuses(404, {
+        "kind": "resolution-result", "status": "unknown", "success": False,
+        "requested": "orchestratr",
+        "near_misses": ["bakehouse.orchestrator.estate-directory"]}))
+    answer = R.Resolver(local_agents={}).resolve("orchestratr", caller="c")
+
+    assert answer.near_misses == ("bakehouse.orchestrator.estate-directory",)

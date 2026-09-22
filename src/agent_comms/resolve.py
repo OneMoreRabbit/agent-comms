@@ -36,7 +36,14 @@ from pathlib import Path
 #: have read as "no credential issued" forever while one sat on disk beside it.
 #: The estate declares these in reference/estate-directory-api-v0_1.md.
 ADDRESS_FILE = Path.home() / ".secrets" / "estate-directory-address"
-CREDENTIAL_FILE = Path.home() / ".secrets" / "estate-directory-read"
+#: The CALLER credential — what `/v0/resolve` accepts. Distinct from
+#: `estate-directory-read`, which is the routes-GET credential: measured
+#: 2026-09-22, the read token answers 200 on `/v0/routes` and 401
+#: "the caller credential is invalid" on `/v0/resolve`.
+CREDENTIAL_FILE = Path.home() / ".secrets" / "estate-directory-seat"
+#: Tried only if the caller credential is absent, so a seat issued one and not
+#: the other says which it has rather than silently looking uncredentialed.
+FALLBACK_CREDENTIAL_FILE = Path.home() / ".secrets" / "estate-directory-read"
 
 #: How long a directory answer may be reused. Short on purpose: §4a allows a
 #: cache, and the DNS pattern it names relies on failure to invalidate, so the
@@ -133,10 +140,21 @@ def directory_address() -> str:
 
 
 def _credential() -> str:
-    try:
-        return CREDENTIAL_FILE.read_text(encoding="utf-8").strip()
-    except OSError:
-        return ""
+    """The caller credential, or the read credential if that is all this seat has.
+
+    Both names are the estate's, from `reference/estate-directory-api-v0_1.md`.
+    Neither is invented — an earlier version of this file guessed
+    `estate-directory-token`, which would have read as "no credential issued"
+    forever while a real one sat on disk beside it.
+    """
+    for path in (CREDENTIAL_FILE, FALLBACK_CREDENTIAL_FILE):
+        try:
+            token = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if token:
+            return token
+    return ""
 
 
 def _post(address: str, payload: dict, timeout: float) -> tuple[int, dict]:
@@ -238,21 +256,24 @@ class Resolver:
             )
             return self._from_local(target, FROM_CACHE, "the credential was refused")
 
-        if code == 404 or code == 426 or code >= 500:
-            # The directory is reachable and cannot serve this call. Same
-            # treatment as unreachable: degrade, label, never refuse, never retry.
-            #
-            # 404 means THE ENDPOINT IS NOT THERE — a different fault from a name
-            # not being known, which arrives as a `unknown` inside a served
-            # answer. Measured 2026-09-22: `/v0/resolve` IS serving; a GET of it
-            # 404s because it is POST-only, which is what a natural probe hits.
-            # Handled anyway: if resolution is ever withdrawn we degrade rather
-            # than read an error body as though it were a route.
-            return self._from_local(target, FROM_CACHE, _why(code))
+        # READ THE BODY BEFORE THE STATUS CODE. The contract defines the answer
+        # shape; the HTTP status is transport. Measured 2026-09-22: the live
+        # directory carries a perfectly good `resolution-result` on 404
+        # (unknown, WITH near-misses) and on 409 (not-registered). Branching on
+        # the code first threw those answers away and degraded instead — losing
+        # the near-misses that make a typo one edit from fixed, and reporting
+        # "resolution is not being served" while it was being served perfectly
+        # well.
+        served = isinstance(body, dict) and body.get("kind") == "resolution-result"
 
-        if not isinstance(body, dict) or "kind" not in body:
-            # Served, but not a resolution-result. Never guess a route out of a
-            # shape we do not recognise — fail closed, degrade, say so.
+        if not served:
+            if code in (404, 426) or code >= 500:
+                # Reachable and cannot serve this call: degrade, label, never
+                # retry. A 404 with no answer in it really is an absent
+                # endpoint, which is a different fault from an unknown name.
+                return self._from_local(target, FROM_CACHE, _why(code))
+            # Served something we do not recognise. Never guess a route out of
+            # a shape we cannot read — fail closed, degrade, say so.
             return self._from_local(
                 target, FROM_CACHE,
                 f"the directory answered {code} with something that is not a resolution")
