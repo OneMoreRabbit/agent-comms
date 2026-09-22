@@ -23,13 +23,17 @@ def test_comms_passes_the_fqn_and_nothing_else():
     assert p.fqn == "bakehouse.agent-eco.arch"
 
 
-def test_a_record_with_no_local_route_still_delivers():
-    """The earlier refusal was built on a bridge the design has since removed.
+def test_nothing_reads_a_route_field_any_more():
+    """`local_route` is deleted, not defaulted.
 
-    Every live record carries local_route null; under v1.2 that is correct and
-    not a blocker, because the FQN is what the seat is given.
+    It asked the orchestrator to author what only the seat can know, which is
+    why it was null on all 32 live records. A field that governs nothing is
+    deleted (§11) — carrying it would leave a control an operator could set and
+    nothing would read.
     """
-    assert plan(_resolved(local_route="")).fqn == "bakehouse.agent-eco.arch"
+    from agent_comms.resolve import Resolution as _R
+
+    assert "local_route" not in _R.__dataclass_fields__
 
 
 def test_an_unnamed_resolution_is_never_given_a_constructed_name():

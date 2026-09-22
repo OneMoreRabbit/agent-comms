@@ -157,14 +157,14 @@ def test_a_directory_answer_is_never_marked_degraded(directory, monkeypatch):
     monkeypatch.setattr(R, "_post", lambda *a, **k: (200, {
         "kind": "resolution-result", "contract": "0.1",
         "success": True, "status": "resolved", "canonical_id": "bakehouse.agent-eco.arch",
-        "route": {"seat": "agent-eco/arch", "host": "otter", "local_route": "arch"},
+        "route": {"seat": "agent-eco/arch", "host": "otter"},
         "delivery": "inject", "route_revision": 12}))
     answer = R.Resolver(local_agents=AGENTS).resolve("arch", caller="c")
 
     assert answer.degraded is False
     assert answer.source == R.FROM_DIRECTORY
     assert answer.label().endswith("bakehouse.agent-eco.arch")
-    assert answer.local_route == "arch" and answer.route_revision == 12
+    assert answer.seat == "agent-eco/arch" and answer.route_revision == 12
 
 
 def test_the_credential_file_is_the_name_the_estate_declares():

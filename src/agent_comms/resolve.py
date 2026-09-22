@@ -63,7 +63,6 @@ class Resolution:
     canonical_id: str = ""
     seat: str = ""
     host: str = ""
-    local_route: str = ""
     delivery: str = ""
     transports: dict = field(default_factory=dict)
     permissions: dict = field(default_factory=dict)
@@ -293,7 +292,6 @@ class Resolver:
             reason=reason,
             canonical_id=record.get("id", target),
             seat=record.get("seat", ""), host=record.get("host", ""),
-            local_route=record.get("local_route", ""),
             delivery=record.get("delivery", ""),
             transports=record.get("transports", {}) or {},
             permissions=record.get("permissions", {}) or {},
@@ -301,7 +299,14 @@ class Resolver:
 
 
 def _read(target: str, body: dict) -> Resolution:
-    """Read the directory's answer. Unknown shapes fail closed, never open."""
+    """Read the directory's answer. Unknown shapes fail closed, never open.
+
+    **`local_route` is not read, because it no longer exists.** Orchestrator
+    proposal 0004, ruled 2026-09-22: population will never author it — it asked
+    the orchestrator to author what only the seat can know, which is why it was
+    null on all 32 live records. The FQN binds to the slot directly. A field
+    that governs nothing is deleted, not carried (constitution §11).
+    """
     if not isinstance(body, dict):
         return Resolution(success=False, status="unknown", requested=target,
                           message="the directory returned something that is not an answer")
@@ -312,7 +317,6 @@ def _read(target: str, body: dict) -> Resolution:
             success=True, status=str(body.get("status") or "resolved"), requested=target,
             canonical_id=str(body.get("canonical_id") or ""),
             seat=str(route.get("seat") or ""), host=str(route.get("host") or ""),
-            local_route=str(route.get("local_route") or ""),
             delivery=str(body.get("delivery") or ""),
             transports=body.get("transports") or {},
             permissions=body.get("permissions") or {},
