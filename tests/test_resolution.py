@@ -325,3 +325,33 @@ def test_near_misses_survive_a_404(directory, monkeypatch):
     answer = R.Resolver(local_agents={}).resolve("orchestratr", caller="c")
 
     assert answer.near_misses == ("bakehouse.orchestrator.estate-directory",)
+
+
+@pytest.mark.parametrize("code", [301, 302, 307, 308])
+def test_a_redirect_is_never_followed_and_never_guessed_at(directory, monkeypatch, code):
+    """urllib turns a redirected POST into a GET, and `/v0/resolve` is POST-only.
+
+    Following one would silently become a GET, land on `404 no such endpoint`,
+    and have us report "resolution is not being served" against a directory
+    that was merely redirecting. Supersession arrives as a 200 with
+    `alias_used` (addressing model R9), never as a redirect.
+    """
+    monkeypatch.setattr(R, "_post", _refuses(code, {"error": "moved"}))
+    answer = R.Resolver(local_agents=AGENTS).resolve("arch", caller="c")
+
+    assert answer.source == R.FROM_CACHE
+    assert "redirect" in answer.label() and str(code) in answer.label()
+
+
+def test_supersession_is_read_from_the_body_not_from_a_redirect(directory, monkeypatch):
+    """A 200 whose canonical_id differs from what was asked for is the redirect."""
+    monkeypatch.setattr(R, "_post", _refuses(200, {
+        "kind": "resolution-result", "contract": "0.1", "success": True,
+        "status": "resolved", "requested": "agenteco",
+        "canonical_id": "bakehouse.agent-eco.arch", "alias_used": "agenteco",
+        "route": {"seat": "agent-eco/arch"}}))
+    answer = R.Resolver(local_agents={}).resolve("agenteco", caller="c")
+
+    assert answer.success is True
+    assert answer.canonical_id == "bakehouse.agent-eco.arch"
+    assert answer.degraded is False

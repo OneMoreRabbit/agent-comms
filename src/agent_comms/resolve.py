@@ -157,6 +157,28 @@ def _credential() -> str:
     return ""
 
 
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect from the directory.
+
+    **urllib's default handler turns a redirected POST into a GET.**
+    `/v0/resolve` is POST-only, so a 3xx would silently become a GET and land
+    on `404 no such endpoint` — we would report "resolution is not being
+    served" against a directory that was merely redirecting us. A silent
+    method mutation is a landmine whoever causes it: a proxy will 3xx someone
+    eventually, and supersession arrives as a 200 with `alias_used`, never as
+    a redirect (addressing model R9).
+
+    So a 3xx is surfaced as itself and refused like any other answer we cannot
+    read, with the status quoted.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_opener = urllib.request.build_opener(_NoRedirects)
+
+
 def _post(address: str, payload: dict, timeout: float) -> tuple[int, dict]:
     """One call. Returns (http status, decoded body) or raises for transport faults."""
     request = urllib.request.Request(
@@ -169,7 +191,7 @@ def _post(address: str, payload: dict, timeout: float) -> tuple[int, dict]:
     if token:
         request.add_header("Authorization", f"Bearer {token}")
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with _opener.open(request, timeout=timeout) as response:
             return response.status, json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", "replace")
@@ -267,6 +289,12 @@ class Resolver:
         served = isinstance(body, dict) and body.get("kind") == "resolution-result"
 
         if not served:
+            if 300 <= code < 400:
+                # Never followed, never guessed at. See `_NoRedirects`.
+                return self._from_local(
+                    target, FROM_CACHE,
+                    f"the directory answered {code}, a redirect — not followed, "
+                    "because following one on a POST silently turns it into a GET")
             if code in (404, 426) or code >= 500:
                 # Reachable and cannot serve this call: degrade, label, never
                 # retry. A 404 with no answer in it really is an absent
