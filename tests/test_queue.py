@@ -160,3 +160,58 @@ def test_seq_is_monotonic_and_local(q):
     seqs = [q.db.execute("SELECT seq FROM messages WHERE id=?", (m,)).fetchone()["seq"]
             for m in ids]
     assert seqs == sorted(seqs) and len(set(seqs)) == 3
+
+
+def test_a_broken_seat_does_not_burn_the_attempt_budget(q):
+    """Measured on agent-skeleton's seat: a seat upgraded before its config file
+    existed answered `broken` to every delivery, and that mail was NEVER
+    re-delivered after a person fixed it. Stranded.
+
+    `broken` and `conflicted` are not the message's fault and no retry could
+    have worked, so consuming the budget on them is what strands the mail —
+    three broken windows and a message is abandoned having never had one real
+    attempt.
+    """
+    m = q.receive(hub_id="1", sender="arch", body="x")
+    q.move(m, QUEUED, "permitted")
+
+    for _ in range(5):
+        q.record_attempt(m, delivered=False, detail="broken — no agent configuration",
+                         consumes_attempt=False)
+
+    assert q.state_of(m) == QUEUED, "a broken seat abandoned the message"
+    assert q.db.execute("SELECT attempts FROM messages WHERE id=?", (m,)).fetchone()["attempts"] == 0
+    assert m in [r["id"] for r in q.due()], "the message is not waiting for the fix"
+
+
+def test_the_message_delivers_on_the_pass_after_the_seat_is_fixed(q):
+    """The stranding, closed: no fresh message is needed to point an agent at
+    its own backlog."""
+    m = q.receive(hub_id="1", sender="arch", body="x")
+    q.move(m, QUEUED, "permitted")
+    q.record_attempt(m, delivered=False, detail="broken", consumes_attempt=False)
+
+    q.record_attempt(m, delivered=True, detail="typed in")      # a person fixed the seat
+    assert q.state_of(m) == DELIVERED
+
+
+def test_a_non_attempt_is_still_written_down(q):
+    """Every transition is a row. 'Nothing happened' is a fact worth keeping —
+    it is how you reconstruct a broken window afterwards."""
+    m = q.receive(hub_id="1", sender="arch", body="x")
+    q.move(m, QUEUED, "permitted")
+    q.record_attempt(m, delivered=False, detail="broken", consumes_attempt=False)
+
+    causes = [r["cause"] for r in q.history(m)]
+    assert any("not attemptable" in c and "no attempt consumed" in c for c in causes)
+
+
+def test_a_broken_window_cannot_hold_a_message_forever(q):
+    """Not consuming attempts must not mean waiting indefinitely. The age bound
+    is what stops that, and it still applies."""
+    m = q.receive(hub_id="1", sender="arch", body="x", received_at=old(40))
+    q.move(m, QUEUED, "permitted")
+    q.record_attempt(m, delivered=False, detail="broken", consumes_attempt=False)
+
+    assert q.retire().expired == 1
+    assert q.state_of(m) == EXPIRED

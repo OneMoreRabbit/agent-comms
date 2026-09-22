@@ -189,7 +189,8 @@ class Queue:
         self.db.execute("UPDATE messages SET state=? WHERE id=?", (to, message))
         self._log(message, was, to, cause, rule, attempt)
 
-    def record_attempt(self, message: int, *, delivered: bool, detail: str) -> None:
+    def record_attempt(self, message: int, *, delivered: bool, detail: str,
+                       consumes_attempt: bool = True) -> None:
         """**The attempt and its outcome, in ONE transaction.**
 
         This method is the fix for the September flood. There is no window in
@@ -203,14 +204,31 @@ class Queue:
                 "SELECT state, attempts FROM messages WHERE id=?", (message,)).fetchone()
             if row is None:
                 raise ForwardOnly(f"no message {message}")
-            attempts = int(row["attempts"]) + 1
-            self.db.execute("UPDATE messages SET attempts=? WHERE id=?", (attempts, message))
+            # A REFUSAL THAT NEEDS A PERSON DOES NOT CONSUME AN ATTEMPT.
+            # Measured on agent-skeleton's seat 2026-09-22: a seat upgraded
+            # before its config file existed answered `broken` (exit 20) to
+            # every delivery, and the mail that arrived in that window was
+            # never re-delivered after a person fixed it. Stranded.
+            #
+            # `broken` and `conflicted` are not the message's fault and no
+            # retry could have succeeded, so burning the budget on them is what
+            # strands the mail: three broken windows and a message is abandoned
+            # having never had a real attempt. It stays `queued` instead, and
+            # the pass after the fix delivers it. The age bound still retires
+            # it, so it cannot wait forever.
+            attempts = int(row["attempts"]) + (1 if consumes_attempt else 0)
+            if consumes_attempt:
+                self.db.execute("UPDATE messages SET attempts=? WHERE id=?",
+                                (attempts, message))
             if delivered:
                 self.move(message, DELIVERED, detail, attempt=attempts)
             else:
                 self._log(message, row["state"], row["state"],
-                          f"attempt {attempts} failed: {detail}", attempt=attempts)
-                if attempts >= self.max_attempts:
+                          (f"attempt {attempts} failed: {detail}" if consumes_attempt else
+                           f"not attemptable: {detail} — a person must act; "
+                           "no attempt consumed, the message stays queued"),
+                          attempt=attempts if consumes_attempt else None)
+                if consumes_attempt and attempts >= self.max_attempts:
                     self.move(message, ABANDONED,
                               f"{attempts} attempts reached", rule="max_attempts",
                               attempt=attempts)
