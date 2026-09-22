@@ -28,6 +28,10 @@ NO_SESSION = "no-session"
 FAILED = "failed"
 BROKEN = "broken"
 UNKNOWN = "unknown"
+#: Added by devagent-seat-contract 1.1, additive: exit codes are unchanged, so
+#: only a consumer branching on the STRING has to care. These are that care.
+UNKNOWN_AGENT = "unknown-agent"   # exit 10 — this seat does not serve that name
+CONFLICTED = "conflicted"         # exit 20 — several sessions could be it; it will not choose
 
 #: The seat's body limit (contract: 65536 bytes, never silently truncated).
 MAX_BODY_BYTES = 65536
@@ -92,6 +96,10 @@ class Delivery:
     runtime: str = ""
     seat: str = ""
     exit_code: int = 0
+    #: Contract 1.1: the FQN that was resolved, and the seat-local label. Empty
+    #: on a 1.0 seat and on a local session — absence is not an error.
+    agent: str = ""
+    label: str = ""
 
     @property
     def retryable(self) -> bool:
@@ -108,13 +116,22 @@ class Delivery:
 
     @property
     def needs_a_person(self) -> bool:
-        """`broken` — the seat's invariant is violated and no retry fixes it."""
-        return self.status == BROKEN
+        """The seat's invariant is violated and no retry fixes it.
+
+        Both of these are exit 20 in the contract, which is the code that means
+        *a person must intervene* — `broken` since 1.0, `conflicted` added by
+        1.1 when several live sessions could be one agent and the seat refuses
+        to choose between them. Leaving `conflicted` out would have made it fall
+        through as an ordinary refusal and gone unreported to anyone who could
+        fix it.
+        """
+        return self.status in (BROKEN, CONFLICTED)
 
     def summary(self) -> str:
         """One line for a log or a sender, in the seat's own words where it has them."""
-        seat = f" [{self.seat}]" if self.seat else ""
-        return f"{self.status}: {self.message}{seat}" if self.message else f"{self.status}{seat}"
+        where = self.agent or self.seat
+        where = f" [{where}]" if where else ""
+        return f"{self.status}: {self.message}{where}" if self.message else f"{self.status}{where}"
 
 
 _contract_checked: str | None = None
@@ -168,7 +185,7 @@ def _client_version() -> str:
     return __version__
 
 
-def deliver(body: str, timeout: int = 30) -> Delivery:
+def deliver(body: str, timeout: int = 30, agent: str | None = None) -> Delivery:
     """Hand one message to the seat. The only way this client delivers anything.
 
     The body goes on **stdin**, never as an argument — the seat refuses an argument
@@ -199,9 +216,16 @@ def deliver(body: str, timeout: int = 30) -> Delivery:
             exit_code=2,
         )
 
+    # `--agent` is the ONLY way to address one agent (contract 1.1 §7.2); a
+    # runtime session id is never an address. Omitting it means the seat's
+    # declared default, which on a one-agent seat is today's behaviour exactly.
+    command = ["seat", "msg", "--json"]
+    if agent:
+        command += ["--agent", agent]
+
     try:
         result = subprocess.run(
-            ["seat", "msg", "--json"],
+            command,
             input=encoded,
             capture_output=True,
             timeout=timeout,
@@ -256,6 +280,8 @@ def _parse(stdout: bytes, stderr: bytes, code: int) -> Delivery:
         runtime=str(payload.get("runtime") or ""),
         seat=str(payload.get("seat") or ""),
         exit_code=code,
+        agent=str(payload.get("agent") or ""),
+        label=str(payload.get("label") or ""),
     )
 
 

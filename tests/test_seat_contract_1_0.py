@@ -356,3 +356,108 @@ def test_the_suite_can_never_reach_a_real_binary(seat):
         out = sp.run([binary, "msg"], capture_output=True)
         assert out.returncode == 127, f"{binary} shim must refuse, got {out.returncode}"
         assert b"test shim refused" in out.stderr
+
+
+# -- devagent-seat-contract 1.1 (draft) ---------------------------------------
+#
+# 1.1 is additive: exit codes are unchanged, so only a consumer branching on the
+# status STRING has to care. These are the places this client branches on it.
+# Each fails against the pre-1.1 client.
+
+def _answer(**fields):
+    import json as _json
+    payload = {"success": False, "status": "delivered", "message": "", "runtime": "claude",
+               "seat": "test-claude"}
+    payload.update(fields)
+    return _json.dumps(payload).encode()
+
+
+def test_conflicted_needs_a_person_not_a_retry():
+    """Exit 20 means a person must intervene. `conflicted` is exit 20.
+
+    Falling through as an ordinary refusal would leave nobody told, and nobody
+    can fix two sessions claiming one agent except a person.
+    """
+    d = seat_app._parse(_answer(status="conflicted",
+                            message="two live sessions could be test-claude.review: 41ab, 7c02"),
+                    b"", 20)
+    assert d.needs_a_person is True
+    assert d.retryable is False
+
+
+def test_unknown_agent_is_never_retried():
+    """This seat does not serve that name. No number of retries changes that."""
+    d = seat_app._parse(_answer(status="unknown-agent",
+                            message="this seat serves test-claude.main, test-claude.review"),
+                    b"", 10)
+    assert d.retryable is False
+    assert d.needs_a_person is False
+
+
+def test_the_resolved_agent_and_label_are_kept():
+    """1.1 answers say WHICH agent took it. A refusal that cannot name the
+    intended recipient is a refusal nobody can act on."""
+    d = seat_app._parse(_answer(success=True, status="delivered",
+                            agent="test-claude.review", label="review"), b"", 0)
+    assert (d.agent, d.label) == ("test-claude.review", "review")
+    assert "test-claude.review" in d.summary()
+
+
+def test_a_1_0_seat_answer_still_parses_with_the_new_fields_absent():
+    """Absence is not an error — every 1.0 guarantee still holds."""
+    d = seat_app._parse(_answer(success=True, status="delivered"), b"", 0)
+    assert (d.agent, d.label) == ("", "")
+    assert d.success is True
+
+
+def test_agent_is_passed_as_a_flag_and_never_as_part_of_the_body(monkeypatch):
+    """`--agent` is the only way to address one agent; an id is never an address."""
+    seen = {}
+
+    class _R:
+        stdout = _answer(success=True, status="delivered", agent="test-claude.review",
+                         label="review")
+        stderr = b""
+        returncode = 0
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = cmd
+        seen["stdin"] = kw.get("input")
+        return _R()
+
+    monkeypatch.setattr(seat_app, "_contract_checked", "1.1")
+    monkeypatch.setattr(seat_app.subprocess, "run", fake_run)
+    seat_app.deliver("hello", agent="test-claude.review")
+
+    assert seen["cmd"] == ["seat", "msg", "--json", "--agent", "test-claude.review"]
+    assert seen["stdin"] == b"hello"
+
+
+def test_no_agent_means_the_seats_default_and_adds_no_flag(monkeypatch):
+    """A caller that passes no new flag behaves exactly as it does today."""
+    seen = {}
+
+    class _R:
+        stdout = _answer(success=True, status="delivered")
+        stderr = b""
+        returncode = 0
+
+    monkeypatch.setattr(seat_app, "_contract_checked", "1.1")
+    monkeypatch.setattr(seat_app.subprocess, "run",
+                        lambda cmd, **kw: (seen.__setitem__("cmd", cmd), _R())[1])
+    seat_app.deliver("hello")
+    assert seen["cmd"] == ["seat", "msg", "--json"]
+
+
+def test_contract_1_1_passes_the_major_gate(monkeypatch):
+    """1.1 is additive inside major 1: re-pin freely, no gate change."""
+    import json as _json
+
+    class _R:
+        stdout = _json.dumps({"contract": "1.1"}).encode()
+        stderr = b""
+        returncode = 0
+
+    monkeypatch.setattr(seat_app, "_contract_checked", None)
+    monkeypatch.setattr(seat_app.subprocess, "run", lambda *a, **k: _R())
+    assert seat_app.require_contract() == "1.1"
