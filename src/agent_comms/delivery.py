@@ -1,13 +1,20 @@
-"""One send, end to end: resolve → permit → deliver → record.
+"""One send: resolve → deliver by FQN → record.
 
-**The division of labour, ruled by the operator 2026-09-22:**
+**The division of labour, ruled by the operator 2026-09-22 and settled by
+seat-router design v1.2:**
 
-- the **directory** resolves a name to an FQN and a route,
-- the **seat** turns a route into a session,
+- the **directory** resolves a name to an FQN,
+- the **seat** turns an FQN into a session — `FQN → seat_local_id → session id`,
 - **comms delivers to an FQN and does nothing else.**
 
-Comms never picks an agent, never resolves a session, and never guesses which
-conversation a message is for. It carries what the directory told it.
+Comms never picks an agent, never resolves a session, never learns a
+`seat_local_id`, and never guesses which conversation a message is for. It
+passes the FQN the directory gave it and reads the answer.
+
+**`local_route` is dead** (v1.2 §A1.2): the FQN binds to the slot directly and
+no third name exists. An earlier version of this module refused to deliver when
+a record carried no `local_route`. That refusal is gone — it was built on a
+bridge the design has since removed.
 """
 
 from __future__ import annotations
@@ -18,37 +25,17 @@ from .errors import CommsError
 from .resolve import Resolution
 
 
-class NoRouteToPass(CommsError):
-    """Resolved, but the answer carries nothing the seat will accept.
+class NotDeliverable(CommsError):
+    """Resolution did not produce an FQN, so there is nothing to deliver to."""
 
-    **Measured 2026-09-22.** `seat msg --agent` refuses an estate FQN:
-
-        bakehouse.agent-eco.test-claude        -> unknown-agent, exit 10
-        bakehouse.agent-eco.test-claude.main   -> unknown-agent, exit 10
-        test-claude.main                       -> resolved
-
-    The bridge between the two vocabularies is `route.local_route`, and it is
-    **null on all 32 records in the live register today**. So a resolution can
-    succeed and still leave nothing to deliver with.
-
-    This fails loudly rather than deriving a route from the FQN. Deriving would
-    be §11 exactly — a plausible value nobody declared — and it would be wrong
-    in the way that matters: `local_route` is a NAMING CHOICE the estate makes,
-    not a fact recoverable from the name. Two seats may spell the same agent
-    differently and both be right. Guessing would deliver to whatever happened
-    to match, and a message in the wrong session is worse than one that did not
-    arrive, because nobody can tell it happened.
-    """
-
-    tag = "no-route-to-pass"
+    tag = "not-deliverable"
 
 
 @dataclass
 class Plan:
-    """What comms will hand the seat, and why."""
+    """What comms hands the seat: an FQN, and the context for the record."""
 
     fqn: str
-    route: str
     seat: str
     delivery: str
     degraded: bool
@@ -56,27 +43,42 @@ class Plan:
 
 
 def plan(answer: Resolution) -> Plan:
-    """Turn a resolution into the one value `seat msg --agent` is given.
+    """Turn a resolution into the one value `seat msg --agent` is given: the FQN.
 
-    `local_route` is what the seat accepts. Nothing else is substituted for it.
+    Nothing is derived. If the directory did not name the agent, comms does not
+    invent a name for it — §11, and the failure mode is the one that matters:
+    a message delivered into the wrong session cannot be noticed by anyone.
     """
     if not answer.success:
-        raise NoRouteToPass(
-            f"{answer.status}: {answer.message or answer.requested}")
+        raise NotDeliverable(f"{answer.status}: {answer.message or answer.requested}")
 
-    if not answer.local_route:
-        raise NoRouteToPass(
-            f"'{answer.canonical_id or answer.requested}' resolved to seat "
-            f"'{answer.seat or 'unknown'}' but the record carries no "
-            "`local_route`, and `seat msg --agent` refuses an estate FQN "
-            "(measured: unknown-agent, exit 10). There is nothing to deliver "
-            "with. This is not derived from the FQN — a local route is a naming "
-            "choice the estate makes, not a fact recoverable from the name, and "
-            "a message in the wrong session is worse than one that did not "
-            "arrive. Population must author `local_route`."
+    fqn = answer.canonical_id
+    if not fqn:
+        raise NotDeliverable(
+            f"'{answer.requested}' resolved without a canonical id, so there is no "
+            "FQN to deliver to. Comms does not construct one: the estate names its "
+            "agents and this client carries the name it is given."
         )
 
-    return Plan(fqn=answer.canonical_id or answer.requested,
-                route=answer.local_route, seat=answer.seat,
-                delivery=answer.delivery, degraded=answer.degraded,
-                reason=answer.reason)
+    return Plan(fqn=fqn, seat=answer.seat, delivery=answer.delivery,
+                degraded=answer.degraded, reason=answer.reason)
+
+
+#: Delivery modes, the estate's three. `none` refuses at send; `hold` stores
+#: and never injects; `inject` goes to the session. A value outside these is
+#: REFUSED, never defaulted — the seat carries it verbatim and never reads it,
+#: so comms is the only thing that can catch a typo in it.
+INJECT, HOLD, NONE = "inject", "hold", "none"
+
+
+def permitted_to_send(mode: str) -> tuple[bool, str]:
+    """May a message be sent to an agent in this delivery mode?"""
+    if mode == NONE:
+        return False, "this agent takes no messages (delivery: none)"
+    if mode in (INJECT, HOLD):
+        return True, ""
+    return False, (
+        f"delivery mode {mode!r} is not one of {INJECT}, {HOLD}, {NONE}. Refused "
+        "rather than assumed: the seat carries this value verbatim and never reads "
+        "it, so nothing else in the estate can catch a typo in it."
+    )
