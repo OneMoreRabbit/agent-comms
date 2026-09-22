@@ -136,7 +136,8 @@ def test_a_delivery_failure_evicts_the_cached_route(directory, monkeypatch):
 
     def answering(address, payload, timeout):
         calls["n"] += 1
-        return 200, {"success": True, "status": "resolved",
+        return 200, {"kind": "resolution-result", "contract": "0.1",
+                     "success": True, "status": "resolved",
                      "canonical_id": "bakehouse.agent-eco.arch",
                      "route": {"seat": "agent-eco/arch"}, "route_revision": 12}
 
@@ -154,6 +155,7 @@ def test_a_delivery_failure_evicts_the_cached_route(directory, monkeypatch):
 def test_a_directory_answer_is_never_marked_degraded(directory, monkeypatch):
     """The label has to be true in both directions, or it means nothing."""
     monkeypatch.setattr(R, "_post", lambda *a, **k: (200, {
+        "kind": "resolution-result", "contract": "0.1",
         "success": True, "status": "resolved", "canonical_id": "bakehouse.agent-eco.arch",
         "route": {"seat": "agent-eco/arch", "host": "otter", "local_route": "arch"},
         "delivery": "inject", "route_revision": 12}))
@@ -163,3 +165,47 @@ def test_a_directory_answer_is_never_marked_degraded(directory, monkeypatch):
     assert answer.source == R.FROM_DIRECTORY
     assert answer.label().endswith("bakehouse.agent-eco.arch")
     assert answer.local_route == "arch" and answer.route_revision == 12
+
+
+def test_the_credential_file_is_the_name_the_estate_declares():
+    """`estate-directory-read`, beside `estate-directory-address`.
+
+    It was `estate-directory-token` for one commit — invented because it sounded
+    right. A wrong filename here fails SILENTLY and in the worst direction: the
+    seat reads "no credential issued" forever while the real one sits on disk
+    next to it, and every answer is degraded with nobody able to see why.
+    Constitution §11 — the estate declares this, we do not guess it.
+    """
+    assert R.CREDENTIAL_FILE.name == "estate-directory-read"
+    assert R.ADDRESS_FILE.name == "estate-directory-address"
+    assert R.CREDENTIAL_FILE.parent == R.ADDRESS_FILE.parent
+
+
+@pytest.mark.parametrize("code,expect", [
+    (404, "resolution is not being served"),
+    (426, "does not support our resolution contract"),
+    (503, "answered 503"),
+])
+def test_a_directory_that_cannot_serve_us_degrades_with_its_own_reason(
+        directory, monkeypatch, code, expect):
+    """Endpoint absent, wrong contract version and a fault are three faults.
+
+    None is retryable and none may refuse — §4a degrades and labels. They get
+    different words because they have different remedies.
+    """
+    monkeypatch.setattr(R, "_post", _refuses(code, {"error": "x"}))
+    answer = R.Resolver(local_agents=AGENTS).resolve("arch", caller="c")
+
+    assert answer.success is True
+    assert answer.source == R.FROM_CACHE
+    assert expect in answer.label()
+
+
+def test_an_unrecognised_answer_never_becomes_a_route(directory, monkeypatch):
+    """Fail closed. Reading an error body as a route is how a message goes
+    somewhere nobody chose."""
+    monkeypatch.setattr(R, "_post", _refuses(200, {"totally": "unexpected"}))
+    answer = R.Resolver(local_agents=AGENTS).resolve("arch", caller="c")
+
+    assert answer.source == R.FROM_CACHE
+    assert "not a resolution" in answer.label()

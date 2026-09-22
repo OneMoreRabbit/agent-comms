@@ -30,8 +30,13 @@ from pathlib import Path
 #: Where the orchestrator drops the directory's address. Absent = no directory
 #: configured, which is a supported deployment and not a fault (§4a: "resolve
 #: from the local config's agent set").
+#: BOTH NAMES ARE THE ESTATE'S, not ours. `estate-directory-read` was
+#: `estate-directory-token` here for one commit, invented because it sounded
+#: right — the exact §11 defect: a plausible value nobody chose, which would
+#: have read as "no credential issued" forever while one sat on disk beside it.
+#: The estate declares these in reference/estate-directory-api-v0_1.md.
 ADDRESS_FILE = Path.home() / ".secrets" / "estate-directory-address"
-CREDENTIAL_FILE = Path.home() / ".secrets" / "estate-directory-token"
+CREDENTIAL_FILE = Path.home() / ".secrets" / "estate-directory-read"
 
 #: How long a directory answer may be reused. Short on purpose: §4a allows a
 #: cache, and the DNS pattern it names relies on failure to invalidate, so the
@@ -146,6 +151,15 @@ def _post(address: str, payload: dict, timeout: float) -> tuple[int, dict]:
             return exc.code, {"error": "unreadable", "message": body[:300]}
 
 
+def _why(code: int) -> str:
+    """The reason a person needs, not the number alone."""
+    if code == 404:
+        return "resolution is not being served at this address"
+    if code == 426:
+        return "the directory does not support our resolution contract version"
+    return f"the directory answered {code}"
+
+
 class Resolver:
     """Per-send resolution, with the degraded path labelled rather than refused.
 
@@ -214,10 +228,24 @@ class Resolver:
             )
             return self._from_local(target, FROM_CACHE, "the credential was refused")
 
-        if code >= 500 or code == 426:
-            # The directory is there and cannot serve us. Same treatment as
-            # unreachable: degrade, label, never refuse.
-            return self._from_local(target, FROM_CACHE, f"the directory answered {code}")
+        if code == 404 or code == 426 or code >= 500:
+            # The directory is reachable and cannot serve this call. Same
+            # treatment as unreachable: degrade, label, never refuse, never retry.
+            #
+            # 404 means THE ENDPOINT IS NOT THERE — a different fault from a name
+            # not being known, which arrives as a `unknown` inside a served
+            # answer. Measured 2026-09-22: `/v0/resolve` IS serving; a GET of it
+            # 404s because it is POST-only, which is what a natural probe hits.
+            # Handled anyway: if resolution is ever withdrawn we degrade rather
+            # than read an error body as though it were a route.
+            return self._from_local(target, FROM_CACHE, _why(code))
+
+        if not isinstance(body, dict) or "kind" not in body:
+            # Served, but not a resolution-result. Never guess a route out of a
+            # shape we do not recognise — fail closed, degrade, say so.
+            return self._from_local(
+                target, FROM_CACHE,
+                f"the directory answered {code} with something that is not a resolution")
 
         resolution = _read(target, body)
         if resolution.success:
