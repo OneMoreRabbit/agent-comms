@@ -63,7 +63,19 @@ RETRYABLE = frozenset({NO_SESSION, UNKNOWN})
 #: totally, so seat-first breaks every seat while comms-first is impossible,
 #: because comms cannot speak a contract that does not exist yet. The gate is
 #: a SET so the estate can widen it deliberately, one major at a time, with
-#: the contract read first.
+#: the contract read first. A floor would wave through a future major that
+#: DOES break callers; an equality makes every additive major an outage.
+#:
+#: **Why 2 qualifies** (arch's ruling, and the part worth keeping): seat 2.0 is
+#: MAJOR FOR THE DEPLOYER — `agents.yml` is required and its absence fails
+#: closed, so the upgrade is not drop-in — while the CALLER surface is additive
+#: over 1.x. One version number serving two audiences. **Gate on what the
+#: number means for YOUR audience, established by reading the contract, never
+#: inferred from the digit.**
+#:
+#: The gate protects against a wrong pairing existing. Lockstep deployment —
+#: both halves of a seat upgraded in one act — prevents it existing. Both
+#: stand; neither substitutes for the other.
 SPEAKABLE_CONTRACT_MAJORS = frozenset({1, 2})
 
 
