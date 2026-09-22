@@ -209,3 +209,41 @@ def test_an_unrecognised_answer_never_becomes_a_route(directory, monkeypatch):
 
     assert answer.source == R.FROM_CACHE
     assert "not a resolution" in answer.label()
+
+
+# -- the short-name/FQN vocabulary wrinkle (arch, 2026-09-22) ------------------
+#
+# The live register spells permissions.comms.partners in SHORT seat names while
+# addressing is by FQN. Until one spelling wins, understanding only one of them
+# silently refuses half the estate.
+
+from agent_comms.directory import Directory  # noqa: E402
+
+
+def test_a_partner_matches_in_both_spellings():
+    d = Directory(project=False, partners=("agent-eco-arch",), source="test")
+    assert d.permits("agent-eco-arch", in_project=False) is True
+    assert d.permits("bakehouse.agent-eco.agent-eco-arch", in_project=False) is True
+
+
+def test_a_short_name_never_matches_across_projects():
+    """An alias never spans a project, so neither may a permission."""
+    d = Directory(project=False, partners=("bakehouse.arc-web.arch",), source="test")
+    assert d.permits("bakehouse.arc-web.arch", in_project=False) is True
+    assert d.permits("bakehouse.labs.arch", in_project=False) is False
+
+
+def test_matching_is_the_last_segment_and_never_a_prefix():
+    """`arch` must not admit `arch-shadow`. A permission that matches loosely is
+    a permission nobody declared."""
+    d = Directory(project=False, partners=("arch",), source="test")
+    assert d.permits("arch", in_project=False) is True
+    assert d.permits("arch-shadow", in_project=False) is False
+    assert d.permits("shadow-arch", in_project=False) is False
+
+
+def test_blocked_wins_in_either_spelling():
+    d = Directory(project=True, partners=("agent-eco-arch",),
+                  blocked=("agent-eco-arch",), source="test")
+    assert d.permits("agent-eco-arch", in_project=True) is False
+    assert d.permits("bakehouse.agent-eco.agent-eco-arch", in_project=True) is False
