@@ -264,3 +264,24 @@ def test_the_reason_is_not_told_twice_and_differently(directory, monkeypatch):
     assert "credential was refused" in answer.label()
     assert "credential was refused" in answer.message
     assert "did not answer" not in answer.message
+
+
+def test_no_directory_configured_is_not_degraded(monkeypatch, tmp_path):
+    """A standalone seat is a supported shape, not a fault.
+
+    Marking it degraded fires a warning on every resolution it ever makes —
+    constitution §9's "speech when it should be silent", which teaches a reader
+    to ignore the ones that matter. Only `cache` means we meant to ask the
+    directory and could not.
+    """
+    monkeypatch.setattr(R, "ADDRESS_FILE", tmp_path / "absent")
+    answer = R.Resolver(local_agents=AGENTS).resolve("arch", caller="c")
+
+    assert answer.source == R.FROM_LOCAL
+    assert answer.degraded is False
+
+
+def test_a_fallback_after_a_real_failure_IS_degraded(directory, monkeypatch):
+    """The other direction has to hold too, or the flag means nothing."""
+    monkeypatch.setattr(R, "_post", _refuses(401, {"error": "unauthenticated"}))
+    assert R.Resolver(local_agents=AGENTS).resolve("arch", caller="c").degraded is True

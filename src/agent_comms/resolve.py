@@ -79,8 +79,19 @@ class Resolution:
 
     @property
     def degraded(self) -> bool:
-        """Did this answer come from something other than the directory itself?"""
-        return self.source != FROM_DIRECTORY
+        """Did we want the directory and fail to use it?
+
+        **`local` is NOT degraded.** A seat with no directory configured is a
+        supported shape (§4a), not a fault — and marking it degraded would fire
+        a warning on every single resolution such a seat ever made. That is
+        constitution §9's "speech when it should be silent": a warning that
+        fires every time is learned into invisibility and takes the real ones
+        with it. Only `cache` is degraded: we meant to ask and could not.
+
+        Found by the seam run on test-claude, which has no directory and
+        reported every answer as degraded.
+        """
+        return self.source == FROM_CACHE
 
     @property
     def retryable(self) -> bool:
