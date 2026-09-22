@@ -247,3 +247,20 @@ def test_blocked_wins_in_either_spelling():
                   blocked=("agent-eco-arch",), source="test")
     assert d.permits("agent-eco-arch", in_project=True) is False
     assert d.permits("bakehouse.agent-eco.agent-eco-arch", in_project=True) is False
+
+
+def test_the_reason_is_not_told_twice_and_differently(directory, monkeypatch):
+    """`message` and `label()` must agree on WHY we degraded.
+
+    `message` hardcoded "the directory did not answer" while `label()` carried
+    the real cause, so a refused credential reported itself as an unreachable
+    directory — and a person would have gone looking at the network instead of
+    at their token. Found by running it against the live service; a fixture
+    would never have caught it, because a fixture agrees with itself.
+    """
+    monkeypatch.setattr(R, "_post", _refuses(401, {"error": "unauthenticated"}))
+    answer = R.Resolver(local_agents={}).resolve("nobody", caller="c")
+
+    assert "credential was refused" in answer.label()
+    assert "credential was refused" in answer.message
+    assert "did not answer" not in answer.message

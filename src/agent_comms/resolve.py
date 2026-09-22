@@ -266,8 +266,14 @@ class Resolver:
                 success=False, status="unknown", requested=target, source=source,
                 reason=reason,
                 near_misses=tuple(near[:5]),
+                # ONE source for the reason. This string used to hardcode "the
+                # directory did not answer" while `label()` carried the real
+                # cause — two places telling the story and one of them wrong,
+                # which is the exact defect we have been filing against other
+                # people's documents. Found by running it live: a refused
+                # credential reported itself as an unreachable directory.
                 message=(f"no agent or alias named '{target}' is in this seat's local "
-                         "agent set, and the directory did not answer"
+                         f"agent set, and {reason}"
                          if source == FROM_CACHE else
                          f"no agent or alias named '{target}' is configured here"),
             )
