@@ -470,12 +470,15 @@ def test_the_gate_accepts_any_major_1(monkeypatch, reported):
     assert seat_app.require_contract() == reported
 
 
-@pytest.mark.parametrize("reported", ["0.5.1", "2.0", "10.0", ""])
-def test_the_gate_refuses_anything_that_is_not_major_1(monkeypatch, reported):
-    """Pre-1.0 has no `seat msg`; major 2 may have changed terms.
+@pytest.mark.parametrize("reported", ["0.5.1", "3.0", "10.0", ""])
+def test_the_gate_refuses_anything_it_does_not_speak(monkeypatch, reported):
+    """Pre-1.0 has no `seat msg`; major 3 is a contract nobody has written.
 
     `10.0` is here for the trap the obvious fix walks into: a gate that
     STARTSWITH "1" accepts major 10, which is not major 1.
+
+    **`2.0` was in this list until 2026-09-22**, when arch ruled the gate
+    widened to speak it. The list changed, the trap did not.
     """
     import json as _json
 
@@ -490,3 +493,60 @@ def test_the_gate_refuses_anything_that_is_not_major_1(monkeypatch, reported):
     monkeypatch.setattr(seat_app.subprocess, "run", lambda *a, **k: _R())
     with pytest.raises(SeatTooOld):
         seat_app.require_contract()
+
+
+# -- the gate as a SET of majors (arch ruling, 2026-09-22) ---------------------
+
+@pytest.mark.parametrize("reported", ["1.0", "1.1", "1.1-draft", "1.2.3",
+                                      "2.0", "2.0-draft", "2.3"])
+def test_the_gate_speaks_majors_one_and_two(monkeypatch, reported):
+    """Contract 1.0 §9 set seat-then-comms because comms fails against OLDER.
+    Nothing set what happens when the seat goes NEWER by a major — and an
+    equality gate refuses it totally, so seat-first breaks every seat while
+    comms-first is impossible. Widened deliberately, one major at a time."""
+    import json as _json
+
+    class _R:
+        stdout = _json.dumps({"contract": reported}).encode()
+        stderr = b""
+        returncode = 0
+
+    monkeypatch.setattr(seat_app, "_contract_checked", None)
+    monkeypatch.setattr(seat_app.subprocess, "run", lambda *a, **k: _R())
+    assert seat_app.require_contract() == reported
+
+
+@pytest.mark.parametrize("reported", ["0.5.1", "3.0", "10.0", "", "draft", "x.y"])
+def test_the_gate_refuses_everything_else(monkeypatch, reported):
+    """`10.0` is the trap a startswith check walks into; `3.0` is a contract
+    nobody has written. Neither is guessed at."""
+    import json as _json
+
+    from agent_comms.seat import SeatTooOld
+
+    class _R:
+        stdout = _json.dumps({"contract": reported}).encode()
+        stderr = b""
+        returncode = 0
+
+    monkeypatch.setattr(seat_app, "_contract_checked", None)
+    monkeypatch.setattr(seat_app.subprocess, "run", lambda *a, **k: _R())
+    with pytest.raises(SeatTooOld):
+        seat_app.require_contract()
+
+
+def test_the_gate_is_a_set_not_a_comparison():
+    """A floor would admit a major 3 nobody has written. The estate widens this
+    one major at a time, with the contract read first."""
+    from agent_comms.seat import SPEAKABLE_CONTRACT_MAJORS
+
+    assert SPEAKABLE_CONTRACT_MAJORS == frozenset({1, 2})
+    assert 3 not in SPEAKABLE_CONTRACT_MAJORS and 0 not in SPEAKABLE_CONTRACT_MAJORS
+
+
+@pytest.mark.parametrize("spelling,major", [
+    ("2.0-draft", 2), ("1.1-draft", 1), ("10.0", 10), ("", None), ("draft", None)])
+def test_the_major_is_parsed_as_a_number(spelling, major):
+    from agent_comms.seat import _major
+
+    assert _major(spelling) == major

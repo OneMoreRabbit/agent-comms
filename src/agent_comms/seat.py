@@ -52,9 +52,19 @@ MAX_BODY_BYTES = 65536
 RETRYABLE = frozenset({NO_SESSION, UNKNOWN})
 
 
-#: The contract major this client is built against. comms 1.x speaks `seat msg`
-#: and nothing else; a pre-1.0 seat has no such command.
-REQUIRED_CONTRACT_MAJOR = "1"
+#: The contract majors this client can speak. **An explicit set, never a
+#: comparison** — ">= 1" would admit a major 3 nobody has written yet, and
+#: `startswith("1")` would admit major 10, which is not major 1.
+#:
+#: Widened to {1, 2} on arch's ruling, 2026-09-22. The reason the ordering
+#: needed a ruling at all: contract 1.0 §9 established seat-then-comms because
+#: comms fails loudly against anything OLDER. Nothing established what happens
+#: when the seat goes NEWER by a major — and an equality gate refuses it
+#: totally, so seat-first breaks every seat while comms-first is impossible,
+#: because comms cannot speak a contract that does not exist yet. The gate is
+#: a SET so the estate can widen it deliberately, one major at a time, with
+#: the contract read first.
+SPEAKABLE_CONTRACT_MAJORS = frozenset({1, 2})
 
 
 class SeatTooOld(Exception):
@@ -166,18 +176,39 @@ def require_contract(timeout: int = 20) -> str:
         payload = {}
     contract = str(payload.get("contract") or "") if isinstance(payload, dict) else ""
 
-    if not contract.split(".")[0] == REQUIRED_CONTRACT_MAJOR:
+    if _major(contract) not in SPEAKABLE_CONTRACT_MAJORS:
+        speakable = ", ".join(f"{m}.x" for m in sorted(SPEAKABLE_CONTRACT_MAJORS))
         raise SeatTooOld(
             f"this seat implements devagent-seat-contract {contract or 'an unreadable version'}, "
-            f"and agent-comms {_client_version()} requires {REQUIRED_CONTRACT_MAJOR}.x. "
-            "It has no `seat msg`, so nothing can be delivered here. Upgrade the seat "
-            "application first — seat-then-comms is the deployer's ordering — and note "
-            "that a pre-1.0 seat answers `seat msg` by printing its help and exiting 0, "
-            "so this check is the only thing that catches it."
+            f"and agent-comms {_client_version()} speaks {speakable}. Nothing can be "
+            "delivered here.\n"
+            "  Older than 1.0: the seat has no `seat msg` at all, and a pre-1.0 seat "
+            "answers it by printing its help and exiting 0 — this check is the only "
+            "thing that catches that.\n"
+            "  Newer than we speak: the contract has changed terms nobody here has read. "
+            "Widening this gate is a deliberate act after reading the new contract, never "
+            "a fallback — a client guessing at a seat's shape is exactly what the contract "
+            "removed."
         )
 
     _contract_checked = contract
     return contract
+
+
+def _major(contract: str) -> int | None:
+    """The major, as a NUMBER. `None` when it cannot be read.
+
+    Parsed rather than string-compared: `"10.0"` must not pass a check for
+    major 1, and `"2.0-draft"` must read as 2 — that is the spelling a seat
+    reports while a contract is published but not yet tagged.
+    """
+    head = contract.strip().split(".", 1)[0]
+    digits = ""
+    for ch in head:
+        if not ch.isdigit():
+            break
+        digits += ch
+    return int(digits) if digits else None
 
 
 def _client_version() -> str:
