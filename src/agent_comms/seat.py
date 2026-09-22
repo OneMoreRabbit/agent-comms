@@ -76,6 +76,14 @@ RETRYABLE = frozenset({NO_SESSION, UNKNOWN})
 #: The gate protects against a wrong pairing existing. Lockstep deployment —
 #: both halves of a seat upgraded in one act — prevents it existing. Both
 #: stand; neither substitutes for the other.
+#:
+#: **Reviewed against devagent-seat-contract 2.0-draft, 2026-09-22**, not
+#: against a summary of it. Two things checked, both hold: the caller surface
+#: is additive over 1.x (§0), and the deployer-side break surfaces as `broken`
+#: — the status-word set is IDENTICAL between 1.1 and 2.0, so nothing falls
+#: through our handler. `broken` already needs a person and does not consume a
+#: delivery attempt, so mail is not stranded during a missing-agents.yml
+#: window. That window is the stranding agent-skeleton measured the same day.
 SPEAKABLE_CONTRACT_MAJORS = frozenset({1, 2})
 
 
