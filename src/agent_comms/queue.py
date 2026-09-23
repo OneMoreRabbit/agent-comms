@@ -145,11 +145,38 @@ class Queue:
         self.max_age = max_age
         self.max_per_pass = max_per_pass
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(self.path, isolation_level=None)
-        self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.execute("PRAGMA foreign_keys=ON")
-        self.db.executescript(SCHEMA)
+        with self._open() as db:
+            db.executescript(SCHEMA)
+
+    def _open(self) -> sqlite3.Connection:
+        """A FRESH connection, per operation. **Never a long-lived one.**
+
+        Measured in production 2026-09-23: a daemon holding one connection for
+        hours had its `-wal` and `-shm` unlinked underneath it by short-lived
+        CLI connections closing — `/proc/<pid>/fd` showed both as `(deleted)`.
+        Its writes went into a WAL that no longer existed on disk: delivery
+        succeeded, `wake` logged it, and the store never saw the message.
+
+        That is the September conflation in a new costume — a message the seat
+        took and the record does not have — so the cure is not a repair path
+        but removing the state that can go stale. SQLite opens are cheap; a
+        connection that outlives the file it points at is not.
+        """
+        db = sqlite3.connect(self.path, isolation_level=None, timeout=10.0)
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("PRAGMA foreign_keys=ON")
+        return db
+
+    @property
+    def db(self) -> sqlite3.Connection:
+        """Compatibility for call sites that reach for `.db` directly.
+
+        Each access is its own connection and is closed by garbage collection.
+        Anything doing more than one statement should use `_open()` in a
+        `with` block so the whole unit shares one.
+        """
+        return self._open()
 
     # -- writing ------------------------------------------------------------
 
@@ -174,15 +201,23 @@ class Queue:
         return message
 
     def _log(self, message: int, was: str, became: str, cause: str,
-             rule: str = "", attempt: int | None = None) -> None:
-        self.db.execute(
+             rule: str = "", attempt: int | None = None, db=None) -> None:
+        (db or self.db).execute(
             "INSERT INTO transitions (message, at, was, became, cause, rule, attempt)"
             " VALUES (?,?,?,?,?,?,?)", (message, _now(), was, became, cause, rule, attempt))
 
     def move(self, message: int, to: str, cause: str, *, rule: str = "",
-             attempt: int | None = None) -> None:
-        """One forward transition, with its reason. Refuses to go backwards."""
-        row = self.db.execute("SELECT state FROM messages WHERE id=?", (message,)).fetchone()
+             attempt: int | None = None, db=None) -> None:
+        """One forward transition, with its reason. Refuses to go backwards.
+
+        `db` carries the CALLER'S connection when it is already inside a
+        transaction. Opening a second one there would block on the write lock
+        this call is itself holding — a deadlock against yourself, which is the
+        price of per-operation connections and is paid here rather than by
+        every caller.
+        """
+        conn = db or self.db
+        row = conn.execute("SELECT state FROM messages WHERE id=?", (message,)).fetchone()
         if row is None:
             raise ForwardOnly(f"no message {message}")
         was = row["state"]
@@ -191,8 +226,8 @@ class Queue:
                 f"message {message} is `{was}` and cannot become `{to}`. States only move "
                 "forward — a store that moves backwards cannot be trusted as evidence, "
                 "and this store is what the last incident was reconstructed from.")
-        self.db.execute("UPDATE messages SET state=? WHERE id=?", (to, message))
-        self._log(message, was, to, cause, rule, attempt)
+        conn.execute("UPDATE messages SET state=? WHERE id=?", (to, message))
+        self._log(message, was, to, cause, rule, attempt, db=conn)
 
     def record_attempt(self, message: int, *, delivered: bool, detail: str,
                        consumes_attempt: bool = True) -> None:
@@ -203,9 +238,9 @@ class Queue:
         because the counter, the state and the transition row all land together
         or none of them do.
         """
-        with self.db:                                   # BEGIN ... COMMIT
-            self.db.execute("BEGIN")
-            row = self.db.execute(
+        with self._open() as db:                        # one unit of work
+            db.execute("BEGIN")
+            row = db.execute(
                 "SELECT state, attempts FROM messages WHERE id=?", (message,)).fetchone()
             if row is None:
                 raise ForwardOnly(f"no message {message}")
@@ -223,20 +258,20 @@ class Queue:
             # it, so it cannot wait forever.
             attempts = int(row["attempts"]) + (1 if consumes_attempt else 0)
             if consumes_attempt:
-                self.db.execute("UPDATE messages SET attempts=? WHERE id=?",
-                                (attempts, message))
+                db.execute("UPDATE messages SET attempts=? WHERE id=?",
+                           (attempts, message))
             if delivered:
-                self.move(message, DELIVERED, detail, attempt=attempts)
+                self.move(message, DELIVERED, detail, attempt=attempts, db=db)
             else:
                 self._log(message, row["state"], row["state"],
                           (f"attempt {attempts} failed: {detail}" if consumes_attempt else
                            f"not attemptable: {detail} — a person must act; "
                            "no attempt consumed, the message stays queued"),
-                          attempt=attempts if consumes_attempt else None)
+                          attempt=attempts if consumes_attempt else None, db=db)
                 if consumes_attempt and attempts >= self.max_attempts:
                     self.move(message, ABANDONED,
                               f"{attempts} attempts reached", rule="max_attempts",
-                              attempt=attempts)
+                              attempt=attempts, db=db)
 
     def record_wake(self, message: int | None, outcome: str, detail: str = "") -> None:
         """A wake is not a message state. Recorded here and nowhere else.
