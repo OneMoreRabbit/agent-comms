@@ -82,3 +82,57 @@ def permitted_to_send(mode: str) -> tuple[bool, str]:
         "rather than assumed: the seat carries this value verbatim and never reads "
         "it, so nothing else in the estate can catch a typo in it."
     )
+
+
+# -- R15: transport defaults derived from the FQN -----------------------------
+#
+# **Empty `transports` is the NORMAL case, not a gap.** Measured on the live
+# directory: our agents answer `"transports": {}`. The design's rule is
+# "defaults are derived, exceptions are declared", so deriving is what makes
+# delivery work at all — the directory only speaks up where reality differs.
+
+def transport_for(fqn: str, declared: dict | None = None) -> dict:
+    """Where a message to this FQN is posted, and as whom.
+
+    `<estate>.<project>.<agent>` carries the routing rule: **project is the
+    channel, agent is the bot**. A declared `transports.comms` block overrides
+    either or both, and a partial override overrides only what it names —
+    an exception that had to restate the defaults would drift from them.
+
+    Raises on an FQN we cannot read rather than posting somewhere derived from
+    a guess. A message in the wrong channel is not a failed delivery; it is a
+    successful delivery to the wrong audience, which nobody notices.
+    """
+    override = ((declared or {}).get("comms") or {})
+    parts = fqn.strip().split(".")
+    if len(parts) != 3 or not all(parts):
+        if override.get("channel") and override.get("bot"):
+            return {"channel": override["channel"], "bot": override["bot"]}
+        raise NotDeliverable(
+            f"cannot derive a transport from {fqn!r}: an FQN is "
+            "<estate>.<project>.<agent>, three non-empty dot-separated segments. "
+            "Nothing is guessed — a message posted to a derived-from-nonsense "
+            "channel is not a failed delivery, it is a successful delivery to the "
+            "wrong audience, and nobody notices that."
+        )
+    _estate, project, agent = parts
+    return {"channel": override.get("channel") or project,
+            "bot": override.get("bot") or agent}
+
+
+#: **Caller-relative shorthands are never resolvable here** (arch ruling,
+#: 2026-09-22, restated 2026-09-23). Two sets, only one authored:
+#:
+#: - **Estate-scoped** names — `orchestrator`, `atlas` — have exactly one
+#:   referent estate-wide and ARE authored as aliases. The directory resolves
+#:   them.
+#: - **Caller-relative** shorthands — bare `arch`, bare `product`,
+#:   `<project>:arch` — are NEVER authored, because `arch` exists in nine
+#:   projects and the right one depends on WHO ASKS. A global alias would
+#:   resolve eight of them wrongly.
+#:
+#: So this client derives against FQNs and authored aliases only, and never
+#: against a shorthand. 0.2 answering `unknown` for bare `arch` is the correct
+#: interim until the resolver's caller-relative logic exists — not a gap, and
+#: not ours to paper over by guessing the caller's project.
+CALLER_RELATIVE_NEVER_AUTHORED = True

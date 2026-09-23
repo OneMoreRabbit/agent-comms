@@ -68,3 +68,53 @@ def test_an_unknown_delivery_mode_is_refused_never_defaulted(typo):
     ok, why = permitted_to_send(typo)
     assert ok is False
     assert "not one of" in why
+
+
+# -- R15: transports derived from the FQN -------------------------------------
+
+def test_project_is_the_channel_and_agent_is_the_bot():
+    """Measured: the live directory answers `transports: {}` for our agents.
+    Empty is the NORMAL case — defaults derived, exceptions declared — so
+    deriving is what makes delivery work at all."""
+    from agent_comms.delivery import transport_for
+
+    assert transport_for("bakehouse.arc-web.review") == {"channel": "arc-web", "bot": "review"}
+    assert transport_for("bakehouse.agent-eco.agent-comms") == {
+        "channel": "agent-eco", "bot": "agent-comms"}
+
+
+def test_a_declared_block_overrides_only_what_it_names():
+    """A partial exception that had to restate the defaults would drift from them."""
+    from agent_comms.delivery import transport_for
+
+    assert transport_for("bakehouse.arc-web.review",
+                         {"comms": {"bot": "arc-web-review"}}) == {
+        "channel": "arc-web", "bot": "arc-web-review"}
+    assert transport_for("bakehouse.arc-web.review",
+                         {"comms": {"channel": "arc-web-private"}}) == {
+        "channel": "arc-web-private", "bot": "review"}
+
+
+@pytest.mark.parametrize("bad", ["arch", "arc-web:arch", "a.b", "a.b.c.d", "bakehouse..arch", ""])
+def test_a_name_we_cannot_read_is_never_guessed_at(bad):
+    """A message posted to a derived-from-nonsense channel is not a failed
+    delivery — it is a SUCCESSFUL delivery to the wrong audience, and nobody
+    notices that.
+
+    `arch` and `arc-web:arch` are here deliberately: caller-relative shorthands
+    are NEVER authored as aliases (arch exists in nine projects; the right one
+    depends on who asks), so they must never be derivable here either.
+    """
+    from agent_comms.delivery import NotDeliverable, transport_for
+
+    with pytest.raises(NotDeliverable):
+        transport_for(bad)
+
+
+def test_a_full_override_rescues_an_unreadable_name():
+    """If the estate declared both halves explicitly, nothing is being derived,
+    so there is nothing to refuse."""
+    from agent_comms.delivery import transport_for
+
+    assert transport_for("weird", {"comms": {"channel": "c", "bot": "b"}}) == {
+        "channel": "c", "bot": "b"}
