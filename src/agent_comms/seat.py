@@ -148,6 +148,16 @@ class Delivery:
             return False
         if self.status == FAILED:
             return self.exit_code != 2
+        if self.exit_code == 30:
+            # **BRANCH ON THE EXIT CODE, NOT THE WORD, FOR "CANNOT TELL".**
+            # 30 means the seat could not find out, and the contract's own
+            # guarantee is that a consumer branching on exit codes needs no
+            # change when status words are added. Measured 2026-09-23: a 2.0
+            # seat answered `unresolved` — a word in NO published contract —
+            # at exit 30, saying in its own message "Retryable — the message
+            # is still yours". Matching on the word alone, we did not retry it.
+            # A new word at a known code must not silently become permanent.
+            return True
         return self.status in RETRYABLE
 
     @property

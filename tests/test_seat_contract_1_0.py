@@ -645,3 +645,26 @@ def test_retired_mail_is_kept_and_readable(seat, monkeypatch):
     row = store.all()[0]
     assert row.content == "m0", "the message was destroyed, not retired"
     assert row.retired and row.delivered is True
+
+
+def test_an_unknown_status_word_at_exit_30_is_still_retried():
+    """MEASURED on a 2.0 seat, 2026-09-23: it answered `unresolved` — a word in
+    no published contract — at exit 30, and said in its own message "Retryable".
+
+    Matching on the word alone, we did not retry it: a message that could have
+    landed would have sat forever. Exit codes are the contract's stable surface
+    and its stated guarantee is that a consumer branching on them needs no
+    change when words are added. So 30 is read as 30.
+    """
+    d = seat_app._parse(_answer(status="unresolved",
+                                message="could not resolve: the answer carries no "
+                                        "seat_local_id. Retryable — the message is still yours."),
+                        b"", 30)
+    assert d.retryable is True
+    assert d.needs_a_person is False
+
+
+def test_an_unknown_word_at_exit_20_still_needs_a_person():
+    """The other direction has to hold, or the rule is just optimism."""
+    d = seat_app._parse(_answer(status="some-new-word"), b"", 20)
+    assert d.retryable is False
