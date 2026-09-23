@@ -322,7 +322,7 @@ def test_project_named_credential_still_works(seat):
 def test_daemon_resumes_a_stored_queue_rather_than_re_registering(seat):
     """Re-registering when a queue was held silently forfeits the gap."""
     from agent_comms.store import Store
-    store = Store(seat / ".comms")
+    store = operations.message_store(seat / ".comms")
     store.save_position("q-existing", 42)
     transport = FakeTransport()
     operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
@@ -437,7 +437,7 @@ def test_lock_is_released_when_the_holder_goes(seat):
     """An flock dies with the process, so a killed daemon leaves nothing to clear."""
     from agent_comms.store import Store
 
-    store = Store(seat / ".comms")
+    store = operations.message_store(seat / ".comms")
     store.acquire_daemon_lock().close()
     operations.run_daemon(transport_factory=lambda c: FakeTransport(), max_iterations=1)
 
@@ -612,6 +612,8 @@ def test_stop_waits_for_the_lock_not_the_signal(seat, monkeypatch):
     """
     from agent_comms.store import Store
 
+    # Store, not the message store: this test is about the daemon LOCK, which
+    # lives in its own file and was never part of the message store.
     store = Store(seat / ".comms")
     held = store.acquire_daemon_lock()
     polls = {"n": 0}
@@ -850,7 +852,7 @@ def test_last_message_id_is_the_durable_marker(seat):
     """last_event_id dies with the queue; a message id does not."""
     from agent_comms.store import Store
 
-    store = Store(seat / ".comms")
+    store = operations.message_store(seat / ".comms")
     assert store.last_message_id() == 0
     transport = HistoryTransport(event_batches=[{"result": "success", "events": [
         {"id": 1, "type": "message", "flags": ["mentioned"],
@@ -865,7 +867,7 @@ def test_a_lost_queue_no_longer_loses_messages(seat):
     from agent_comms.errors import QueueGapError
     from agent_comms.store import Store
 
-    store = Store(seat / ".comms")
+    store = operations.message_store(seat / ".comms")
     transport = HistoryTransport(
         history=[_history_msg(601, 10), _history_msg(602, 11)],
         event_batches=[{"result": "success", "events": [
@@ -888,7 +890,7 @@ def test_the_anchor_message_is_not_handled_twice(seat):
     """`anchor` is inclusive. Re-handling it would re-notify the agent."""
     from agent_comms.store import Store
 
-    store = Store(seat / ".comms")
+    store = operations.message_store(seat / ".comms")
     transport = HistoryTransport(
         history=[_history_msg(700, 10)],
         event_batches=[{"result": "success", "events": [
@@ -908,7 +910,7 @@ def test_a_fresh_seat_does_not_replay_all_history(seat):
     """Backfilling from id 0 would notify the agent about every message ever sent."""
     from agent_comms.store import Store
 
-    store = Store(seat / ".comms")
+    store = operations.message_store(seat / ".comms")
     transport = HistoryTransport(history=[_history_msg(i, 1) for i in range(800, 900)])
     hub = operations.Hub(transport, operations.load_settings(),
                          operations.load_credential(operations.load_settings().identity))
@@ -923,7 +925,7 @@ def test_the_backstop_catches_a_queue_that_stopped_delivering(seat, monkeypatch)
 
     from agent_comms.store import Store
 
-    store = Store(seat / ".comms")
+    store = operations.message_store(seat / ".comms")
     old = _time.time() - 600  # comfortably past MISSED_AFTER_SECS
     transport = HistoryTransport(
         history=[_history_msg(901, old)],
@@ -949,7 +951,7 @@ def test_the_backstop_does_not_cry_wolf_on_a_timing_race(seat, monkeypatch):
 
     from agent_comms.store import Store
 
-    store = Store(seat / ".comms")
+    store = operations.message_store(seat / ".comms")
     transport = HistoryTransport(
         history=[_history_msg(1001, _time.time())],  # just now
         event_batches=[{"result": "success", "events": [
@@ -976,7 +978,7 @@ def test_a_losing_daemon_does_not_erase_the_winners_pid(seat):
     from agent_comms.errors import DaemonAlreadyRunning
     from agent_comms.store import Store
 
-    store = Store(seat / ".comms")
+    store = operations.message_store(seat / ".comms")
     held = store.acquire_daemon_lock()
     try:
         recorded = (seat / ".comms" / "daemon.lock").read_text().strip()
@@ -1007,7 +1009,7 @@ def test_empty_lock_does_not_stop_stop_from_working(seat, monkeypatch):
     """
     from agent_comms.store import Store
 
-    store = Store(seat / ".comms")
+    store = operations.message_store(seat / ".comms")
     held = store.acquire_daemon_lock()
     holder = int((seat / ".comms" / "daemon.lock").read_text())
     (seat / ".comms" / "daemon.lock").write_text("")  # the defect, exactly
@@ -1030,7 +1032,7 @@ def test_status_names_the_pid_when_the_lock_file_is_empty(seat):
     """`running (pid None)` is the state that makes a person reach for pkill."""
     from agent_comms.store import Store
 
-    store = Store(seat / ".comms")
+    store = operations.message_store(seat / ".comms")
     held = store.acquire_daemon_lock()
     try:
         expected = int((seat / ".comms" / "daemon.lock").read_text())
@@ -1049,7 +1051,7 @@ def test_lock_holder_is_never_guessed(seat, monkeypatch):
 
     from agent_comms.store import Store
 
-    store = Store(seat / ".comms")
+    store = operations.message_store(seat / ".comms")
     store.ensure()
     monkeypatch.setattr(Path, "read_text",
                         lambda self, *a, **k: (_ for _ in ()).throw(OSError("no /proc/locks")))

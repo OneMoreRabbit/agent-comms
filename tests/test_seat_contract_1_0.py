@@ -212,7 +212,7 @@ def test_a_held_message_stays_queued_and_is_retried(seat, monkeypatch):
     from agent_comms.store import Store
     from tests.conftest import FakeTransport
 
-    store = Store(seat / ".comms")
+    store = operations.message_store(seat / ".comms")
     transport = FakeTransport(event_batches=[{"result": "success", "events": [
         {"id": 1, "type": "message", "flags": ["mentioned"], "message": {
             "id": 500, "sender_full_name": "agent-eco-arch", "display_recipient": "agent-eco",
@@ -241,7 +241,7 @@ def test_retry_stops_at_the_first_message_that_will_not_land(seat, monkeypatch):
     from agent_comms.store import Store
     from agent_comms.store import Mention
 
-    store = Store(seat / ".comms")
+    store = operations.message_store(seat / ".comms")
     for mid in (10, 11, 12):
         store.append(Mention(id=mid, sender="agent-eco-arch", channel="agent-eco",
                              topic="t", content="x", timestamp=NOW, permalink="",
@@ -258,7 +258,7 @@ def test_a_broken_seat_is_not_hammered(seat, monkeypatch):
     from agent_comms import operations
     from agent_comms.store import Mention, Store
 
-    store = Store(seat / ".comms")
+    store = operations.message_store(seat / ".comms")
     store.append(Mention(id=20, sender="agent-eco-arch", channel="agent-eco", topic="t",
                          content="x", timestamp=NOW, permalink="", reason="mentioned"))
     calls = {"n": 0}
@@ -283,7 +283,7 @@ def test_a_permanently_failing_message_stops_being_retried(seat, monkeypatch):
     from agent_comms import operations
     from agent_comms.store import Mention, Store
 
-    store = Store(seat / ".comms")
+    store = operations.message_store(seat / ".comms")
     store.append(Mention(id=30, sender="agent-eco-arch", channel="agent-eco", topic="t",
                          content="x", timestamp=NOW, permalink="", reason="mentioned"))
     fake_seat(monkeypatch, {"success": False, "status": "failed",
@@ -587,7 +587,7 @@ def test_nothing_past_the_age_bound_is_ever_attempted(seat, monkeypatch):
     current, which is what makes it dangerous."""
     from agent_comms.store import Store
 
-    store = Store(seat / ".comms")
+    store = operations.message_store(seat / ".comms")
     _old(store, 5, 48 * 3600)
     attempted = []
     monkeypatch.setattr(operations, "wake", lambda m: attempted.append(m["id"]))
@@ -605,7 +605,7 @@ def test_a_backlog_is_capped_at_three_newest_per_pass(seat, monkeypatch):
     """THE FLOOD, BOUNDED. Twenty per pass was the old behaviour."""
     from agent_comms.store import Store
 
-    store = Store(seat / ".comms")
+    store = operations.message_store(seat / ".comms")
     _old(store, 20, 60)                       # fresh, so the age bound does not apply
     delivered = []
 
@@ -642,7 +642,7 @@ def test_retired_mail_is_kept_and_readable(seat, monkeypatch):
     conflating them is what made the 1.0.0 store ambiguous to migrate."""
     from agent_comms.store import Store
 
-    store = Store(seat / ".comms")
+    store = operations.message_store(seat / ".comms")
     _old(store, 1, 48 * 3600)
     monkeypatch.setattr(operations, "wake", lambda m: None)
     operations.retry_undelivered(transport_factory=lambda c: FakeTransport())
@@ -695,7 +695,7 @@ def test_the_reading_surface_reports_honest_states(seat):
     both — delivered is the bookkeeping, retired is the fact nobody saw it."""
     from agent_comms.store import Mention, Store
 
-    store = Store(seat / ".comms")
+    store = operations.message_store(seat / ".comms")
     store.append(Mention(id=1, sender="s", channel="c", topic="t", content="x",
                          timestamp=NOW, permalink="", delivered=True, retired="too old"))
     store.append(Mention(id=2, sender="s", channel="c", topic="t", content="x",
@@ -715,7 +715,7 @@ def test_trace_says_when_something_is_not_recorded(seat):
     """Trace ends arguments, so it must not imply an absence is a fact."""
     from agent_comms.store import Mention, Store
 
-    Store(seat / ".comms").append(Mention(id=7, sender="arch", channel="agent-eco",
+    operations.message_store(seat / ".comms").append(Mention(id=7, sender="arch", channel="agent-eco",
                                           topic="t", content="x", timestamp=NOW,
                                           permalink="", authorised=False))
     out = "\n".join(operations.trace(7))

@@ -215,3 +215,17 @@ def test_a_broken_window_cannot_hold_a_message_forever(q):
 
     assert q.retire().expired == 1
     assert q.state_of(m) == EXPIRED
+
+
+def test_the_permalink_is_stored_not_discarded(q):
+    """`receive` accepted a permalink and threw it away — a phantom parameter,
+    the exact class this client spends its time flagging elsewhere.
+
+    It matters because the permalink is how chat cites the record: a stored
+    message nobody can cite is a message that cannot be pointed at in a
+    post-mortem, which is what the store is FOR.
+    """
+    m = q.receive(hub_id="1", sender="arch", body="x",
+                  permalink="https://hub/#narrow/channel/5-agent-eco/topic/t/near/1")
+    row = q.db.execute("SELECT permalink FROM messages WHERE id=?", (m,)).fetchone()
+    assert row["permalink"].endswith("/near/1")

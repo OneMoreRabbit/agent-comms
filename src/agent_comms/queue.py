@@ -70,7 +70,12 @@ CREATE TABLE IF NOT EXISTS messages (
     received_at TEXT    NOT NULL,
     state       TEXT    NOT NULL,
     attempts    INTEGER NOT NULL DEFAULT 0,
-    permalink   TEXT    NOT NULL DEFAULT ''
+    permalink   TEXT    NOT NULL DEFAULT '',
+    channel     TEXT    NOT NULL DEFAULT '',
+    reason      TEXT    NOT NULL DEFAULT 'mentioned',
+    read_at     TEXT,
+    retired_reason TEXT NOT NULL DEFAULT '',
+    received_at_epoch INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS transitions (
     id       INTEGER PRIMARY KEY,
@@ -158,9 +163,9 @@ class Queue:
         now = received_at or _now()
         cur = self.db.execute(
             "INSERT OR IGNORE INTO messages"
-            " (seq, hub_id, sender, agent, subject, body, received_at, state)"
-            " VALUES ((SELECT COALESCE(MAX(seq),0)+1 FROM messages),?,?,?,?,?,?,?)",
-            (hub_id, sender, agent, subject, body, now, RECEIVED))
+            " (seq, hub_id, sender, agent, subject, body, received_at, state, permalink)"
+            " VALUES ((SELECT COALESCE(MAX(seq),0)+1 FROM messages),?,?,?,?,?,?,?,?)",
+            (hub_id, sender, agent, subject, body, now, RECEIVED, permalink))
         if cur.rowcount == 0:
             return int(self.db.execute(
                 "SELECT id FROM messages WHERE hub_id=?", (hub_id,)).fetchone()["id"])
@@ -310,3 +315,162 @@ class Queue:
         """For `comms stats --json`: counts by state, for the estate to poll."""
         return {r["state"]: int(r["n"]) for r in self.db.execute(
             "SELECT state, COUNT(*) n FROM messages GROUP BY state")}
+
+
+# -- the daemon's store, SQLite underneath -----------------------------------
+
+class MessageStore(Queue):
+    """The message store the daemon and CLI use. SQLite, Mention-shaped.
+
+    **One store, not two.** This is the migration: the JSONL file stops being
+    the store of record and becomes what it always was underneath — a backup —
+    while every read and write goes through the states in §3.
+
+    It keeps the `Store` message API deliberately. Seventeen call sites read
+    and write messages; rewriting all of them in one act, days after an
+    incident, is how a migration becomes a second incident. The interface is
+    the seam, so the interface is what stays still.
+
+    Daemon liveness, queue position and the event log are NOT here. They are
+    different facts in different files and were never part of the message
+    store; moving them would be scope, not migration.
+    """
+
+    #: The JSONL store carried daemon liveness, queue position and the event
+    #: log alongside messages. Those are different facts in different files and
+    #: were never part of the message store, so they stay where they are and
+    #: this delegates rather than reimplementing them. Moving them would be
+    #: scope, not migration.
+    def _side(self):
+        from .store import Store
+        return Store(self.path.parent)
+
+    def ensure(self):
+        return self._side().ensure()
+
+    def daemon_state(self):
+        return self._side().daemon_state()
+
+    def acquire_daemon_lock(self):
+        return self._side().acquire_daemon_lock()
+
+    def lock_holder_pid(self):
+        return self._side().lock_holder_pid()
+
+    def save_position(self, queue_id, last_event_id):
+        return self._side().save_position(queue_id, last_event_id)
+
+    def load_position(self):
+        return self._side().load_position()
+
+    def last_message_id(self) -> int:
+        row = self.db.execute("SELECT MAX(CAST(hub_id AS INTEGER)) m FROM messages").fetchone()
+        return int(row["m"] or 0)
+
+    def record(self, level, message):
+        return self._side().record(level, message)
+
+    def sleeping(self):
+        return self._side().sleeping()
+
+    def set_sleeping(self, value):
+        return self._side().set_sleeping(value)
+
+    def unreachable(self):
+        return self._side().unreachable()
+
+    def set_unreachable(self, value):
+        return self._side().set_unreachable(value)
+
+    def _to_mention(self, row) -> "Mention":
+        from .store import Mention
+
+        state = row["state"]
+        return Mention(
+            id=row["hub_id"] and int(row["hub_id"]) or row["id"],
+            sender=row["sender"], channel=row["channel"], topic=row["subject"],
+            content=row["body"], timestamp=int(row["received_at_epoch"] or 0),
+            permalink=row["permalink"], read=bool(row["read_at"]),
+            reason=row["reason"] or "mentioned",
+            delivered=state in (DELIVERED, RETRIEVED, REFUSED, EXPIRED, ABANDONED),
+            attempts=int(row["attempts"]),
+            authorised=state != REFUSED,
+            retired=row["retired_reason"] or "",
+        )
+
+    def _rows(self):
+        return self.db.execute("SELECT * FROM messages ORDER BY seq").fetchall()
+
+    def append(self, mention) -> None:
+        """Store one arrival. Idempotent on the hub id, as `receive` is."""
+        mid = self.receive(hub_id=str(mention.id), sender=mention.sender,
+                           body=mention.content, subject=mention.topic,
+                           permalink=mention.permalink,
+                           received_at=datetime.fromtimestamp(
+                               mention.timestamp, tz=timezone.utc).isoformat(timespec="seconds"))
+        self.db.execute("UPDATE messages SET channel=?, reason=?, received_at_epoch=? WHERE id=?",
+                        (mention.channel, mention.reason, mention.timestamp, mid))
+        if self.state_of(mid) != RECEIVED:
+            return
+        if not mention.authorised:
+            self.move(mid, REFUSED, "sender not permitted", rule="directory")
+        elif mention.retired:
+            # Arrives already retired — an import, or a caller that has decided.
+            # Honour it rather than queueing something nobody intends to deliver.
+            self.move(mid, EXPIRED, mention.retired, rule="retired")
+            self.db.execute("UPDATE messages SET retired_reason=? WHERE id=?",
+                            (mention.retired, mid))
+        elif mention.delivered:
+            self.move(mid, QUEUED, "permitted")
+            self.record_attempt(mid, delivered=True, detail="already delivered on arrival")
+        else:
+            self.move(mid, QUEUED, "permitted")
+
+    def all(self) -> list:
+        return [self._to_mention(r) for r in self._rows()]
+
+    def unread(self) -> list:
+        return [m for m in self.all() if not m.read]
+
+    def undelivered(self) -> list:
+        return [m for m in self.all() if not m.delivered]
+
+    def _find(self, hub_id: int):
+        return self.db.execute("SELECT * FROM messages WHERE hub_id=?",
+                               (str(hub_id),)).fetchone()
+
+    def mark_delivered(self, message_id: int) -> bool:
+        row = self._find(message_id)
+        if row is None:
+            return False
+        if row["state"] in (QUEUED, RECEIVED):
+            self.record_attempt(row["id"], delivered=True, detail="delivered")
+        elif row["state"] == HELD:
+            self.move(row["id"], RETRIEVED, "the agent read it")
+        return True
+
+    def mark_read(self, message_id: int) -> bool:
+        row = self._find(message_id)
+        if row is None:
+            return False
+        self.db.execute("UPDATE messages SET read_at=? WHERE id=?", (_now(), row["id"]))
+        return True
+
+    def mark_retired(self, message_id: int, reason: str) -> bool:
+        row = self._find(message_id)
+        if row is None:
+            return False
+        if row["state"] in (RECEIVED, QUEUED, HELD):
+            self.move(row["id"], EXPIRED, reason, rule="retired")
+        self.db.execute("UPDATE messages SET retired_reason=? WHERE id=?", (reason, row["id"]))
+        return True
+
+    def record_attempt_for(self, message_id: int) -> int:
+        """`Store.record_attempt(id) -> count`, kept by name for its callers."""
+        row = self._find(message_id)
+        if row is None:
+            return 0
+        attempts = int(row["attempts"]) + 1
+        self.db.execute("UPDATE messages SET attempts=? WHERE id=?", (attempts, row["id"]))
+        self._log(row["id"], row["state"], row["state"], f"attempt {attempts}", attempt=attempts)
+        return attempts

@@ -43,6 +43,32 @@ from .seat import _client_version
 from .seat import state as seat_state_now
 from .wake import WakeError, wake
 from .store import DaemonState, Mention, Store
+from .queue import MessageStore
+
+
+def message_store(state_dir) -> MessageStore:
+    """The store of record for messages. **SQLite, since 2.0.**
+
+    The JSONL file stops being the store and becomes what it always was
+    underneath — the backup. On first use its contents are imported once, with
+    the two refusals to guess that migration documents: a message refused by
+    the permission graph imports as `refused` whatever its delivered flag says,
+    and an undelivered one imports as `expired` rather than being assumed
+    either way.
+
+    Import happens HERE rather than in a deploy step because a migration a
+    person has to remember is a migration that gets skipped on the seat nobody
+    was watching.
+    """
+    store = MessageStore(Path(state_dir) / "comms.db")
+    marker = Path(state_dir) / ".imported-from-jsonl"
+    source = Path(state_dir) / "messages.jsonl"
+    if not marker.exists() and source.exists():
+        from .migrate import import_jsonl
+        out = import_jsonl(source, store)
+        marker.write_text(out.report(source, store.path), encoding="utf-8")
+    return store
+
 
 
 @dataclass
@@ -459,13 +485,13 @@ def mention_from_event(
 
 def inbox(unread_only: bool = True, **kw) -> list[Mention]:
     settings = load_settings(**kw)
-    store = Store(settings.state_dir)
+    store = message_store(settings.state_dir)
     return store.unread() if unread_only else store.all()
 
 
 def show(message_id: int, **kw) -> Mention | None:
     settings = load_settings(**kw)
-    store = Store(settings.state_dir)
+    store = message_store(settings.state_dir)
     for m in store.all():
         if m.id == message_id:
             store.mark_read(message_id)
@@ -725,7 +751,7 @@ def reply(
 ) -> dict:
     """Reply in the mention's own topic, so the conversation stays one thread."""
     settings = load_settings(**kw)
-    store = Store(settings.state_dir)
+    store = message_store(settings.state_dir)
     target = next((m for m in store.all() if m.id == message_id), None)
     if target is None:
         raise CommsError(f"no message {message_id} in the local store")
@@ -764,7 +790,7 @@ def wake_agent(
       malformed call repeated is how a bug becomes a flood.
     """
     settings = load_settings(**kw)
-    store = Store(settings.state_dir)
+    store = message_store(settings.state_dir)
     store.ensure()
     mid = mention.get("id")
 
@@ -931,7 +957,7 @@ def retry_undelivered(
     one it will not take the next either.
     """
     settings = load_settings(**kw)
-    store = Store(settings.state_dir)
+    store = message_store(settings.state_dir)
 
     retired = retire_stale(store, max_age_secs)
     waiting = [m for m in store.undelivered() if m.authorised]
@@ -953,7 +979,7 @@ def retry_undelivered(
             result = wake(asdict(mention))
         except WakeError:
             break  # the seat is not reachable at all; nothing else will land either
-        attempts = store.record_attempt(mention.id)
+        attempts = store.record_attempt_for(mention.id)
         if not result.success:
             if not result.retryable:
                 # broken, or our own usage error. Leave it stored and stop: both
@@ -1114,7 +1140,7 @@ def detach_daemon(log_path: str | None = None, **kw) -> int:
     saying so plainly is better than a half-restarter that hides the gap.
     """
     settings = load_settings(**kw)
-    store = Store(settings.state_dir)
+    store = message_store(settings.state_dir)
     store.ensure()
 
     state = store.daemon_state()
@@ -1175,7 +1201,7 @@ def stop_daemon(timeout: float = 10.0, **kw) -> tuple[bool, int | None]:
     `DaemonWillNotStop` rather than returning a hopeful answer.
     """
     settings = load_settings(**kw)
-    store = Store(settings.state_dir)
+    store = message_store(settings.state_dir)
     store.ensure()
 
     state = store.daemon_state()
@@ -1297,7 +1323,7 @@ def supervise_daemon(
     `max_restarts` bounds the loop for tests; unbounded in a seat.
     """
     settings = load_settings(**kw)
-    store = Store(settings.state_dir)
+    store = message_store(settings.state_dir)
     store.ensure()
 
     restarts, delay = 0, backoff_start
@@ -1381,7 +1407,7 @@ def run_daemon(
     settings = load_settings(**kw)
     check_wake_triggers(settings)
     credential = load_credential(settings.identity)
-    store = Store(settings.state_dir)
+    store = message_store(settings.state_dir)
     store.ensure()
     lock = store.acquire_daemon_lock()  # released by the OS when this process ends
 
@@ -1812,7 +1838,7 @@ def _state_of(m: "Mention") -> str:
 
 def recent(last: int = 20, state: str = "", **kw) -> list[dict]:
     """The last N messages, newest first, one dict each."""
-    store = Store(load_settings(**kw).state_dir)
+    store = message_store(load_settings(**kw).state_dir)
     rows = sorted(store.all(), key=lambda m: m.id, reverse=True)
     out = []
     for m in rows:
@@ -1834,7 +1860,7 @@ def stats(**kw) -> dict:
     seat's prose, and a number nobody can poll is a number nobody checks.
     """
     settings = load_settings(**kw)
-    store = Store(settings.state_dir)
+    store = message_store(settings.state_dir)
     rows = store.all()
     counts: dict[str, int] = {}
     for m in rows:
@@ -1861,7 +1887,7 @@ def trace(message_id: int, **kw) -> list[str]:
     and says plainly when something is not recorded, rather than implying the
     absence is a fact.
     """
-    store = Store(load_settings(**kw).state_dir)
+    store = message_store(load_settings(**kw).state_dir)
     found = next((m for m in store.all() if m.id == message_id), None)
     if found is None:
         return [f"no message {message_id} on this seat."]
