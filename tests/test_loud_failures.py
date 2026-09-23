@@ -9,6 +9,10 @@ from __future__ import annotations
 import click
 import pytest
 
+import time as _time
+
+NOW = int(_time.time())
+
 from agent_comms import operations
 from agent_comms.config import Settings, load_credential, load_settings
 from agent_comms.errors import (
@@ -1372,3 +1376,88 @@ def test_doctor_is_quiet_when_the_builds_agree(seat, monkeypatch):
     report = operations.preflight(transport_factory=lambda c: FakeTransport())
 
     assert next(c for c in report.checks if c[0] == "daemon build")[1] is True
+
+
+# -- R17: the rest of the §6 surface -----------------------------------------
+
+def test_resolve_prints_the_path_and_sends_nothing(seat, monkeypatch):
+    """The command that ends arguments: where would this go, and why.
+
+    Every field failure this client has had looked like "the message went
+    nowhere". This is how a person finds out where it WOULD have gone before
+    they send it — and it must send nothing while answering.
+    """
+    import agent_comms.resolve as R
+
+    sent = []
+    monkeypatch.setattr(R, "_post", lambda *a, **k: (200, {
+        "kind": "resolution-result", "contract": "0.2", "success": True,
+        "status": "resolved", "canonical_id": "bakehouse.agent-eco.arch",
+        "delivery": "inject", "route_revision": 3}))
+    monkeypatch.setattr(R, "directory_address", lambda: "http://d")
+    monkeypatch.setattr(operations, "send", lambda *a, **k: sent.append(a))
+
+    out = "\n".join(operations.resolve_name("arch"))
+    assert "bakehouse.agent-eco.arch" in out
+    assert "channel agent-eco" in out and "bot arch" in out
+    assert "would send  YES" in out
+    assert sent == [], "resolve sent something"
+
+
+def test_resolve_says_why_when_it_would_not_send(seat, monkeypatch):
+    import agent_comms.resolve as R
+
+    monkeypatch.setattr(R, "directory_address", lambda: "")
+    out = "\n".join(operations.resolve_name("nobody"))
+    assert "would send  NO" in out and "unknown" in out
+
+
+def test_queue_shows_what_the_pass_would_send_not_everything(seat):
+    """A queue view that shows more than the pass would send teaches the wrong
+    expectation — the bounds apply here exactly as they do in the pass."""
+    from agent_comms.store import Mention
+
+    store = operations.message_store(seat / ".comms")
+    for i in range(7):
+        store.append(Mention(id=200 + i, sender="agent-eco-arch", channel="agent-eco",
+                             topic="t", content="x", timestamp=NOW, permalink=""))
+    rows = operations.queued_now()
+    assert len(rows) == 3, f"showed {len(rows)}, the pass sends 3"
+    assert rows[0]["of"] == 7, "did not say how many are waiting behind it"
+
+
+def test_retire_by_hand_is_logged_with_its_reason(seat):
+    """A person removing a message is legitimate; doing it by editing a file is
+    how a store stops being evidence. `retired` with no cause is
+    indistinguishable from a bug six months later."""
+    from agent_comms.store import Mention
+
+    store = operations.message_store(seat / ".comms")
+    store.append(Mention(id=301, sender="agent-eco-arch", channel="agent-eco", topic="t",
+                         content="x", timestamp=NOW, permalink=""))
+    said = operations.retire(301, "superseded by a later instruction")
+
+    assert "retired 301" in said and "superseded" in said
+    assert [r["id"] for r in operations.recent(last=9, state="retired")] == [301]
+    assert any("superseded" in r["cause"] for r in store.history(store._find(301)["id"]))
+
+
+def test_requeue_is_the_one_backwards_move_and_needs_a_person(seat):
+    """Everything else is forward-only. An operator resurrecting a message is a
+    DECISION, not a transition, and the record says which."""
+    from agent_comms.store import Mention
+
+    store = operations.message_store(seat / ".comms")
+    store.append(Mention(id=302, sender="agent-eco-arch", channel="agent-eco", topic="t",
+                         content="x", timestamp=NOW, permalink=""))
+    operations.retire(302, "wrongly retired")
+    said = operations.requeue(302, "it was wanted after all")
+
+    assert "requeued 302" in said and "age bound still applies" in said
+    assert [r["id"] for r in operations.recent(last=9, state="queued")] == [302]
+    assert any("requeued by hand" in r["cause"] for r in store.history(store._find(302)["id"]))
+
+
+def test_retire_and_requeue_refuse_an_unknown_id(seat):
+    assert "no message 999" in operations.retire(999, "x")
+    assert "no message 999" in operations.requeue(999, "x")

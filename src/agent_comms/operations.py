@@ -1942,3 +1942,102 @@ def trace(message_id: int, **kw) -> list[str]:
     lines.append("  wake and per-attempt history are in ~/.comms/events.log; "
                  "the per-transition record arrives with the SQLite store.")
     return lines
+
+
+def resolve_name(name: str, **kw) -> list[str]:
+    """`comms resolve <name>` — what would this address resolve to, and WHY.
+
+    **The command that ends arguments.** It prints the resolution path, the
+    answer, the delivery mode and the permission verdict, and it sends nothing.
+    Every failure this client has had in the field looked like "the message
+    went nowhere"; this is how a person finds out where it would have gone
+    before they send it.
+    """
+    from .delivery import NotDeliverable, permitted_to_send, plan, transport_for
+    from .resolve import Resolver
+
+    settings = load_settings(**kw)
+    me = f"bakehouse.{settings.identity.project}.{settings.identity.seat}"
+    answer = Resolver(local_agents=config_sync.agent_set(settings.state_dir)).resolve(
+        name, caller=me)
+
+    out = [f"{name}", f"  asked as   {me}", f"  answer     {answer.status}",
+           f"  source     {answer.source}" + ("  (degraded)" if answer.degraded else ""),
+           f"  because    {answer.reason or answer.message or '—'}"]
+    if answer.near_misses:
+        out.append(f"  did you mean  {', '.join(answer.near_misses[:5])}")
+    if not answer.success:
+        out.append("  would send  NO — nothing would be delivered")
+        return out
+
+    out += [f"  canonical  {answer.canonical_id}",
+            f"  revision   {answer.route_revision}"]
+    try:
+        p = plan(answer)
+        t = transport_for(p.fqn, answer.transports)
+        allowed, why = permitted_to_send(p.delivery or "inject")
+        out += [f"  transport  channel {t['channel']}, bot {t['bot']}",
+                f"  delivery   {p.delivery or '(none declared)'}",
+                f"  would send  {'YES' if allowed else 'NO — ' + why}"]
+    except NotDeliverable as exc:
+        out.append(f"  would send  NO — {exc}")
+    return out
+
+
+def queued_now(**kw) -> list[dict]:
+    """`comms queue` — exactly what the next pass would deliver, in order.
+
+    Not "everything waiting": the bounds apply here as they do in the pass, so
+    what this prints is what would actually go. A queue view that shows more
+    than the pass would send teaches the wrong expectation.
+    """
+    settings = load_settings(**kw)
+    store = message_store(settings.state_dir)
+    retired = retire_stale(store)
+    waiting = [m for m in store.undelivered() if m.authorised]
+    due = sorted(sorted(waiting, key=lambda m: m.id, reverse=True)[:MAX_PER_PASS],
+                 key=lambda m: m.id)
+    return [{"id": m.id, "when": m.when, "sender": m.sender, "topic": m.topic,
+             "attempts": m.attempts, "of": len(waiting),
+             "retired_this_check": len(retired)} for m in due]
+
+
+def retire(message_id: int, reason: str, **kw) -> str:
+    """`comms retire <id> --reason` — the supported version of editing the store.
+
+    **Logged, always.** A person removing a message from the queue by hand is a
+    legitimate act; doing it by editing a file is how a store stops being
+    evidence. The reason is required for the same purpose: `retired` without a
+    cause is indistinguishable from a bug, six months later.
+    """
+    store = message_store(load_settings(**kw).state_dir)
+    if not store.mark_retired(message_id, f"by hand: {reason}"):
+        return f"no message {message_id} on this seat."
+    store.record("info", f"retired {message_id} by hand: {reason}")
+    return f"retired {message_id}, never delivered — {reason}"
+
+
+def requeue(message_id: int, reason: str, **kw) -> str:
+    """`comms requeue <id> --reason` — deliberate resurrection, logged.
+
+    The ONE place a message moves backwards, and it needs a person to say so.
+    Everything else in this store is forward-only; an operator resurrecting a
+    message is a decision, not a transition, and the record says which by
+    carrying the reason and the fact that a human asked.
+    """
+    from .queue import QUEUED
+
+    settings = load_settings(**kw)
+    store = message_store(settings.state_dir)
+    row = store._find(message_id)
+    if row is None:
+        return f"no message {message_id} on this seat."
+    store.db.execute(
+        "UPDATE messages SET state=?, attempts=0, retired_reason='' WHERE id=?",
+        (QUEUED, row["id"]))
+    store._log(row["id"], row["state"], QUEUED, f"requeued by hand: {reason}",
+               rule="operator")
+    store.record("info", f"requeued {message_id} by hand: {reason}")
+    return (f"requeued {message_id} from {row['state']} — {reason}\n"
+            "Attempts reset. The age bound still applies: if it is past the bound "
+            "it will retire again on the next pass rather than deliver.")
