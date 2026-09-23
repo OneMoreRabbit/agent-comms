@@ -292,14 +292,14 @@ def test_a_pre_1_0_seat_is_refused_loudly(monkeypatch):
     says anything went wrong. Without this check the only symptom is unparseable
     output, which this client would report as a seat defect — blaming the wrong
     component for an upgrade-ordering mistake."""
-    from agent_comms.seat import SeatTooOld
+    from agent_comms.seat import SeatContractUnsupported
 
     seat_app._contract_checked = None
     monkeypatch.setattr(seat_app.subprocess, "run", lambda cmd, **kw:
                         subprocess.CompletedProcess(
                             cmd, 0, json.dumps({"seat": "0.5.1", "contract": "0.5.1"}).encode(), b""))
 
-    with pytest.raises(SeatTooOld) as caught:
+    with pytest.raises(SeatContractUnsupported) as caught:
         seat_app.deliver("body")
     assert "0.5.1" in str(caught.value) and "1.x" in str(caught.value)
     assert "exiting 0" in str(caught.value), "say why silence is not evidence of success"
@@ -482,7 +482,7 @@ def test_the_gate_refuses_anything_it_does_not_speak(monkeypatch, reported):
     """
     import json as _json
 
-    from agent_comms.seat import SeatTooOld
+    from agent_comms.seat import SeatContractUnsupported
 
     class _R:
         stdout = _json.dumps({"contract": reported}).encode()
@@ -491,7 +491,7 @@ def test_the_gate_refuses_anything_it_does_not_speak(monkeypatch, reported):
 
     monkeypatch.setattr(seat_app, "_contract_checked", None)
     monkeypatch.setattr(seat_app.subprocess, "run", lambda *a, **k: _R())
-    with pytest.raises(SeatTooOld):
+    with pytest.raises(SeatContractUnsupported):
         seat_app.require_contract()
 
 
@@ -522,7 +522,7 @@ def test_the_gate_refuses_everything_else(monkeypatch, reported):
     nobody has written. Neither is guessed at."""
     import json as _json
 
-    from agent_comms.seat import SeatTooOld
+    from agent_comms.seat import SeatContractUnsupported
 
     class _R:
         stdout = _json.dumps({"contract": reported}).encode()
@@ -531,7 +531,7 @@ def test_the_gate_refuses_everything_else(monkeypatch, reported):
 
     monkeypatch.setattr(seat_app, "_contract_checked", None)
     monkeypatch.setattr(seat_app.subprocess, "run", lambda *a, **k: _R())
-    with pytest.raises(SeatTooOld):
+    with pytest.raises(SeatContractUnsupported):
         seat_app.require_contract()
 
 

@@ -87,8 +87,14 @@ RETRYABLE = frozenset({NO_SESSION, UNKNOWN})
 SPEAKABLE_CONTRACT_MAJORS = frozenset({1, 2})
 
 
-class SeatTooOld(Exception):
-    """This seat implements a contract older than this client can speak.
+class SeatContractUnsupported(Exception):
+    """This seat implements a contract this client does not speak — either way.
+
+    **Renamed from `SeatTooOld` 2026-09-22.** The gate now refuses a seat that
+    is too NEW as well as one that is too old, and the old name asserted the
+    opposite of half the cases it was raised for. The message it carries had
+    the same defect and was fixed with the {1, 2} widening; the class name
+    outlived it by a day. *A name that lies is how the message came to lie.*
 
     **Ruled 2026-09-17**: comms 1.0.0 hard-requires contract 1.0 and fails loudly
     rather than carrying both paths, with the seat-then-comms upgrade ordering
@@ -198,7 +204,7 @@ def require_contract(timeout: int = 20) -> str:
 
     if _major(contract) not in SPEAKABLE_CONTRACT_MAJORS:
         speakable = ", ".join(f"{m}.x" for m in sorted(SPEAKABLE_CONTRACT_MAJORS))
-        raise SeatTooOld(
+        raise SeatContractUnsupported(
             f"this seat implements devagent-seat-contract {contract or 'an unreadable version'}, "
             f"and agent-comms {_client_version()} speaks {speakable}. Nothing can be "
             "delivered here.\n"

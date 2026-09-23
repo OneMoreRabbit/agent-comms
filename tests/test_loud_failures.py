@@ -1154,3 +1154,54 @@ def test_doctor_passes_when_every_routed_channel_is_held(seat, monkeypatch):
     report = operations.preflight(transport_factory=lambda c: FakeTransport())
 
     assert next(c for c in report.checks if c[0] == "reachable channels")[1] is True
+
+
+def test_doctor_names_grant_without_subscription_as_drift(seat, monkeypatch):
+    """§5a provisions grant and subscription together, so a routed channel we
+    do not hold is DRIFT — not a state anyone chose — and the remedy is orch's
+    idempotent provisioning replay, not a hand-edit."""
+    import json
+
+    from agent_comms.hub import Hub
+
+    (seat / ".comms").mkdir(parents=True, exist_ok=True)
+    (seat / ".comms" / "routes.json").write_text(json.dumps({"routes": [
+        {"transports": {"comms": {"channel": "orchestrator"}}}]}))
+    monkeypatch.setattr(Hub, "subscribed_channels", lambda self: frozenset({"agent-eco"}))
+    monkeypatch.setattr("agent_comms.operations.seat_state_now",
+                        lambda: __import__("agent_comms.seat", fromlist=["x"]).SeatState(
+                            answer="yes", reason="r", runtime="claude", sessions=1,
+                            version="1.0.2", contract="1.0"))
+    report = operations.preflight(transport_factory=lambda c: FakeTransport())
+
+    check = next(c for c in report.checks if c[0] == "reachable channels")
+    assert check[1] is False
+    assert "GRANT WITHOUT SUBSCRIPTION" in check[2]
+    assert "replay provisioning" in check[2]
+
+
+def test_subscription_without_grant_is_a_note_not_a_warning(seat, monkeypatch):
+    """The other direction loses nothing — ungranted mail is refused by the
+    permission graph, which is the graph working.
+
+    A warning here would fire on every seat holding a test channel, and one
+    that fires every time is learned into invisibility (§9) — it would take the
+    grant-without-subscription failure down with it.
+    """
+    import json
+
+    from agent_comms.hub import Hub
+
+    (seat / ".comms").mkdir(parents=True, exist_ok=True)
+    (seat / ".comms" / "routes.json").write_text(json.dumps({"routes": [
+        {"transports": {"comms": {"channel": "agent-eco"}}}]}))
+    monkeypatch.setattr(Hub, "subscribed_channels",
+                        lambda self: frozenset({"agent-eco", "seat-testing"}))
+    monkeypatch.setattr("agent_comms.operations.seat_state_now",
+                        lambda: __import__("agent_comms.seat", fromlist=["x"]).SeatState(
+                            answer="yes", reason="r", runtime="claude", sessions=1,
+                            version="1.0.2", contract="1.0"))
+    report = operations.preflight(transport_factory=lambda c: FakeTransport())
+
+    assert next(c for c in report.checks if c[0] == "reachable channels")[1] is True
+    assert any("seat-testing" in n for n in report.notes)

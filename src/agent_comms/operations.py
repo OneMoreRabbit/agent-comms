@@ -179,18 +179,41 @@ def preflight(
         wanted = _transport_channels(settings)
         missing = sorted(c for c in wanted if c not in held)
         if missing:
+            # GRANT WITHOUT SUBSCRIPTION. This is the direction that loses
+            # messages: the send posts and the reply never comes back. §5a
+            # provisions the two together, so this is drift, not a state
+            # anybody chose — and it is fixed by orch's provisioning replay,
+            # which is idempotent from the graph.
             report.add(
                 "reachable channels", False,
-                f"the routing records name channel(s) this bot cannot reach: "
-                f"{', '.join(missing)}. A message addressed there would post and its "
-                f"reply would never come back. Subscribed to: {', '.join(sorted(held))}.")
+                f"GRANT WITHOUT SUBSCRIPTION — the routing records name channel(s) this "
+                f"bot cannot reach: {', '.join(missing)}. A message addressed there would "
+                f"post and its reply would never come back. §5a provisions the grant and "
+                f"the subscription together, so this is drift: ask the orchestrator to "
+                f"replay provisioning, which reconciles subscriptions from the graph. "
+                f"Subscribed to: {', '.join(sorted(held))}.")
         elif wanted:
             report.add("reachable channels", True,
                        f"every routed channel is subscribed: {', '.join(sorted(wanted))}")
         else:
-            report.note("reachable channels",
-                        "no routing records are cached yet, so there is nothing to check "
-                        "beyond this seat's own channel")
+            report.notes.append(
+                "no routing records are cached yet, so there is nothing to check "
+                "beyond this seat's own channel")
+
+        # SUBSCRIPTION WITHOUT GRANT — the other direction, and deliberately a
+        # NOTE. It loses nothing: an ungranted channel delivers events we then
+        # refuse by the permission graph, which is the graph working. Making it
+        # a warning would fire on every seat holding a test channel, and a
+        # warning that fires every time is learned into invisibility
+        # (constitution §9) — it would take the failure above down with it.
+        if wanted:
+            spare = sorted(c for c in held if c not in wanted)
+            if spare:
+                report.notes.append(
+                    f"subscribed to {', '.join(spare)} with no routing record naming "
+                    "it. Nothing is lost — mail from there is refused by the permission "
+                    "graph — but after a narrowing, a subscription left behind is what "
+                    "the provisioning replay tidies.")
 
     try:
         registration = hub.register_queue()

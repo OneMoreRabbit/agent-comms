@@ -17,7 +17,7 @@ the seat's extensibility, not ours.
 from __future__ import annotations
 
 from . import seat as seat_app
-from .seat import Delivery, SeatTooOld, SeatUnavailable
+from .seat import Delivery, SeatContractUnsupported, SeatUnavailable
 
 #: How much of a message is delivered inline before it is pointed at instead.
 #: Well under the seat's 65536-byte limit: the constraint here is an agent's
@@ -76,5 +76,5 @@ def wake(mention: dict, **_ignored) -> Delivery:
     """
     try:
         return seat_app.deliver(compose_turn(mention))
-    except (SeatUnavailable, SeatTooOld) as exc:
+    except (SeatUnavailable, SeatContractUnsupported) as exc:
         raise WakeError(str(exc)) from exc
