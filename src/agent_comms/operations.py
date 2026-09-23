@@ -61,12 +61,28 @@ def message_store(state_dir) -> MessageStore:
     was watching.
     """
     store = MessageStore(Path(state_dir) / "comms.db")
-    marker = Path(state_dir) / ".imported-from-jsonl"
     source = Path(state_dir) / "messages.jsonl"
-    if not marker.exists() and source.exists():
+    if source.exists():
+        # **ALWAYS, not once.** The import is idempotent on the hub id, so
+        # re-running it costs a file read and catches anything the JSONL has
+        # that the database does not.
+        #
+        # It ran once behind a marker until 2026-09-23, and this seat proved
+        # why that was wrong: a daemon still running PRE-2.0 code keeps
+        # appending to the JSONL while the CLI reads SQLite, and the marker
+        # stops the two ever meeting. Two of arch's messages were sitting in
+        # the JSONL, invisible to `comms show`, with nothing reporting a
+        # problem — a stranding window created by the very thing meant to
+        # migrate cleanly.
+        #
+        # Removing the marker removes the window. The same shape as the WAL
+        # fix an hour earlier: delete the state that goes stale rather than
+        # manage it.
         from .migrate import import_jsonl
         out = import_jsonl(source, store)
-        marker.write_text(out.report(source, store.path), encoding="utf-8")
+        if out.written:
+            (Path(state_dir) / ".last-import").write_text(
+                out.report(source, store.path), encoding="utf-8")
     return store
 
 

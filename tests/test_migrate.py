@@ -118,3 +118,25 @@ def test_the_import_carries_the_timestamp_and_channel(tmp_path):
     row = q.db.execute("SELECT received_at_epoch, channel FROM messages WHERE id=1").fetchone()
     assert row["received_at_epoch"] == 1_760_000_000
     assert row["channel"] == "agent-eco"
+
+
+def test_the_import_catches_up_rather_than_running_once(tmp_path):
+    """MEASURED ON A LIVE SEAT: a daemon still running pre-2.0 code keeps
+    appending to the JSONL while the CLI reads SQLite. A once-only marker stops
+    the two ever meeting, and messages sit in the JSONL invisible to `show`
+    with nothing reporting a problem.
+
+    The import is idempotent on the hub id, so running it every time costs a
+    file read and closes the window entirely.
+    """
+    from agent_comms.operations import message_store
+
+    src = write(tmp_path, base(id=1))
+    store = message_store(tmp_path)
+    assert len(store.all()) == 1
+
+    # something else appends to the JSONL afterwards — the old daemon
+    with src.open("a") as fh:
+        fh.write("\n" + json.dumps(base(id=2)))
+
+    assert len(message_store(tmp_path).all()) == 2, "the late arrival was stranded"
