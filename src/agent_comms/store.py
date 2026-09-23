@@ -351,6 +351,24 @@ class Store:
 
     # -- queue position ----------------------------------------------------
 
+    def record_build(self, version: str) -> None:
+        """Stamp which build this daemon is. Read by `doctor`, by a LATER CLI.
+
+        The one piece of state here that is not removable: a seat mid-upgrade
+        genuinely has two versions on it, because the running daemon is a
+        process and the CLI is whatever is on disk now. That condition cannot
+        be deleted, so it is reported instead — which is the honest half of
+        catalogue 0.56, not a substitute for the other half.
+        """
+        (self.root / "daemon.build").write_text(version, encoding="utf-8")
+
+    def daemon_build(self) -> str:
+        """The build the RUNNING daemon started as, or empty if it never said."""
+        try:
+            return (self.root / "daemon.build").read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+
     def save_position(self, queue_id: str, last_event_id: int) -> None:
         """Record where the queue is, and that we were alive to record it.
 

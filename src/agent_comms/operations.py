@@ -343,6 +343,19 @@ def preflight(
     # above all pass and the seat receives nothing — every other failure in this
     # client's catalogue has that shape, and this one had it too until it was
     # measured by hand on 2026-09-10.
+    side = Store(settings.state_dir)
+    running_build = side.daemon_build()
+    if daemon_is_running(side) and running_build and running_build != _client_version():
+        report.add(
+            "daemon build", False,
+            f"the RUNNING daemon is {running_build}; this CLI is {_client_version()}. "
+            "They are out of step, which is a real state during an upgrade and not a "
+            "guess — the daemon is a process and the CLI is whatever is on disk now. "
+            "Restart it to bring them together: comms daemon --restart. Until then "
+            "the two halves may disagree about where messages are stored.")
+    elif running_build:
+        report.add("daemon build", True, f"daemon and CLI both {running_build}")
+
     daemon = Store(settings.state_dir).daemon_state()
     report.add("daemon", daemon.running and not daemon.stale, daemon.summary())
 
@@ -382,6 +395,11 @@ def _wake_summary(settings: Settings) -> str:
         "(the estate installs this file; ansible-platform owns it on a provisioned "
         "seat). Until then, mentions are only visible to `comms inbox`."
     )
+
+
+def daemon_is_running(store) -> bool:
+    """One place asks; `doctor` and the build check must not disagree."""
+    return store.daemon_state().running
 
 
 def _transport_channels(settings: Settings) -> set[str]:
@@ -1462,6 +1480,7 @@ def run_daemon(
     # so without this a freshly started daemon carries the *previous* daemon's
     # last tick and reads as wedged for its first minute — a false alarm on the
     # one signal that has to stay trustworthy.
+    store.record_build(_client_version())
     store.save_position(registration.queue_id, registration.last_event_id)
 
     stored, iterations, backoff = 0, 0, 1

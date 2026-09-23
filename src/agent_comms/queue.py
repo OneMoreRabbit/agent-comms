@@ -405,6 +405,12 @@ class MessageStore(Queue):
     def record(self, level, message):
         return self._side().record(level, message)
 
+    def record_build(self, version):
+        return self._side().record_build(version)
+
+    def daemon_build(self):
+        return self._side().daemon_build()
+
     def sleeping(self):
         return self._side().sleeping()
 

@@ -1322,3 +1322,53 @@ class _Resp:
 
     def __exit__(self, *a):
         return False
+
+
+def test_doctor_names_a_daemon_running_a_different_build(seat, monkeypatch):
+    """The one piece of stale state that CANNOT be removed, so it is reported.
+
+    A seat mid-upgrade genuinely has two versions on it: the daemon is a
+    process and the CLI is whatever is on disk now. This seat lost two messages
+    to exactly that gap while every check read green (catalogue 0.56).
+    """
+    from agent_comms.hub import Hub
+    from agent_comms.seat import SeatState
+    from agent_comms.store import Store
+
+    s = Store(seat / ".comms")
+    s.ensure()
+    s.record_build("1.9.9")
+    monkeypatch.setattr(Store, "daemon_state",
+                        lambda self: __import__("agent_comms.store", fromlist=["x"]).DaemonState(
+                            running=True, pid=1, last_tick=None))
+    monkeypatch.setattr(Hub, "subscribed_channels", lambda self: frozenset({"agent-eco"}))
+    monkeypatch.setattr("agent_comms.operations.seat_state_now",
+                        lambda: SeatState(answer="yes", reason="r", runtime="claude",
+                                          sessions=1, version="2.0.0", contract="2.0"))
+    report = operations.preflight(transport_factory=lambda c: FakeTransport())
+
+    check = next(c for c in report.checks if c[0] == "daemon build")
+    assert check[1] is False
+    assert "1.9.9" in check[2] and "comms daemon --restart" in check[2]
+
+
+def test_doctor_is_quiet_when_the_builds_agree(seat, monkeypatch):
+    """It must not fire on the ordinary case, or it stops being read (§9)."""
+    from agent_comms import __version__
+    from agent_comms.hub import Hub
+    from agent_comms.seat import SeatState
+    from agent_comms.store import Store
+
+    s = Store(seat / ".comms")
+    s.ensure()
+    s.record_build(__version__)
+    monkeypatch.setattr(Store, "daemon_state",
+                        lambda self: __import__("agent_comms.store", fromlist=["x"]).DaemonState(
+                            running=True, pid=1, last_tick=None))
+    monkeypatch.setattr(Hub, "subscribed_channels", lambda self: frozenset({"agent-eco"}))
+    monkeypatch.setattr("agent_comms.operations.seat_state_now",
+                        lambda: SeatState(answer="yes", reason="r", runtime="claude",
+                                          sessions=1, version="2.0.0", contract="2.0"))
+    report = operations.preflight(transport_factory=lambda c: FakeTransport())
+
+    assert next(c for c in report.checks if c[0] == "daemon build")[1] is True
