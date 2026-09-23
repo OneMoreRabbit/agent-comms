@@ -355,3 +355,29 @@ def test_supersession_is_read_from_the_body_not_from_a_redirect(directory, monke
     assert answer.success is True
     assert answer.canonical_id == "bakehouse.agent-eco.arch"
     assert answer.degraded is False
+
+
+def test_we_request_contract_0_2():
+    """0.1 cannot express a 0.2-provisioned agent: it promises a legacy route
+    block the directory cannot fabricate from an opaque seat_local_id, so the
+    agent answers not-registered however correctly it is assigned."""
+    assert R.CONTRACT == "0.2"
+
+
+def test_a_0_2_answer_tells_us_where_to_send_and_nothing_about_the_seat(directory, monkeypatch):
+    """THE PRIVACY PROPERTY. A 0.2 answer carries no route block — no seat, no
+    host, no seat_local_id. A sender is told where to send, never what the seat
+    is made of, and a consumer that never receives an internal id cannot build
+    on one."""
+    monkeypatch.setattr(R, "_post", _refuses(200, {
+        "kind": "resolution-result", "contract": "0.2", "success": True,
+        "status": "resolved", "requested": "arc-web-review",
+        "canonical_id": "bakehouse.arc-web.review", "alias_used": "arc-web-review",
+        "delivery": "inject", "route_revision": 1,
+        "transports": {"comms": {"channel": "arc-web", "bot": "arc-web-arch"}}}))
+    a = R.Resolver(local_agents={}).resolve("arc-web-review", caller="c")
+
+    assert a.success and a.canonical_id == "bakehouse.arc-web.review"
+    assert a.delivery == "inject" and a.transports["comms"]["channel"] == "arc-web"
+    assert a.seat == "" and a.host == "", "a seat internal was carried into the client"
+    assert not hasattr(a, "seat_local_id")

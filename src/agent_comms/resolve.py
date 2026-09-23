@@ -50,7 +50,18 @@ FALLBACK_CREDENTIAL_FILE = Path.home() / ".secrets" / "estate-directory-read"
 #: TTL is a backstop rather than the mechanism.
 CACHE_TTL = timedelta(seconds=60)
 
-CONTRACT = "0.1"
+#: **0.2, and the bump is a FIX not a courtesy.** The 0.1/0.2 divergence is
+#: deliberate retained compatibility: resolution 0.1 promises a legacy route
+#: block carrying seat/host/local_route, which the directory cannot fabricate
+#: from an opaque seat_local_id — so a 0.2-provisioned agent CANNOT resolve
+#: through 0.1 at all and answers `not-registered` however correctly it is
+#: assigned. That is the assignments-versus-resolve disagreement we filed:
+#: not two views of one agent, one view answered through a version that cannot
+#: express it.
+#:
+#: 0.2 answers carry NO route block — no seat, no host, no seat_local_id.
+#: A sender is told where to send, never what the seat is made of.
+CONTRACT = "0.2"
 
 #: Where an answer came from. This is not decoration — a consumer that cannot
 #: tell a live answer from a cached one will eventually report a stale route as
