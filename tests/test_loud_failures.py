@@ -1205,3 +1205,31 @@ def test_subscription_without_grant_is_a_note_not_a_warning(seat, monkeypatch):
 
     assert next(c for c in report.checks if c[0] == "reachable channels")[1] is True
     assert any("seat-testing" in n for n in report.notes)
+
+
+@pytest.mark.parametrize("contract,warns", [
+    ("1.0", False), ("1.1-draft", False), ("2.0", False), ("2.0-draft", False),
+    ("0.5.1", True), ("3.0", True), ("10.0", True),
+])
+def test_doctor_uses_the_one_contract_predicate(seat, monkeypatch, contract, warns):
+    """THE SAME TRAP, IN A SECOND HOME. `doctor` carried its own
+    `contract.startswith("1.")` — the major-10 trap pinned against in the
+    delivery gate — and it survived the {1,2} widening, firing on every healthy
+    2.0 seat and calling it *older* than the client. Found by agent-skeleton on
+    their install, in shipped 2.0.
+
+    A predicate with two implementations has two behaviours. There is one now,
+    and this test is what stops a third appearing.
+    """
+    from agent_comms.hub import Hub
+    from agent_comms.seat import SeatState
+
+    monkeypatch.setattr(Hub, "subscribed_channels", lambda self: frozenset({"agent-eco"}))
+    monkeypatch.setattr("agent_comms.operations.seat_state_now",
+                        lambda: SeatState(answer="yes", reason="r", runtime="claude",
+                                          sessions=1, version="2.0.0", contract=contract))
+    report = operations.preflight(transport_factory=lambda c: FakeTransport())
+
+    said = " ".join(report.warnings)
+    assert ("does not speak" in said) is warns, f"contract {contract}: warnings={report.warnings}"
+    assert "cannot deliver to an older seat" not in said, "the backwards wording is back"

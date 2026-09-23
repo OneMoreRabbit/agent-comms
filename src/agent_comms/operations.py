@@ -37,7 +37,8 @@ from .errors import (
     QueueGapError,
 )
 from .hub import Hub, Registration, Transport, build_transport
-from .seat import SeatUnavailable
+from .seat import SeatUnavailable, speaks_contract
+from .seat import _client_version
 from .seat import state as seat_state_now
 from .wake import WakeError, wake
 from .store import DaemonState, Mention, Store
@@ -285,10 +286,12 @@ def preflight(
         known = bool(build.version and build.contract)
         report.add("seat build", known,
                    f"seat {build.version or '?'} (contract {build.contract or '?'})")
-        if known and not build.contract.startswith("1."):
+        if known and not speaks_contract(build.contract):
             report.warnings.append(
-                f"this seat implements contract {build.contract}; agent-comms 1.x "
-                "requires 1.0 and cannot deliver to an older seat."
+                f"this seat implements contract {build.contract}, which agent-comms "
+                f"{_client_version()} does not speak. Nothing can be delivered here "
+                "until the pair is on speaking terms — check which half is behind "
+                "before upgrading either."
             )
     except SeatUnavailable as exc:
         report.add("seat build", False, str(exc))

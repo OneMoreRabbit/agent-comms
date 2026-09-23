@@ -247,6 +247,19 @@ def _major(contract: str) -> int | None:
     return int(digits) if digits else None
 
 
+def speaks_contract(contract: str) -> bool:
+    """Can this client speak that contract? **The one place this is decided.**
+
+    Exported because the answer was being re-derived elsewhere and got it
+    wrong: `comms doctor` carried its own `contract.startswith("1.")`, which is
+    the major-10 trap this module pins against, and it survived the {1, 2}
+    widening in a second home — firing on every healthy 2.0 seat and calling it
+    older than the client. A predicate with two implementations has two
+    behaviours; this is now the only one.
+    """
+    return _major(contract) in SPEAKABLE_CONTRACT_MAJORS
+
+
 def _client_version() -> str:
     from . import __version__
     return __version__
