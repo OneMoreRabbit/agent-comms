@@ -23,6 +23,7 @@ from typing import Callable
 from .config import Credential, Settings, load_credential, load_settings
 from .directory import Directory
 from .directory import load as load_directory
+from . import config_sync
 from .errors import (
     ChannelNotReachable,
     CommsDisabled,
@@ -349,12 +350,7 @@ def _transport_channels(settings: Settings) -> set[str]:
     genuinely nothing to check.
     """
     channels = {settings.channel.strip().casefold()}
-    cache = settings.state_dir / "routes.json"
-    try:
-        import json as _json
-        records = _json.loads(cache.read_text(encoding="utf-8")).get("routes", [])
-    except (OSError, ValueError, AttributeError):
-        return channels
+    records = config_sync.load(settings.state_dir).get("routes") or []
     for record in records:
         name = ((record or {}).get("transports") or {}).get("comms", {}).get("channel")
         if name:
@@ -1428,6 +1424,7 @@ def run_daemon(
 
     stored, iterations, backoff = 0, 0, 1
     last_backstop = time.monotonic()
+    last_config = 0.0
     gap_recovery = False
     while max_iterations is None or iterations < max_iterations:
         iterations += 1
@@ -1519,6 +1516,15 @@ def run_daemon(
         # Check the doorstep regardless. Two failures hide from the queue alone:
         # a connection that hangs without erroring, and a queue replaced between
         # ticks. Both look exactly like a quiet channel.
+        if time.monotonic() - last_config >= CONFIG_REFRESH_SECS:
+            last_config = time.monotonic()
+            got = config_sync.fetch(settings.identity.project, settings.identity.seat,
+                                    settings.state_dir)
+            if got.source == "directory":
+                store.record("info", f"config: {got.line()}")
+            elif got.reason:
+                store.record("warn", f"config: {got.reason}; running from file")
+
         if time.monotonic() - last_backstop >= BACKSTOP_SECS:
             last_backstop = time.monotonic()
             # The queue is ours, so something has to work it. Without this,
@@ -1563,6 +1569,8 @@ def run_daemon(
 #: and that is the number worth spending an API call on. Twelve calls an hour
 #: against a hub this seat already long-polls continuously is not a cost.
 BACKSTOP_SECS = 300
+#: Slow-changing facts, §4a. Not on the hot path: resolution is per send.
+CONFIG_REFRESH_SECS = 300
 
 #: How many times a held message is retried before this client stops and says so.
 #:
@@ -1781,3 +1789,95 @@ def _notify(settings: Settings, store: Store, mention: Mention) -> None:
             )
     except Exception as exc:
         store.record("warn", f"notify_command failed for message {mention.id}: {exc}")
+
+
+# -- the reading surface (design §6, R17) -------------------------------------
+
+def _state_of(m: "Mention") -> str:
+    """One honest word for a 1.0-shaped record.
+
+    `retired` is checked BEFORE `delivered` because a retired message carries
+    both: `delivered` is the bookkeeping that stops it being picked up again,
+    `retired` is the fact that nobody ever saw it. Reading them the other way
+    round is exactly the conflation that made the 1.0.0 store ambiguous.
+    """
+    if not m.authorised:
+        return "refused"
+    if m.retired:
+        return "retired"
+    if m.delivered:
+        return "delivered"
+    return "queued"
+
+
+def recent(last: int = 20, state: str = "", **kw) -> list[dict]:
+    """The last N messages, newest first, one dict each."""
+    store = Store(load_settings(**kw).state_dir)
+    rows = sorted(store.all(), key=lambda m: m.id, reverse=True)
+    out = []
+    for m in rows:
+        current = _state_of(m)
+        if state and current != state:
+            continue
+        out.append({"id": m.id, "when": m.when, "state": current, "sender": m.sender,
+                    "topic": m.topic, "attempts": m.attempts,
+                    "retired": m.retired, "permalink": m.permalink})
+        if len(out) >= last:
+            break
+    return out
+
+
+def stats(**kw) -> dict:
+    """Counts by state and queue health — for a person and for the estate.
+
+    Exposed as JSON on purpose: the estate polls this rather than reading a
+    seat's prose, and a number nobody can poll is a number nobody checks.
+    """
+    settings = load_settings(**kw)
+    store = Store(settings.state_dir)
+    rows = store.all()
+    counts: dict[str, int] = {}
+    for m in rows:
+        counts[_state_of(m)] = counts.get(_state_of(m), 0) + 1
+    waiting = [m for m in rows if _state_of(m) == "queued"]
+    daemon = store.daemon_state()
+    return {
+        "seat": settings.identity.seat,
+        "stored": len(rows),
+        "by_state": counts,
+        "undelivered": len(waiting),
+        "retired": counts.get("retired", 0),
+        "refused": counts.get("refused", 0),
+        "oldest_undelivered": min((m.when for m in waiting), default=""),
+        "daemon": daemon.summary(),
+        "daemon_running": daemon.running,
+    }
+
+
+def trace(message_id: int, **kw) -> list[str]:
+    """One message end to end: where it came from, what was decided, what happened.
+
+    The point of `trace` is that it ends arguments — so it prints what is known
+    and says plainly when something is not recorded, rather than implying the
+    absence is a fact.
+    """
+    store = Store(load_settings(**kw).state_dir)
+    found = next((m for m in store.all() if m.id == message_id), None)
+    if found is None:
+        return [f"no message {message_id} on this seat."]
+
+    lines = [
+        f"message {found.id}   {found.when}",
+        f"  from      {found.sender}   ({found.reason})",
+        f"  topic     {found.topic}",
+        f"  channel   {found.channel}",
+        f"  state     {_state_of(found)}"
+        + (f" — {found.retired}" if found.retired else ""),
+        f"  attempts  {found.attempts}",
+        f"  permitted {'yes' if found.authorised else 'NO — stored and never delivered'}",
+    ]
+    if found.permalink:
+        lines.append(f"  cite      {found.permalink}")
+    lines.append("  wake and per-attempt history are in ~/.comms/events.log; "
+                 "the per-transition record arrives with the SQLite store.")
+    return lines

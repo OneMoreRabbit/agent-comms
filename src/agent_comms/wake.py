@@ -56,8 +56,14 @@ def compose_turn(mention: dict) -> str:
     # turn: a message from a sender the estate has not permitted is refused at the
     # daemon and never composed. The label was always the weaker half — it put the
     # sender's text in front of the agent and asked the agent to police it.
+    # R6: the monotonic id is EXPOSED ON DELIVERY so a context-free session can
+    # tell a new message from a replayed one. ingstr's corollary is why it is
+    # here rather than only in the store: existence proves delivery and says
+    # nothing about continuity — a session that has seen 2950 knows 2946 is
+    # older WITHOUT needing our records, which is the whole point, because after
+    # a restart it does not have our records.
     return (
-        f"[hub message from {sender} — topic '{topic}'] {body} "
+        f"[hub message #{mid} from {sender} — topic '{topic}'] {body} "
         f"[cite {permalink} | reply: comms reply {mid} '<text>']"
     )
 

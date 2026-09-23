@@ -1233,3 +1233,90 @@ def test_doctor_uses_the_one_contract_predicate(seat, monkeypatch, contract, war
     said = " ".join(report.warnings)
     assert ("does not speak" in said) is warns, f"contract {contract}: warnings={report.warnings}"
     assert "cannot deliver to an older seat" not in said, "the backwards wording is back"
+
+
+# -- R13: the periodic config sync -------------------------------------------
+
+def test_a_refresh_replaces_the_set_and_never_merges(seat, monkeypatch):
+    """The directory is authoritative (master ruling, 2026-09-23). Merging would
+    make this seat the second authority and keep a withdrawn agent alive locally
+    forever."""
+    import json
+
+    from agent_comms import config_sync
+
+    d = seat / ".comms"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "routes.json").write_text(json.dumps({"generation": 1, "routes": [
+        {"agent": "bakehouse.agent-eco.gone", "delivery": "inject"}]}))
+
+    monkeypatch.setattr(config_sync, "directory_address", lambda: "http://d.invalid")
+    monkeypatch.setattr(config_sync, "_credential", lambda: "t")
+    monkeypatch.setattr(config_sync.urllib.request, "urlopen",
+                        lambda *a, **k: _Resp(json.dumps({
+                            "contract": "0.2", "generation": 2, "assignments": [
+                                {"agent": "bakehouse.agent-eco.kept", "delivery": "inject"}]})))
+    got = config_sync.fetch("agent-eco", "s", d)
+
+    assert got.generation == 2 and got.agents == 1
+    assert list(config_sync.agent_set(d)) == ["bakehouse.agent-eco.kept"], "withdrawn agent survived"
+
+
+def test_an_unreachable_directory_runs_from_the_file(seat, monkeypatch):
+    """The file is the boot source. An outage must not stop a seat working from
+    what it already has."""
+    import json
+
+    from agent_comms import config_sync
+
+    d = seat / ".comms"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "routes.json").write_text(json.dumps({"generation": 5, "fetched_at": "t", "routes": [
+        {"agent": "bakehouse.agent-eco.held"}]}))
+    monkeypatch.setattr(config_sync, "directory_address", lambda: "http://d.invalid")
+    monkeypatch.setattr(config_sync.urllib.request, "urlopen",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError()))
+
+    got = config_sync.fetch("agent-eco", "s", d)
+    assert got.source == "file" and got.generation == 5
+    assert "did not answer" in got.reason
+    assert list(config_sync.agent_set(d)) == ["bakehouse.agent-eco.held"], "the held set was lost"
+
+
+def test_an_unreadable_answer_never_replaces_a_readable_set(seat, monkeypatch):
+    """Fail closed. A set we cannot read must not overwrite one we can."""
+    import json
+
+    from agent_comms import config_sync
+
+    d = seat / ".comms"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "routes.json").write_text(json.dumps({"generation": 5, "routes": [{"agent": "keep.me"}]}))
+    monkeypatch.setattr(config_sync, "directory_address", lambda: "http://d.invalid")
+    monkeypatch.setattr(config_sync.urllib.request, "urlopen",
+                        lambda *a, **k: _Resp(json.dumps({"totally": "unexpected"})))
+
+    got = config_sync.fetch("agent-eco", "s", d)
+    assert got.source == "file" and "not an assignment set" in got.reason
+    assert list(config_sync.agent_set(d)) == ["keep.me"]
+
+
+def test_the_seat_door_is_project_qualified(seat):
+    """Measured: the bare seat name answers 403. /v0/routes is the OPERATOR view."""
+    from agent_comms.config_sync import seat_path
+
+    assert seat_path("agent-eco", "test-claude") == "/v0/seats/agent-eco/test-claude/assignments"
+
+
+class _Resp:
+    def __init__(self, text):
+        self._t = text.encode()
+
+    def read(self):
+        return self._t
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False

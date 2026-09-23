@@ -15,6 +15,8 @@ from __future__ import annotations
 import json
 import subprocess
 
+import re
+
 import pytest
 
 from agent_comms import operations, seat as seat_app
@@ -193,7 +195,10 @@ def test_the_turn_names_the_sender_first(monkeypatch):
     """ADR-0009 §1a is only actionable if the agent knows who is asking."""
     turn = compose_turn({"id": 9, "sender": "agent-eco-arch", "topic": "t",
                          "content": "do the thing", "permalink": "http://x/9"})
-    assert turn.startswith("[hub message from agent-eco-arch")
+    # The PROPERTY is that the sender is named first and unmissably, not the
+    # literal prefix: R6 put the monotonic id ahead of it so a context-free
+    # session can tell new from replayed. Sender is still the first ACTOR named.
+    assert re.match(r"\[hub message #\d+ from agent-eco-arch", turn), turn[:60]
     assert "comms reply 9" in turn
 
 
@@ -668,3 +673,52 @@ def test_an_unknown_word_at_exit_20_still_needs_a_person():
     """The other direction has to hold, or the rule is just optimism."""
     d = seat_app._parse(_answer(status="some-new-word"), b"", 20)
     assert d.retryable is False
+
+
+def test_the_turn_carries_the_monotonic_id(seat):
+    """R6. A context-free session must be able to tell new from replayed.
+
+    ingstr's corollary is why it rides ON THE TURN and not only in the store:
+    existence proves delivery and says nothing about continuity. A session that
+    has seen #2950 knows #2946 is older without consulting our records — which
+    is the point, because after a restart it does not have our records.
+    """
+    from agent_comms.wake import compose_turn
+
+    line = compose_turn({"id": 2946, "sender": "agent-eco-arch", "topic": "t",
+                         "content": "x", "permalink": "p"})
+    assert line.startswith("[hub message #2946 from agent-eco-arch")
+
+
+def test_the_reading_surface_reports_honest_states(seat):
+    """`retired` is checked BEFORE `delivered`, because a retired message carries
+    both — delivered is the bookkeeping, retired is the fact nobody saw it."""
+    from agent_comms.store import Mention, Store
+
+    store = Store(seat / ".comms")
+    store.append(Mention(id=1, sender="s", channel="c", topic="t", content="x",
+                         timestamp=NOW, permalink="", delivered=True, retired="too old"))
+    store.append(Mention(id=2, sender="s", channel="c", topic="t", content="x",
+                         timestamp=NOW, permalink="", delivered=True))
+    store.append(Mention(id=3, sender="s", channel="c", topic="t", content="x",
+                         timestamp=NOW, permalink="", authorised=False))
+
+    states = {r["id"]: r["state"] for r in operations.recent(last=10)}
+    assert states == {1: "retired", 2: "delivered", 3: "refused"}
+
+    data = operations.stats()
+    assert data["retired"] == 1 and data["refused"] == 1
+    assert [r["id"] for r in operations.recent(last=10)] == [3, 2, 1], "not newest-first"
+
+
+def test_trace_says_when_something_is_not_recorded(seat):
+    """Trace ends arguments, so it must not imply an absence is a fact."""
+    from agent_comms.store import Mention, Store
+
+    Store(seat / ".comms").append(Mention(id=7, sender="arch", channel="agent-eco",
+                                          topic="t", content="x", timestamp=NOW,
+                                          permalink="", authorised=False))
+    out = "\n".join(operations.trace(7))
+    assert "stored and never delivered" in out
+    assert "events.log" in out, "must point at where the rest of the history lives"
+    assert "no message" in "\n".join(operations.trace(999))
