@@ -28,6 +28,10 @@ NO_SESSION = "no-session"
 FAILED = "failed"
 BROKEN = "broken"
 UNKNOWN = "unknown"
+#: Added by devagent-seat-contract 1.1, additive: exit codes are unchanged, so
+#: only a consumer branching on the STRING has to care. These are that care.
+UNKNOWN_AGENT = "unknown-agent"   # exit 10 — this seat does not serve that name
+CONFLICTED = "conflicted"         # exit 20 — several sessions could be it; it will not choose
 
 #: The seat's body limit (contract: 65536 bytes, never silently truncated).
 MAX_BODY_BYTES = 65536
@@ -48,13 +52,49 @@ MAX_BODY_BYTES = 65536
 RETRYABLE = frozenset({NO_SESSION, UNKNOWN})
 
 
-#: The contract major this client is built against. comms 1.x speaks `seat msg`
-#: and nothing else; a pre-1.0 seat has no such command.
-REQUIRED_CONTRACT_MAJOR = "1"
+#: The contract majors this client can speak. **An explicit set, never a
+#: comparison** — ">= 1" would admit a major 3 nobody has written yet, and
+#: `startswith("1")` would admit major 10, which is not major 1.
+#:
+#: Widened to {1, 2} on arch's ruling, 2026-09-22. The reason the ordering
+#: needed a ruling at all: contract 1.0 §9 established seat-then-comms because
+#: comms fails loudly against anything OLDER. Nothing established what happens
+#: when the seat goes NEWER by a major — and an equality gate refuses it
+#: totally, so seat-first breaks every seat while comms-first is impossible,
+#: because comms cannot speak a contract that does not exist yet. The gate is
+#: a SET so the estate can widen it deliberately, one major at a time, with
+#: the contract read first. A floor would wave through a future major that
+#: DOES break callers; an equality makes every additive major an outage.
+#:
+#: **Why 2 qualifies** (arch's ruling, and the part worth keeping): seat 2.0 is
+#: MAJOR FOR THE DEPLOYER — `agents.yml` is required and its absence fails
+#: closed, so the upgrade is not drop-in — while the CALLER surface is additive
+#: over 1.x. One version number serving two audiences. **Gate on what the
+#: number means for YOUR audience, established by reading the contract, never
+#: inferred from the digit.**
+#:
+#: The gate protects against a wrong pairing existing. Lockstep deployment —
+#: both halves of a seat upgraded in one act — prevents it existing. Both
+#: stand; neither substitutes for the other.
+#:
+#: **Reviewed against devagent-seat-contract 2.0-draft, 2026-09-22**, not
+#: against a summary of it. Two things checked, both hold: the caller surface
+#: is additive over 1.x (§0), and the deployer-side break surfaces as `broken`
+#: — the status-word set is IDENTICAL between 1.1 and 2.0, so nothing falls
+#: through our handler. `broken` already needs a person and does not consume a
+#: delivery attempt, so mail is not stranded during a missing-agents.yml
+#: window. That window is the stranding agent-skeleton measured the same day.
+SPEAKABLE_CONTRACT_MAJORS = frozenset({1, 2})
 
 
-class SeatTooOld(Exception):
-    """This seat implements a contract older than this client can speak.
+class SeatContractUnsupported(Exception):
+    """This seat implements a contract this client does not speak — either way.
+
+    **Renamed from `SeatTooOld` 2026-09-22.** The gate now refuses a seat that
+    is too NEW as well as one that is too old, and the old name asserted the
+    opposite of half the cases it was raised for. The message it carries had
+    the same defect and was fixed with the {1, 2} widening; the class name
+    outlived it by a day. *A name that lies is how the message came to lie.*
 
     **Ruled 2026-09-17**: comms 1.0.0 hard-requires contract 1.0 and fails loudly
     rather than carrying both paths, with the seat-then-comms upgrade ordering
@@ -92,6 +132,10 @@ class Delivery:
     runtime: str = ""
     seat: str = ""
     exit_code: int = 0
+    #: Contract 1.1: the FQN that was resolved, and the seat-local label. Empty
+    #: on a 1.0 seat and on a local session — absence is not an error.
+    agent: str = ""
+    label: str = ""
 
     @property
     def retryable(self) -> bool:
@@ -104,17 +148,36 @@ class Delivery:
             return False
         if self.status == FAILED:
             return self.exit_code != 2
+        if self.exit_code == 30:
+            # **BRANCH ON THE EXIT CODE, NOT THE WORD, FOR "CANNOT TELL".**
+            # 30 means the seat could not find out, and the contract's own
+            # guarantee is that a consumer branching on exit codes needs no
+            # change when status words are added. Measured 2026-09-23: a 2.0
+            # seat answered `unresolved` — a word in NO published contract —
+            # at exit 30, saying in its own message "Retryable — the message
+            # is still yours". Matching on the word alone, we did not retry it.
+            # A new word at a known code must not silently become permanent.
+            return True
         return self.status in RETRYABLE
 
     @property
     def needs_a_person(self) -> bool:
-        """`broken` — the seat's invariant is violated and no retry fixes it."""
-        return self.status == BROKEN
+        """The seat's invariant is violated and no retry fixes it.
+
+        Both of these are exit 20 in the contract, which is the code that means
+        *a person must intervene* — `broken` since 1.0, `conflicted` added by
+        1.1 when several live sessions could be one agent and the seat refuses
+        to choose between them. Leaving `conflicted` out would have made it fall
+        through as an ordinary refusal and gone unreported to anyone who could
+        fix it.
+        """
+        return self.status in (BROKEN, CONFLICTED)
 
     def summary(self) -> str:
         """One line for a log or a sender, in the seat's own words where it has them."""
-        seat = f" [{self.seat}]" if self.seat else ""
-        return f"{self.status}: {self.message}{seat}" if self.message else f"{self.status}{seat}"
+        where = self.agent or self.seat
+        where = f" [{where}]" if where else ""
+        return f"{self.status}: {self.message}{where}" if self.message else f"{self.status}{where}"
 
 
 _contract_checked: str | None = None
@@ -149,18 +212,52 @@ def require_contract(timeout: int = 20) -> str:
         payload = {}
     contract = str(payload.get("contract") or "") if isinstance(payload, dict) else ""
 
-    if not contract.split(".")[0] == REQUIRED_CONTRACT_MAJOR:
-        raise SeatTooOld(
+    if _major(contract) not in SPEAKABLE_CONTRACT_MAJORS:
+        speakable = ", ".join(f"{m}.x" for m in sorted(SPEAKABLE_CONTRACT_MAJORS))
+        raise SeatContractUnsupported(
             f"this seat implements devagent-seat-contract {contract or 'an unreadable version'}, "
-            f"and agent-comms {_client_version()} requires {REQUIRED_CONTRACT_MAJOR}.x. "
-            "It has no `seat msg`, so nothing can be delivered here. Upgrade the seat "
-            "application first — seat-then-comms is the deployer's ordering — and note "
-            "that a pre-1.0 seat answers `seat msg` by printing its help and exiting 0, "
-            "so this check is the only thing that catches it."
+            f"and agent-comms {_client_version()} speaks {speakable}. Nothing can be "
+            "delivered here.\n"
+            "  Older than 1.0: the seat has no `seat msg` at all, and a pre-1.0 seat "
+            "answers it by printing its help and exiting 0 — this check is the only "
+            "thing that catches that.\n"
+            "  Newer than we speak: the contract has changed terms nobody here has read. "
+            "Widening this gate is a deliberate act after reading the new contract, never "
+            "a fallback — a client guessing at a seat's shape is exactly what the contract "
+            "removed."
         )
 
     _contract_checked = contract
     return contract
+
+
+def _major(contract: str) -> int | None:
+    """The major, as a NUMBER. `None` when it cannot be read.
+
+    Parsed rather than string-compared: `"10.0"` must not pass a check for
+    major 1, and `"2.0-draft"` must read as 2 — that is the spelling a seat
+    reports while a contract is published but not yet tagged.
+    """
+    head = contract.strip().split(".", 1)[0]
+    digits = ""
+    for ch in head:
+        if not ch.isdigit():
+            break
+        digits += ch
+    return int(digits) if digits else None
+
+
+def speaks_contract(contract: str) -> bool:
+    """Can this client speak that contract? **The one place this is decided.**
+
+    Exported because the answer was being re-derived elsewhere and got it
+    wrong: `comms doctor` carried its own `contract.startswith("1.")`, which is
+    the major-10 trap this module pins against, and it survived the {1, 2}
+    widening in a second home — firing on every healthy 2.0 seat and calling it
+    older than the client. A predicate with two implementations has two
+    behaviours; this is now the only one.
+    """
+    return _major(contract) in SPEAKABLE_CONTRACT_MAJORS
 
 
 def _client_version() -> str:
@@ -168,7 +265,7 @@ def _client_version() -> str:
     return __version__
 
 
-def deliver(body: str, timeout: int = 30) -> Delivery:
+def deliver(body: str, timeout: int = 30, agent: str | None = None) -> Delivery:
     """Hand one message to the seat. The only way this client delivers anything.
 
     The body goes on **stdin**, never as an argument — the seat refuses an argument
@@ -199,9 +296,16 @@ def deliver(body: str, timeout: int = 30) -> Delivery:
             exit_code=2,
         )
 
+    # `--agent` is the ONLY way to address one agent (contract 1.1 §7.2); a
+    # runtime session id is never an address. Omitting it means the seat's
+    # declared default, which on a one-agent seat is today's behaviour exactly.
+    command = ["seat", "msg", "--json"]
+    if agent:
+        command += ["--agent", agent]
+
     try:
         result = subprocess.run(
-            ["seat", "msg", "--json"],
+            command,
             input=encoded,
             capture_output=True,
             timeout=timeout,
@@ -256,6 +360,8 @@ def _parse(stdout: bytes, stderr: bytes, code: int) -> Delivery:
         runtime=str(payload.get("runtime") or ""),
         seat=str(payload.get("seat") or ""),
         exit_code=code,
+        agent=str(payload.get("agent") or ""),
+        label=str(payload.get("label") or ""),
     )
 
 

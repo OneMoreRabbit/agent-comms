@@ -15,9 +15,21 @@ from __future__ import annotations
 import json
 import subprocess
 
+import re
+
 import pytest
 
-from agent_comms import seat as seat_app
+from agent_comms import operations, seat as seat_app
+
+import time
+
+#: Fixtures must carry a REAL time. `timestamp=1` is 1970 and was a don't-care
+#: value until the 24h staleness bound made it meaningful — the exact trap
+#: catalogue 0.55 records ("the test data encoded an assumption that no rule
+#: existed"), found here in our own suite when the bound landed.
+NOW = int(time.time())
+
+
 from agent_comms.seat import Delivery, SeatUnavailable
 from agent_comms.wake import WakeError, compose_turn, wake
 
@@ -183,7 +195,10 @@ def test_the_turn_names_the_sender_first(monkeypatch):
     """ADR-0009 §1a is only actionable if the agent knows who is asking."""
     turn = compose_turn({"id": 9, "sender": "agent-eco-arch", "topic": "t",
                          "content": "do the thing", "permalink": "http://x/9"})
-    assert turn.startswith("[hub message from agent-eco-arch")
+    # The PROPERTY is that the sender is named first and unmissably, not the
+    # literal prefix: R6 put the monotonic id ahead of it so a context-free
+    # session can tell new from replayed. Sender is still the first ACTOR named.
+    assert re.match(r"\[hub message #\d+ from agent-eco-arch", turn), turn[:60]
     assert "comms reply 9" in turn
 
 
@@ -197,11 +212,11 @@ def test_a_held_message_stays_queued_and_is_retried(seat, monkeypatch):
     from agent_comms.store import Store
     from tests.conftest import FakeTransport
 
-    store = Store(seat / ".comms")
+    store = operations.message_store(seat / ".comms")
     transport = FakeTransport(event_batches=[{"result": "success", "events": [
         {"id": 1, "type": "message", "flags": ["mentioned"], "message": {
             "id": 500, "sender_full_name": "agent-eco-arch", "display_recipient": "agent-eco",
-            "subject": "agent-comms: q", "content": "?", "timestamp": 1, "stream_id": 7}},
+            "subject": "agent-comms: q", "content": "?", "timestamp": NOW, "stream_id": 7}},
     ]}])
 
     # First the seat has nothing running, so it holds.
@@ -226,10 +241,10 @@ def test_retry_stops_at_the_first_message_that_will_not_land(seat, monkeypatch):
     from agent_comms.store import Store
     from agent_comms.store import Mention
 
-    store = Store(seat / ".comms")
+    store = operations.message_store(seat / ".comms")
     for mid in (10, 11, 12):
         store.append(Mention(id=mid, sender="agent-eco-arch", channel="agent-eco",
-                             topic="t", content="x", timestamp=1, permalink="",
+                             topic="t", content="x", timestamp=NOW, permalink="",
                              reason="mentioned"))
     fake_seat(monkeypatch, {"success": False, "status": "no-session", "message": "none"},
               code=10)
@@ -243,9 +258,9 @@ def test_a_broken_seat_is_not_hammered(seat, monkeypatch):
     from agent_comms import operations
     from agent_comms.store import Mention, Store
 
-    store = Store(seat / ".comms")
+    store = operations.message_store(seat / ".comms")
     store.append(Mention(id=20, sender="agent-eco-arch", channel="agent-eco", topic="t",
-                         content="x", timestamp=1, permalink="", reason="mentioned"))
+                         content="x", timestamp=NOW, permalink="", reason="mentioned"))
     calls = {"n": 0}
 
     seat_app._contract_checked = "1.0"
@@ -268,9 +283,9 @@ def test_a_permanently_failing_message_stops_being_retried(seat, monkeypatch):
     from agent_comms import operations
     from agent_comms.store import Mention, Store
 
-    store = Store(seat / ".comms")
+    store = operations.message_store(seat / ".comms")
     store.append(Mention(id=30, sender="agent-eco-arch", channel="agent-eco", topic="t",
-                         content="x", timestamp=1, permalink="", reason="mentioned"))
+                         content="x", timestamp=NOW, permalink="", reason="mentioned"))
     fake_seat(monkeypatch, {"success": False, "status": "failed",
                             "message": "body is 70000 bytes; the limit is 65536"}, code=10)
 
@@ -292,14 +307,14 @@ def test_a_pre_1_0_seat_is_refused_loudly(monkeypatch):
     says anything went wrong. Without this check the only symptom is unparseable
     output, which this client would report as a seat defect — blaming the wrong
     component for an upgrade-ordering mistake."""
-    from agent_comms.seat import SeatTooOld
+    from agent_comms.seat import SeatContractUnsupported
 
     seat_app._contract_checked = None
     monkeypatch.setattr(seat_app.subprocess, "run", lambda cmd, **kw:
                         subprocess.CompletedProcess(
                             cmd, 0, json.dumps({"seat": "0.5.1", "contract": "0.5.1"}).encode(), b""))
 
-    with pytest.raises(SeatTooOld) as caught:
+    with pytest.raises(SeatContractUnsupported) as caught:
         seat_app.deliver("body")
     assert "0.5.1" in str(caught.value) and "1.x" in str(caught.value)
     assert "exiting 0" in str(caught.value), "say why silence is not evidence of success"
@@ -356,3 +371,354 @@ def test_the_suite_can_never_reach_a_real_binary(seat):
         out = sp.run([binary, "msg"], capture_output=True)
         assert out.returncode == 127, f"{binary} shim must refuse, got {out.returncode}"
         assert b"test shim refused" in out.stderr
+
+
+# -- devagent-seat-contract 1.1 (draft) ---------------------------------------
+#
+# 1.1 is additive: exit codes are unchanged, so only a consumer branching on the
+# status STRING has to care. These are the places this client branches on it.
+# Each fails against the pre-1.1 client.
+
+def _answer(**fields):
+    import json as _json
+    payload = {"success": False, "status": "delivered", "message": "", "runtime": "claude",
+               "seat": "test-claude"}
+    payload.update(fields)
+    return _json.dumps(payload).encode()
+
+
+def test_conflicted_needs_a_person_not_a_retry():
+    """Exit 20 means a person must intervene. `conflicted` is exit 20.
+
+    Falling through as an ordinary refusal would leave nobody told, and nobody
+    can fix two sessions claiming one agent except a person.
+    """
+    d = seat_app._parse(_answer(status="conflicted",
+                            message="two live sessions could be test-claude.review: 41ab, 7c02"),
+                    b"", 20)
+    assert d.needs_a_person is True
+    assert d.retryable is False
+
+
+def test_unknown_agent_is_never_retried():
+    """This seat does not serve that name. No number of retries changes that."""
+    d = seat_app._parse(_answer(status="unknown-agent",
+                            message="this seat serves test-claude.main, test-claude.review"),
+                    b"", 10)
+    assert d.retryable is False
+    assert d.needs_a_person is False
+
+
+def test_the_resolved_agent_and_label_are_kept():
+    """1.1 answers say WHICH agent took it. A refusal that cannot name the
+    intended recipient is a refusal nobody can act on."""
+    d = seat_app._parse(_answer(success=True, status="delivered",
+                            agent="test-claude.review", label="review"), b"", 0)
+    assert (d.agent, d.label) == ("test-claude.review", "review")
+    assert "test-claude.review" in d.summary()
+
+
+def test_a_1_0_seat_answer_still_parses_with_the_new_fields_absent():
+    """Absence is not an error — every 1.0 guarantee still holds."""
+    d = seat_app._parse(_answer(success=True, status="delivered"), b"", 0)
+    assert (d.agent, d.label) == ("", "")
+    assert d.success is True
+
+
+def test_agent_is_passed_as_a_flag_and_never_as_part_of_the_body(monkeypatch):
+    """`--agent` is the only way to address one agent; an id is never an address."""
+    seen = {}
+
+    class _R:
+        stdout = _answer(success=True, status="delivered", agent="test-claude.review",
+                         label="review")
+        stderr = b""
+        returncode = 0
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = cmd
+        seen["stdin"] = kw.get("input")
+        return _R()
+
+    monkeypatch.setattr(seat_app, "_contract_checked", "1.1")
+    monkeypatch.setattr(seat_app.subprocess, "run", fake_run)
+    seat_app.deliver("hello", agent="test-claude.review")
+
+    assert seen["cmd"] == ["seat", "msg", "--json", "--agent", "test-claude.review"]
+    assert seen["stdin"] == b"hello"
+
+
+def test_no_agent_means_the_seats_default_and_adds_no_flag(monkeypatch):
+    """A caller that passes no new flag behaves exactly as it does today."""
+    seen = {}
+
+    class _R:
+        stdout = _answer(success=True, status="delivered")
+        stderr = b""
+        returncode = 0
+
+    monkeypatch.setattr(seat_app, "_contract_checked", "1.1")
+    monkeypatch.setattr(seat_app.subprocess, "run",
+                        lambda cmd, **kw: (seen.__setitem__("cmd", cmd), _R())[1])
+    seat_app.deliver("hello")
+    assert seen["cmd"] == ["seat", "msg", "--json"]
+
+
+@pytest.mark.parametrize("reported", ["1.0", "1.1", "1.1-draft", "1.2.3", "1"])
+def test_the_gate_accepts_any_major_1(monkeypatch, reported):
+    """Accept-any-major-1, never a string match on "1.0".
+
+    1.1 is additive, so a seat reporting it is strictly MORE capable, not less.
+    A gate that matched the string would refuse the better seat — the same defect
+    class we found in their draft, pointing the other way. `1.1-draft` is the
+    real spelling both test seats report today, measured, not assumed.
+    """
+    import json as _json
+
+    class _R:
+        stdout = _json.dumps({"contract": reported}).encode()
+        stderr = b""
+        returncode = 0
+
+    monkeypatch.setattr(seat_app, "_contract_checked", None)
+    monkeypatch.setattr(seat_app.subprocess, "run", lambda *a, **k: _R())
+    assert seat_app.require_contract() == reported
+
+
+@pytest.mark.parametrize("reported", ["0.5.1", "3.0", "10.0", ""])
+def test_the_gate_refuses_anything_it_does_not_speak(monkeypatch, reported):
+    """Pre-1.0 has no `seat msg`; major 3 is a contract nobody has written.
+
+    `10.0` is here for the trap the obvious fix walks into: a gate that
+    STARTSWITH "1" accepts major 10, which is not major 1.
+
+    **`2.0` was in this list until 2026-09-22**, when arch ruled the gate
+    widened to speak it. The list changed, the trap did not.
+    """
+    import json as _json
+
+    from agent_comms.seat import SeatContractUnsupported
+
+    class _R:
+        stdout = _json.dumps({"contract": reported}).encode()
+        stderr = b""
+        returncode = 0
+
+    monkeypatch.setattr(seat_app, "_contract_checked", None)
+    monkeypatch.setattr(seat_app.subprocess, "run", lambda *a, **k: _R())
+    with pytest.raises(SeatContractUnsupported):
+        seat_app.require_contract()
+
+
+# -- the gate as a SET of majors (arch ruling, 2026-09-22) ---------------------
+
+@pytest.mark.parametrize("reported", ["1.0", "1.1", "1.1-draft", "1.2.3",
+                                      "2.0", "2.0-draft", "2.3"])
+def test_the_gate_speaks_majors_one_and_two(monkeypatch, reported):
+    """Contract 1.0 §9 set seat-then-comms because comms fails against OLDER.
+    Nothing set what happens when the seat goes NEWER by a major — and an
+    equality gate refuses it totally, so seat-first breaks every seat while
+    comms-first is impossible. Widened deliberately, one major at a time."""
+    import json as _json
+
+    class _R:
+        stdout = _json.dumps({"contract": reported}).encode()
+        stderr = b""
+        returncode = 0
+
+    monkeypatch.setattr(seat_app, "_contract_checked", None)
+    monkeypatch.setattr(seat_app.subprocess, "run", lambda *a, **k: _R())
+    assert seat_app.require_contract() == reported
+
+
+@pytest.mark.parametrize("reported", ["0.5.1", "3.0", "10.0", "", "draft", "x.y"])
+def test_the_gate_refuses_everything_else(monkeypatch, reported):
+    """`10.0` is the trap a startswith check walks into; `3.0` is a contract
+    nobody has written. Neither is guessed at."""
+    import json as _json
+
+    from agent_comms.seat import SeatContractUnsupported
+
+    class _R:
+        stdout = _json.dumps({"contract": reported}).encode()
+        stderr = b""
+        returncode = 0
+
+    monkeypatch.setattr(seat_app, "_contract_checked", None)
+    monkeypatch.setattr(seat_app.subprocess, "run", lambda *a, **k: _R())
+    with pytest.raises(SeatContractUnsupported):
+        seat_app.require_contract()
+
+
+def test_the_gate_is_a_set_not_a_comparison():
+    """A floor would admit a major 3 nobody has written. The estate widens this
+    one major at a time, with the contract read first."""
+    from agent_comms.seat import SPEAKABLE_CONTRACT_MAJORS
+
+    assert SPEAKABLE_CONTRACT_MAJORS == frozenset({1, 2})
+    assert 3 not in SPEAKABLE_CONTRACT_MAJORS and 0 not in SPEAKABLE_CONTRACT_MAJORS
+
+
+@pytest.mark.parametrize("spelling,major", [
+    ("2.0-draft", 2), ("1.1-draft", 1), ("10.0", 10), ("", None), ("draft", None)])
+def test_the_major_is_parsed_as_a_number(spelling, major):
+    from agent_comms.seat import _major
+
+    assert _major(spelling) == major
+
+
+# -- the bounds, wired into the delivery path ---------------------------------
+#
+# Before this, retry_undelivered took up to TWENTY undelivered messages per pass
+# with NO staleness check, so restoring a seat after an outage replayed its whole
+# backlog as live turns. That is the September incident, and it is what made 2.0
+# undeployable without a manual precaution.
+
+def _old(store, n, age_secs, first_id=100):
+    from agent_comms.store import Mention
+    for i in range(n):
+        store.append(Mention(id=first_id + i, sender="agent-eco-arch", channel="agent-eco",
+                             topic="t", content=f"m{i}", timestamp=int(time.time()) - age_secs,
+                             permalink="", reason="mentioned"))
+
+
+def test_nothing_past_the_age_bound_is_ever_attempted(seat, monkeypatch):
+    """A stale message must not reach a session EVEN ONCE: it arrives looking
+    current, which is what makes it dangerous."""
+    from agent_comms.store import Store
+
+    store = operations.message_store(seat / ".comms")
+    _old(store, 5, 48 * 3600)
+    attempted = []
+    monkeypatch.setattr(operations, "wake", lambda m: attempted.append(m["id"]))
+
+    operations.retry_undelivered(transport_factory=lambda c: FakeTransport())
+
+    # id 0 is the retirement summary — one line about the batch, which IS
+    # delivered. What must not be delivered is any of the stale messages.
+    assert [i for i in attempted if i] == [], f"attempted {attempted} past the bound"
+    assert attempted.count(0) == 1, "the batch was not summarised, or was summarised twice"
+    assert all(m.retired for m in store.all()), "retired without being recorded as retired"
+
+
+def test_a_backlog_is_capped_at_three_newest_per_pass(seat, monkeypatch):
+    """THE FLOOD, BOUNDED. Twenty per pass was the old behaviour."""
+    from agent_comms.store import Store
+
+    store = operations.message_store(seat / ".comms")
+    _old(store, 20, 60)                       # fresh, so the age bound does not apply
+    delivered = []
+
+    class _Ok:
+        success, retryable, status, message = True, False, "delivered", ""
+
+        def summary(self):
+            return "delivered"
+
+    monkeypatch.setattr(operations, "wake",
+                        lambda m: (delivered.append(m["id"]), _Ok())[1])
+    operations.retry_undelivered(transport_factory=lambda c: FakeTransport())
+
+    assert len(delivered) == 3, f"delivered {len(delivered)}, not 3"
+    assert delivered == sorted(delivered), "delivered out of arrival order"
+    assert delivered == [117, 118, 119], "not the three NEWEST"
+
+
+def test_retirement_says_it_once_with_the_supersession_caveat(seat):
+    """One line for a batch, never N stale turns."""
+    from agent_comms.store import Mention
+
+    retired = [Mention(id=1, sender="s", channel="c", topic="t", content="x",
+                       timestamp=int(time.time()) - 99999, permalink="")]
+    line = operations.retirement_summary(retired, still_waiting=7)
+
+    assert "1 message(s) were not delivered" in line
+    assert "7 more are still queued" in line
+    assert "not instructions" in line and "newest-first" in line
+
+
+def test_retired_mail_is_kept_and_readable(seat, monkeypatch):
+    """Nothing is deleted. `delivered` and `retired` are separate facts, because
+    conflating them is what made the 1.0.0 store ambiguous to migrate."""
+    from agent_comms.store import Store
+
+    store = operations.message_store(seat / ".comms")
+    _old(store, 1, 48 * 3600)
+    monkeypatch.setattr(operations, "wake", lambda m: None)
+    operations.retry_undelivered(transport_factory=lambda c: FakeTransport())
+
+    row = store.all()[0]
+    assert row.content == "m0", "the message was destroyed, not retired"
+    assert row.retired and row.delivered is True
+
+
+def test_an_unknown_status_word_at_exit_30_is_still_retried():
+    """MEASURED on a 2.0 seat, 2026-09-23: it answered `unresolved` — a word in
+    no published contract — at exit 30, and said in its own message "Retryable".
+
+    Matching on the word alone, we did not retry it: a message that could have
+    landed would have sat forever. Exit codes are the contract's stable surface
+    and its stated guarantee is that a consumer branching on them needs no
+    change when words are added. So 30 is read as 30.
+    """
+    d = seat_app._parse(_answer(status="unresolved",
+                                message="could not resolve: the answer carries no "
+                                        "seat_local_id. Retryable — the message is still yours."),
+                        b"", 30)
+    assert d.retryable is True
+    assert d.needs_a_person is False
+
+
+def test_an_unknown_word_at_exit_20_still_needs_a_person():
+    """The other direction has to hold, or the rule is just optimism."""
+    d = seat_app._parse(_answer(status="some-new-word"), b"", 20)
+    assert d.retryable is False
+
+
+def test_the_turn_carries_the_monotonic_id(seat):
+    """R6. A context-free session must be able to tell new from replayed.
+
+    ingstr's corollary is why it rides ON THE TURN and not only in the store:
+    existence proves delivery and says nothing about continuity. A session that
+    has seen #2950 knows #2946 is older without consulting our records — which
+    is the point, because after a restart it does not have our records.
+    """
+    from agent_comms.wake import compose_turn
+
+    line = compose_turn({"id": 2946, "sender": "agent-eco-arch", "topic": "t",
+                         "content": "x", "permalink": "p"})
+    assert line.startswith("[hub message #2946 from agent-eco-arch")
+
+
+def test_the_reading_surface_reports_honest_states(seat):
+    """`retired` is checked BEFORE `delivered`, because a retired message carries
+    both — delivered is the bookkeeping, retired is the fact nobody saw it."""
+    from agent_comms.store import Mention, Store
+
+    store = operations.message_store(seat / ".comms")
+    store.append(Mention(id=1, sender="s", channel="c", topic="t", content="x",
+                         timestamp=NOW, permalink="", delivered=True, retired="too old"))
+    store.append(Mention(id=2, sender="s", channel="c", topic="t", content="x",
+                         timestamp=NOW, permalink="", delivered=True))
+    store.append(Mention(id=3, sender="s", channel="c", topic="t", content="x",
+                         timestamp=NOW, permalink="", authorised=False))
+
+    states = {r["id"]: r["state"] for r in operations.recent(last=10)}
+    assert states == {1: "retired", 2: "delivered", 3: "refused"}
+
+    data = operations.stats()
+    assert data["retired"] == 1 and data["refused"] == 1
+    assert [r["id"] for r in operations.recent(last=10)] == [3, 2, 1], "not newest-first"
+
+
+def test_trace_says_when_something_is_not_recorded(seat):
+    """Trace ends arguments, so it must not imply an absence is a fact."""
+    from agent_comms.store import Mention, Store
+
+    operations.message_store(seat / ".comms").append(Mention(id=7, sender="arch", channel="agent-eco",
+                                          topic="t", content="x", timestamp=NOW,
+                                          permalink="", authorised=False))
+    out = "\n".join(operations.trace(7))
+    assert "stored and never delivered" in out
+    assert "events.log" in out, "must point at where the rest of the history lives"
+    assert "no message" in "\n".join(operations.trace(999))

@@ -23,7 +23,9 @@ from typing import Callable
 from .config import Credential, Settings, load_credential, load_settings
 from .directory import Directory
 from .directory import load as load_directory
+from . import config_sync
 from .errors import (
+    ChannelNotReachable,
     CommsDisabled,
     CommsError,
     ConflictingWakeTriggers,
@@ -36,10 +38,53 @@ from .errors import (
     QueueGapError,
 )
 from .hub import Hub, Registration, Transport, build_transport
-from .seat import SeatUnavailable
+from .seat import SeatUnavailable, speaks_contract
+from .seat import _client_version
 from .seat import state as seat_state_now
 from .wake import WakeError, wake
 from .store import DaemonState, Mention, Store
+from .queue import MessageStore
+
+
+def message_store(state_dir) -> MessageStore:
+    """The store of record for messages. **SQLite, since 2.0.**
+
+    The JSONL file stops being the store and becomes what it always was
+    underneath — the backup. On first use its contents are imported once, with
+    the two refusals to guess that migration documents: a message refused by
+    the permission graph imports as `refused` whatever its delivered flag says,
+    and an undelivered one imports as `expired` rather than being assumed
+    either way.
+
+    Import happens HERE rather than in a deploy step because a migration a
+    person has to remember is a migration that gets skipped on the seat nobody
+    was watching.
+    """
+    store = MessageStore(Path(state_dir) / "comms.db")
+    source = Path(state_dir) / "messages.jsonl"
+    if source.exists():
+        # **ALWAYS, not once.** The import is idempotent on the hub id, so
+        # re-running it costs a file read and catches anything the JSONL has
+        # that the database does not.
+        #
+        # It ran once behind a marker until 2026-09-23, and this seat proved
+        # why that was wrong: a daemon still running PRE-2.0 code keeps
+        # appending to the JSONL while the CLI reads SQLite, and the marker
+        # stops the two ever meeting. Two of arch's messages were sitting in
+        # the JSONL, invisible to `comms show`, with nothing reporting a
+        # problem — a stranding window created by the very thing meant to
+        # migrate cleanly.
+        #
+        # Removing the marker removes the window. The same shape as the WAL
+        # fix an hour earlier: delete the state that goes stale rather than
+        # manage it.
+        from .migrate import import_jsonl
+        out = import_jsonl(source, store)
+        if out.written:
+            (Path(state_dir) / ".last-import").write_text(
+                out.report(source, store.path), encoding="utf-8")
+    return store
+
 
 
 @dataclass
@@ -165,6 +210,55 @@ def preflight(
         report.add("subscription", False, str(exc))
         return report
 
+    # Every channel the directory says we must reach, checked against the ones
+    # this bot actually holds. A transports record naming a channel we are not
+    # subscribed to is silent non-delivery waiting to happen: the send would
+    # succeed and the reply would never arrive.
+    try:
+        held = hub.subscribed_channels()
+    except CommsError as exc:
+        report.add("reachable channels", False, str(exc))
+        held = frozenset()
+    else:
+        wanted = _transport_channels(settings)
+        missing = sorted(c for c in wanted if c not in held)
+        if missing:
+            # GRANT WITHOUT SUBSCRIPTION. This is the direction that loses
+            # messages: the send posts and the reply never comes back. §5a
+            # provisions the two together, so this is drift, not a state
+            # anybody chose — and it is fixed by orch's provisioning replay,
+            # which is idempotent from the graph.
+            report.add(
+                "reachable channels", False,
+                f"GRANT WITHOUT SUBSCRIPTION — the routing records name channel(s) this "
+                f"bot cannot reach: {', '.join(missing)}. A message addressed there would "
+                f"post and its reply would never come back. §5a provisions the grant and "
+                f"the subscription together, so this is drift: ask the orchestrator to "
+                f"replay provisioning, which reconciles subscriptions from the graph. "
+                f"Subscribed to: {', '.join(sorted(held))}.")
+        elif wanted:
+            report.add("reachable channels", True,
+                       f"every routed channel is subscribed: {', '.join(sorted(wanted))}")
+        else:
+            report.notes.append(
+                "no routing records are cached yet, so there is nothing to check "
+                "beyond this seat's own channel")
+
+        # SUBSCRIPTION WITHOUT GRANT — the other direction, and deliberately a
+        # NOTE. It loses nothing: an ungranted channel delivers events we then
+        # refuse by the permission graph, which is the graph working. Making it
+        # a warning would fire on every seat holding a test channel, and a
+        # warning that fires every time is learned into invisibility
+        # (constitution §9) — it would take the failure above down with it.
+        if wanted:
+            spare = sorted(c for c in held if c not in wanted)
+            if spare:
+                report.notes.append(
+                    f"subscribed to {', '.join(spare)} with no routing record naming "
+                    "it. Nothing is lost — mail from there is refused by the permission "
+                    "graph — but after a narrowing, a subscription left behind is what "
+                    "the provisioning replay tidies.")
+
     try:
         registration = hub.register_queue()
     except CommsError as exc:
@@ -235,10 +329,12 @@ def preflight(
         known = bool(build.version and build.contract)
         report.add("seat build", known,
                    f"seat {build.version or '?'} (contract {build.contract or '?'})")
-        if known and not build.contract.startswith("1."):
+        if known and not speaks_contract(build.contract):
             report.warnings.append(
-                f"this seat implements contract {build.contract}; agent-comms 1.x "
-                "requires 1.0 and cannot deliver to an older seat."
+                f"this seat implements contract {build.contract}, which agent-comms "
+                f"{_client_version()} does not speak. Nothing can be delivered here "
+                "until the pair is on speaking terms — check which half is behind "
+                "before upgrading either."
             )
     except SeatUnavailable as exc:
         report.add("seat build", False, str(exc))
@@ -247,6 +343,19 @@ def preflight(
     # above all pass and the seat receives nothing — every other failure in this
     # client's catalogue has that shape, and this one had it too until it was
     # measured by hand on 2026-09-10.
+    side = Store(settings.state_dir)
+    running_build = side.daemon_build()
+    if daemon_is_running(side) and running_build and running_build != _client_version():
+        report.add(
+            "daemon build", False,
+            f"the RUNNING daemon is {running_build}; this CLI is {_client_version()}. "
+            "They are out of step, which is a real state during an upgrade and not a "
+            "guess — the daemon is a process and the CLI is whatever is on disk now. "
+            "Restart it to bring them together: comms daemon --restart. Until then "
+            "the two halves may disagree about where messages are stored.")
+    elif running_build:
+        report.add("daemon build", True, f"daemon and CLI both {running_build}")
+
     daemon = Store(settings.state_dir).daemon_state()
     report.add("daemon", daemon.running and not daemon.stale, daemon.summary())
 
@@ -286,6 +395,27 @@ def _wake_summary(settings: Settings) -> str:
         "(the estate installs this file; ansible-platform owns it on a provisioned "
         "seat). Until then, mentions are only visible to `comms inbox`."
     )
+
+
+def daemon_is_running(store) -> bool:
+    """One place asks; `doctor` and the build check must not disagree."""
+    return store.daemon_state().running
+
+
+def _transport_channels(settings: Settings) -> set[str]:
+    """Channels named by cached routing records, plus this seat's own.
+
+    Read from the local config the periodic layer writes. Absent means nothing
+    has been fetched yet, which is a note rather than a failure — there is
+    genuinely nothing to check.
+    """
+    channels = {settings.channel.strip().casefold()}
+    records = config_sync.load(settings.state_dir).get("routes") or []
+    for record in records:
+        name = ((record or {}).get("transports") or {}).get("comms", {}).get("channel")
+        if name:
+            channels.add(str(name).strip().casefold())
+    return channels
 
 
 def _permalink(site: str, event_msg: dict) -> str:
@@ -389,13 +519,13 @@ def mention_from_event(
 
 def inbox(unread_only: bool = True, **kw) -> list[Mention]:
     settings = load_settings(**kw)
-    store = Store(settings.state_dir)
+    store = message_store(settings.state_dir)
     return store.unread() if unread_only else store.all()
 
 
 def show(message_id: int, **kw) -> Mention | None:
     settings = load_settings(**kw)
-    store = Store(settings.state_dir)
+    store = message_store(settings.state_dir)
     for m in store.all():
         if m.id == message_id:
             store.mark_read(message_id)
@@ -494,6 +624,7 @@ def send(
     to: str | None = None,
     subject: str | None = None,
     topic: str | None = None,
+    channel: str | None = None,
     transport_factory: Callable[[Credential], Transport] = build_transport,
     **kw,
 ) -> dict:
@@ -545,9 +676,42 @@ def send(
     hub = Hub(transport_factory(credential), settings, credential)
     recipient = _resolve_recipient(settings, hub, recipient)
 
-    warnings = _mention_warnings(hub, content, settings.channel)
-    response = hub.send(settings.channel, topic, addressed(recipient, content))
+    channel = channel or settings.channel
+    require_reachable(hub, channel)
+
+    warnings = _mention_warnings(hub, content, channel)
+    response = hub.send(channel, topic, addressed(recipient, content))
     return Posted(response=response, warnings=warnings)
+
+
+def require_reachable(hub: Hub, channel: str) -> None:
+    """Refuse to post into a channel this bot is not subscribed to.
+
+    **Subscription is the routing mechanism and nothing declares it.** The event
+    queue carries no narrow, so a seat receives exactly what its bot holds.
+    Measured 2026-09-22: a message posted in a channel this bot does not hold
+    produces no event at all — not a refusal, not a stored record, not a log
+    line. Silence at the transport layer, before any permission check.
+
+    So posting into an unsubscribed channel would send a message whose reply we
+    could never read: we would start a topic we cannot follow. Cross-project
+    conversations live entirely in the RECIPIENT's channel with the sender's bot
+    subscribed there (comms-design §5a) — this is the check that makes that a
+    requirement rather than a hope.
+    """
+    held = hub.subscribed_channels()
+    if channel.strip().casefold() in held:
+        return
+    raise ChannelNotReachable(
+        f"this seat's bot is not subscribed to '{channel}', so a message posted "
+        "there would go out and its reply would never come back — the event "
+        "queue carries no narrow, so a seat receives exactly what its bot holds "
+        "and nothing else.\n"
+        f"  subscribed to: {', '.join(sorted(held)) or '(nothing)'}\n"
+        "  A cross-project conversation lives in the RECIPIENT's channel and the "
+        "sender's bot must be subscribed there (comms-design §5a). Subscribe it, "
+        "or address an agent whose channel this seat already holds."
+    )
 
 
 def _resolve_recipient(settings: Settings, hub: Hub, name: str) -> str:
@@ -621,7 +785,7 @@ def reply(
 ) -> dict:
     """Reply in the mention's own topic, so the conversation stays one thread."""
     settings = load_settings(**kw)
-    store = Store(settings.state_dir)
+    store = message_store(settings.state_dir)
     target = next((m for m in store.all() if m.id == message_id), None)
     if target is None:
         raise CommsError(f"no message {message_id} in the local store")
@@ -660,7 +824,7 @@ def wake_agent(
       malformed call repeated is how a bug becomes a flood.
     """
     settings = load_settings(**kw)
-    store = Store(settings.state_dir)
+    store = message_store(settings.state_dir)
     store.ensure()
     mid = mention.get("id")
 
@@ -732,25 +896,114 @@ def _announce_held(
     )
 
 
+#: **The bounds, wired into the delivery path.** Before this, `retry_undelivered`
+#: took up to TWENTY undelivered messages per pass with no staleness check at
+#: all, so restoring a seat after an outage replayed its whole backlog as live
+#: turns. That is the September incident, and it is what made 2.0 undeployable
+#: without a manual precaution.
+#:
+#: Configurable, and these are the operator's numbers.
+MAX_AGE_SECS = 24 * 60 * 60
+#: At most this many per pass, so a backlog never arrives as N live turns. The
+#: NEWEST ones, because the newest are the likeliest to still be current — the
+#: rest stay stored and the agent is told once that they exist.
+MAX_PER_PASS = 3
+
+
+def retire_stale(store: Store, max_age_secs: int = MAX_AGE_SECS) -> list[Mention]:
+    """Retire everything past the age bound BEFORE any attempt is made.
+
+    **Checked before every pass, not only before the first attempt.** The design
+    says before the first; that leaves any message which got one attempt
+    unbounded, because nothing fixes a retry interval — so it reaches a session
+    days later, which is the exact thing the rule exists to prevent. Built to
+    the rule's stated intent: *a stale message must not reach a session even
+    once, because it arrives looking current.*
+
+    Nothing is deleted. Retired messages stay in the store and in `comms inbox`,
+    to be read deliberately, newest-first.
+    """
+    now = time.time()
+    retired = []
+    for mention in store.undelivered():
+        if now - mention.timestamp > max_age_secs:
+            store.mark_retired(mention.id, f"older than {max_age_secs // 3600}h")
+            retired.append(mention)
+    return retired
+
+
+def retirement_summary(retired: list[Mention], still_waiting: int) -> str:
+    """ONE line for a batch. Never N stale turns.
+
+    Carries the caveat that earned itself: a context-free seat cannot tell a
+    superseded instruction from a current one, and the neighbours are the
+    evidence.
+    """
+    oldest = min((m.when for m in retired), default="")
+    line = (f"**{len(retired)} message(s) were not delivered** — older than "
+            f"{MAX_AGE_SECS // 3600}h (oldest {oldest}). They are in `comms inbox`, "
+            "unread and unretried.")
+    if still_waiting:
+        line += f" {still_waiting} more are still queued behind this pass."
+    return line + ("\n\nThese are **not instructions**: later messages commonly "
+                   "supersede earlier ones, so read newest-first and check the "
+                   "current state before acting on any of them.")
+
+
+def _tell_agent_once(settings, store, text, transport_factory) -> None:
+    """Put the summary in front of the agent — one line, via the wake path.
+
+    Deliberately not a hub post: this is about mail already on this seat, so
+    telling the channel would be noise to everyone else. Failure to wake is
+    swallowed on purpose — the summary is a courtesy, and a seat that cannot be
+    woken has a louder problem that `doctor` already reports.
+    """
+    try:
+        wake({"id": 0, "sender": "agent-comms", "channel": settings.channel,
+              "topic": "retired mail", "content": text, "timestamp": int(time.time()),
+              "permalink": "", "read": False, "reason": "summary",
+              "delivered": False, "attempts": 0, "authorised": True, "retired": ""})
+    except (WakeError, Exception):  # noqa: BLE001 — a courtesy must not break a pass
+        store.record("warn", "could not deliver the retirement summary")
+
+
 def retry_undelivered(
     transport_factory: Callable[[Credential], Transport] = build_transport,
-    limit: int = 20,
+    limit: int = MAX_PER_PASS,
+    max_age_secs: int = MAX_AGE_SECS,
     **kw,
 ) -> int:
-    """Try the queue again. Returns how many landed this pass.
+    """Try the queue again, BOUNDED. Returns how many landed this pass.
 
-    This is the other half of owning the queue: without it, "stored and will be
-    retried" would be a claim nothing honoured, which is the shape this estate has
-    spent a fortnight removing.
+    Three bounds, each bought by the September incident:
 
-    **Oldest first, and it stops at the first still-undeliverable message.** A
-    conversation delivered out of order is worse than one delivered late, and if
-    the seat cannot take one it will not take the next either — walking the whole
-    queue to collect identical refusals is noise and load for nothing.
+    1. **Age is checked before every attempt.** Anything past the bound is
+       retired here, before delivery is attempted, so nothing stale reaches a
+       session even once.
+    2. **At most `limit` per pass, the NEWEST ones**, so a backlog never arrives
+       as N live turns. Selected newest-first and then delivered in arrival
+       order, because a conversation delivered out of order is worse than one
+       delivered late.
+    3. **One summary line** tells the agent what was retired and what is still
+       waiting — not N turns saying it.
+
+    It stops at the first still-undeliverable message: if the seat cannot take
+    one it will not take the next either.
     """
     settings = load_settings(**kw)
-    store = Store(settings.state_dir)
-    pending = [m for m in store.undelivered() if m.authorised][:limit]
+    store = message_store(settings.state_dir)
+
+    retired = retire_stale(store, max_age_secs)
+    waiting = [m for m in store.undelivered() if m.authorised]
+    # Newest first for the CAP, then arrival order for DELIVERY.
+    pending = sorted(sorted(waiting, key=lambda m: m.id, reverse=True)[:limit],
+                     key=lambda m: m.id)
+    if retired:
+        store.record("warn", f"retired {len(retired)} message(s) past the "
+                             f"{max_age_secs // 3600}h bound without delivering them")
+        _tell_agent_once(settings, store,
+                         retirement_summary(retired, max(0, len(waiting) - len(pending))),
+                         transport_factory)
     if not pending:
         return 0
 
@@ -760,7 +1013,7 @@ def retry_undelivered(
             result = wake(asdict(mention))
         except WakeError:
             break  # the seat is not reachable at all; nothing else will land either
-        attempts = store.record_attempt(mention.id)
+        attempts = store.record_attempt_for(mention.id)
         if not result.success:
             if not result.retryable:
                 # broken, or our own usage error. Leave it stored and stop: both
@@ -921,7 +1174,7 @@ def detach_daemon(log_path: str | None = None, **kw) -> int:
     saying so plainly is better than a half-restarter that hides the gap.
     """
     settings = load_settings(**kw)
-    store = Store(settings.state_dir)
+    store = message_store(settings.state_dir)
     store.ensure()
 
     state = store.daemon_state()
@@ -982,17 +1235,28 @@ def stop_daemon(timeout: float = 10.0, **kw) -> tuple[bool, int | None]:
     `DaemonWillNotStop` rather than returning a hopeful answer.
     """
     settings = load_settings(**kw)
-    store = Store(settings.state_dir)
+    store = message_store(settings.state_dir)
     store.ensure()
 
     state = store.daemon_state()
     if not state.running:
         return False, None
     if state.pid is None:
+        # Both sources are exhausted: the lock file is empty AND the kernel's
+        # lock table could not name a holder. Say so and stop. It must NOT
+        # suggest a pattern match — `pkill -f "comms daemon"` matches the tmux
+        # server's own argv and takes every session on the seat with it. That
+        # advice used to live in this message and it cost thirteen seats their
+        # sessions (orchestrator need, 2026-09-21).
+        lock = settings.state_dir / "daemon.lock"
         raise DaemonWillNotStop(
-            "a daemon holds this seat's lock but its pid is unreadable, so there is "
-            f"nothing to signal. Find it with: pgrep -f 'comms daemon', then kill it, "
-            f"and check {settings.state_dir / 'daemon.lock'} is writable."
+            f"something holds {lock} but neither the lock file nor the kernel's lock "
+            "table can name it, so there is nothing safe to signal. Find the holder "
+            f"exactly, by that one file:\n"
+            f"    fuser -v {lock}        # or: lsof {lock}\n"
+            "then stop that pid. NEVER match on the command line: a seat's tmux server "
+            "carries 'comms daemon' in its own argv, so pkill -f would kill the server "
+            "and every session inside it."
         )
 
     pid = state.pid
@@ -1093,7 +1357,7 @@ def supervise_daemon(
     `max_restarts` bounds the loop for tests; unbounded in a seat.
     """
     settings = load_settings(**kw)
-    store = Store(settings.state_dir)
+    store = message_store(settings.state_dir)
     store.ensure()
 
     restarts, delay = 0, backoff_start
@@ -1177,7 +1441,7 @@ def run_daemon(
     settings = load_settings(**kw)
     check_wake_triggers(settings)
     credential = load_credential(settings.identity)
-    store = Store(settings.state_dir)
+    store = message_store(settings.state_dir)
     store.ensure()
     lock = store.acquire_daemon_lock()  # released by the OS when this process ends
 
@@ -1216,10 +1480,12 @@ def run_daemon(
     # so without this a freshly started daemon carries the *previous* daemon's
     # last tick and reads as wedged for its first minute — a false alarm on the
     # one signal that has to stay trustworthy.
+    store.record_build(_client_version())
     store.save_position(registration.queue_id, registration.last_event_id)
 
     stored, iterations, backoff = 0, 0, 1
     last_backstop = time.monotonic()
+    last_config = 0.0
     gap_recovery = False
     while max_iterations is None or iterations < max_iterations:
         iterations += 1
@@ -1311,6 +1577,15 @@ def run_daemon(
         # Check the doorstep regardless. Two failures hide from the queue alone:
         # a connection that hangs without erroring, and a queue replaced between
         # ticks. Both look exactly like a quiet channel.
+        if time.monotonic() - last_config >= CONFIG_REFRESH_SECS:
+            last_config = time.monotonic()
+            got = config_sync.fetch(settings.identity.project, settings.identity.seat,
+                                    settings.state_dir)
+            if got.source == "directory":
+                store.record("info", f"config: {got.line()}")
+            elif got.reason:
+                store.record("warn", f"config: {got.reason}; running from file")
+
         if time.monotonic() - last_backstop >= BACKSTOP_SECS:
             last_backstop = time.monotonic()
             # The queue is ours, so something has to work it. Without this,
@@ -1355,6 +1630,8 @@ def run_daemon(
 #: and that is the number worth spending an API call on. Twelve calls an hour
 #: against a hub this seat already long-polls continuously is not a cost.
 BACKSTOP_SECS = 300
+#: Slow-changing facts, §4a. Not on the hot path: resolution is per send.
+CONFIG_REFRESH_SECS = 300
 
 #: How many times a held message is retried before this client stops and says so.
 #:
@@ -1573,3 +1850,194 @@ def _notify(settings: Settings, store: Store, mention: Mention) -> None:
             )
     except Exception as exc:
         store.record("warn", f"notify_command failed for message {mention.id}: {exc}")
+
+
+# -- the reading surface (design §6, R17) -------------------------------------
+
+def _state_of(m: "Mention") -> str:
+    """One honest word for a 1.0-shaped record.
+
+    `retired` is checked BEFORE `delivered` because a retired message carries
+    both: `delivered` is the bookkeeping that stops it being picked up again,
+    `retired` is the fact that nobody ever saw it. Reading them the other way
+    round is exactly the conflation that made the 1.0.0 store ambiguous.
+    """
+    if not m.authorised:
+        return "refused"
+    if m.retired:
+        return "retired"
+    if m.delivered:
+        return "delivered"
+    return "queued"
+
+
+def recent(last: int = 20, state: str = "", **kw) -> list[dict]:
+    """The last N messages, newest first, one dict each."""
+    store = message_store(load_settings(**kw).state_dir)
+    rows = sorted(store.all(), key=lambda m: m.id, reverse=True)
+    out = []
+    for m in rows:
+        current = _state_of(m)
+        if state and current != state:
+            continue
+        out.append({"id": m.id, "when": m.when, "state": current, "sender": m.sender,
+                    "topic": m.topic, "attempts": m.attempts,
+                    "retired": m.retired, "permalink": m.permalink})
+        if len(out) >= last:
+            break
+    return out
+
+
+def stats(**kw) -> dict:
+    """Counts by state and queue health — for a person and for the estate.
+
+    Exposed as JSON on purpose: the estate polls this rather than reading a
+    seat's prose, and a number nobody can poll is a number nobody checks.
+    """
+    settings = load_settings(**kw)
+    store = message_store(settings.state_dir)
+    rows = store.all()
+    counts: dict[str, int] = {}
+    for m in rows:
+        counts[_state_of(m)] = counts.get(_state_of(m), 0) + 1
+    waiting = [m for m in rows if _state_of(m) == "queued"]
+    daemon = store.daemon_state()
+    return {
+        "seat": settings.identity.seat,
+        "stored": len(rows),
+        "by_state": counts,
+        "undelivered": len(waiting),
+        "retired": counts.get("retired", 0),
+        "refused": counts.get("refused", 0),
+        "oldest_undelivered": min((m.when for m in waiting), default=""),
+        "daemon": daemon.summary(),
+        "daemon_running": daemon.running,
+    }
+
+
+def trace(message_id: int, **kw) -> list[str]:
+    """One message end to end: where it came from, what was decided, what happened.
+
+    The point of `trace` is that it ends arguments — so it prints what is known
+    and says plainly when something is not recorded, rather than implying the
+    absence is a fact.
+    """
+    store = message_store(load_settings(**kw).state_dir)
+    found = next((m for m in store.all() if m.id == message_id), None)
+    if found is None:
+        return [f"no message {message_id} on this seat."]
+
+    lines = [
+        f"message {found.id}   {found.when}",
+        f"  from      {found.sender}   ({found.reason})",
+        f"  topic     {found.topic}",
+        f"  channel   {found.channel}",
+        f"  state     {_state_of(found)}"
+        + (f" — {found.retired}" if found.retired else ""),
+        f"  attempts  {found.attempts}",
+        f"  permitted {'yes' if found.authorised else 'NO — stored and never delivered'}",
+    ]
+    if found.permalink:
+        lines.append(f"  cite      {found.permalink}")
+    lines.append("  wake and per-attempt history are in ~/.comms/events.log; "
+                 "the per-transition record arrives with the SQLite store.")
+    return lines
+
+
+def resolve_name(name: str, **kw) -> list[str]:
+    """`comms resolve <name>` — what would this address resolve to, and WHY.
+
+    **The command that ends arguments.** It prints the resolution path, the
+    answer, the delivery mode and the permission verdict, and it sends nothing.
+    Every failure this client has had in the field looked like "the message
+    went nowhere"; this is how a person finds out where it would have gone
+    before they send it.
+    """
+    from .delivery import NotDeliverable, permitted_to_send, plan, transport_for
+    from .resolve import Resolver
+
+    settings = load_settings(**kw)
+    me = f"bakehouse.{settings.identity.project}.{settings.identity.seat}"
+    answer = Resolver(local_agents=config_sync.agent_set(settings.state_dir)).resolve(
+        name, caller=me)
+
+    out = [f"{name}", f"  asked as   {me}", f"  answer     {answer.status}",
+           f"  source     {answer.source}" + ("  (degraded)" if answer.degraded else ""),
+           f"  because    {answer.reason or answer.message or '—'}"]
+    if answer.near_misses:
+        out.append(f"  did you mean  {', '.join(answer.near_misses[:5])}")
+    if not answer.success:
+        out.append("  would send  NO — nothing would be delivered")
+        return out
+
+    out += [f"  canonical  {answer.canonical_id}",
+            f"  revision   {answer.route_revision}"]
+    try:
+        p = plan(answer)
+        t = transport_for(p.fqn, answer.transports)
+        allowed, why = permitted_to_send(p.delivery or "inject")
+        out += [f"  transport  channel {t['channel']}, bot {t['bot']}",
+                f"  delivery   {p.delivery or '(none declared)'}",
+                f"  would send  {'YES' if allowed else 'NO — ' + why}"]
+    except NotDeliverable as exc:
+        out.append(f"  would send  NO — {exc}")
+    return out
+
+
+def queued_now(**kw) -> list[dict]:
+    """`comms queue` — exactly what the next pass would deliver, in order.
+
+    Not "everything waiting": the bounds apply here as they do in the pass, so
+    what this prints is what would actually go. A queue view that shows more
+    than the pass would send teaches the wrong expectation.
+    """
+    settings = load_settings(**kw)
+    store = message_store(settings.state_dir)
+    retired = retire_stale(store)
+    waiting = [m for m in store.undelivered() if m.authorised]
+    due = sorted(sorted(waiting, key=lambda m: m.id, reverse=True)[:MAX_PER_PASS],
+                 key=lambda m: m.id)
+    return [{"id": m.id, "when": m.when, "sender": m.sender, "topic": m.topic,
+             "attempts": m.attempts, "of": len(waiting),
+             "retired_this_check": len(retired)} for m in due]
+
+
+def retire(message_id: int, reason: str, **kw) -> str:
+    """`comms retire <id> --reason` — the supported version of editing the store.
+
+    **Logged, always.** A person removing a message from the queue by hand is a
+    legitimate act; doing it by editing a file is how a store stops being
+    evidence. The reason is required for the same purpose: `retired` without a
+    cause is indistinguishable from a bug, six months later.
+    """
+    store = message_store(load_settings(**kw).state_dir)
+    if not store.mark_retired(message_id, f"by hand: {reason}"):
+        return f"no message {message_id} on this seat."
+    store.record("info", f"retired {message_id} by hand: {reason}")
+    return f"retired {message_id}, never delivered — {reason}"
+
+
+def requeue(message_id: int, reason: str, **kw) -> str:
+    """`comms requeue <id> --reason` — deliberate resurrection, logged.
+
+    The ONE place a message moves backwards, and it needs a person to say so.
+    Everything else in this store is forward-only; an operator resurrecting a
+    message is a decision, not a transition, and the record says which by
+    carrying the reason and the fact that a human asked.
+    """
+    from .queue import QUEUED
+
+    settings = load_settings(**kw)
+    store = message_store(settings.state_dir)
+    row = store._find(message_id)
+    if row is None:
+        return f"no message {message_id} on this seat."
+    store.db.execute(
+        "UPDATE messages SET state=?, attempts=0, retired_reason='' WHERE id=?",
+        (QUEUED, row["id"]))
+    store._log(row["id"], row["state"], QUEUED, f"requeued by hand: {reason}",
+               rule="operator")
+    store.record("info", f"requeued {message_id} by hand: {reason}")
+    return (f"requeued {message_id} from {row['state']} — {reason}\n"
+            "Attempts reset. The age bound still applies: if it is past the bound "
+            "it will retire again on the next pass rather than deliver.")

@@ -9,6 +9,10 @@ from __future__ import annotations
 import click
 import pytest
 
+import time as _time
+
+NOW = int(_time.time())
+
 from agent_comms import operations
 from agent_comms.config import Settings, load_credential, load_settings
 from agent_comms.errors import (
@@ -249,6 +253,10 @@ def test_doctor_reports_every_check_not_just_the_first(running_daemon, monkeypat
     report = operations.preflight(transport_factory=lambda c: FakeTransport())
     names = [n for n, _, _ in report.checks]
     assert names == ["enabled", "credential", "identity", "subscription",
+                     # "reachable channels" added 2026-09-22: a routing record naming a
+                     # channel this bot is not subscribed to is silent non-delivery
+                     # waiting to happen, and doctor is where it is found out.
+                     "reachable channels",
                      "event queue", "deliverable", "directory", "seat build", "daemon",
                      "wake trigger"]
     assert report.ok
@@ -318,7 +326,7 @@ def test_project_named_credential_still_works(seat):
 def test_daemon_resumes_a_stored_queue_rather_than_re_registering(seat):
     """Re-registering when a queue was held silently forfeits the gap."""
     from agent_comms.store import Store
-    store = Store(seat / ".comms")
+    store = operations.message_store(seat / ".comms")
     store.save_position("q-existing", 42)
     transport = FakeTransport()
     operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
@@ -433,7 +441,7 @@ def test_lock_is_released_when_the_holder_goes(seat):
     """An flock dies with the process, so a killed daemon leaves nothing to clear."""
     from agent_comms.store import Store
 
-    store = Store(seat / ".comms")
+    store = operations.message_store(seat / ".comms")
     store.acquire_daemon_lock().close()
     operations.run_daemon(transport_factory=lambda c: FakeTransport(), max_iterations=1)
 
@@ -608,6 +616,8 @@ def test_stop_waits_for_the_lock_not_the_signal(seat, monkeypatch):
     """
     from agent_comms.store import Store
 
+    # Store, not the message store: this test is about the daemon LOCK, which
+    # lives in its own file and was never part of the message store.
     store = Store(seat / ".comms")
     held = store.acquire_daemon_lock()
     polls = {"n": 0}
@@ -846,7 +856,7 @@ def test_last_message_id_is_the_durable_marker(seat):
     """last_event_id dies with the queue; a message id does not."""
     from agent_comms.store import Store
 
-    store = Store(seat / ".comms")
+    store = operations.message_store(seat / ".comms")
     assert store.last_message_id() == 0
     transport = HistoryTransport(event_batches=[{"result": "success", "events": [
         {"id": 1, "type": "message", "flags": ["mentioned"],
@@ -861,7 +871,7 @@ def test_a_lost_queue_no_longer_loses_messages(seat):
     from agent_comms.errors import QueueGapError
     from agent_comms.store import Store
 
-    store = Store(seat / ".comms")
+    store = operations.message_store(seat / ".comms")
     transport = HistoryTransport(
         history=[_history_msg(601, 10), _history_msg(602, 11)],
         event_batches=[{"result": "success", "events": [
@@ -884,7 +894,7 @@ def test_the_anchor_message_is_not_handled_twice(seat):
     """`anchor` is inclusive. Re-handling it would re-notify the agent."""
     from agent_comms.store import Store
 
-    store = Store(seat / ".comms")
+    store = operations.message_store(seat / ".comms")
     transport = HistoryTransport(
         history=[_history_msg(700, 10)],
         event_batches=[{"result": "success", "events": [
@@ -904,7 +914,7 @@ def test_a_fresh_seat_does_not_replay_all_history(seat):
     """Backfilling from id 0 would notify the agent about every message ever sent."""
     from agent_comms.store import Store
 
-    store = Store(seat / ".comms")
+    store = operations.message_store(seat / ".comms")
     transport = HistoryTransport(history=[_history_msg(i, 1) for i in range(800, 900)])
     hub = operations.Hub(transport, operations.load_settings(),
                          operations.load_credential(operations.load_settings().identity))
@@ -919,7 +929,7 @@ def test_the_backstop_catches_a_queue_that_stopped_delivering(seat, monkeypatch)
 
     from agent_comms.store import Store
 
-    store = Store(seat / ".comms")
+    store = operations.message_store(seat / ".comms")
     old = _time.time() - 600  # comfortably past MISSED_AFTER_SECS
     transport = HistoryTransport(
         history=[_history_msg(901, old)],
@@ -945,7 +955,7 @@ def test_the_backstop_does_not_cry_wolf_on_a_timing_race(seat, monkeypatch):
 
     from agent_comms.store import Store
 
-    store = Store(seat / ".comms")
+    store = operations.message_store(seat / ".comms")
     transport = HistoryTransport(
         history=[_history_msg(1001, _time.time())],  # just now
         event_batches=[{"result": "success", "events": [
@@ -972,7 +982,7 @@ def test_a_losing_daemon_does_not_erase_the_winners_pid(seat):
     from agent_comms.errors import DaemonAlreadyRunning
     from agent_comms.store import Store
 
-    store = Store(seat / ".comms")
+    store = operations.message_store(seat / ".comms")
     held = store.acquire_daemon_lock()
     try:
         recorded = (seat / ".comms" / "daemon.lock").read_text().strip()
@@ -986,3 +996,468 @@ def test_a_losing_daemon_does_not_erase_the_winners_pid(seat):
         assert store.daemon_state().pid == int(recorded)
     finally:
         held.close()
+
+
+# -- the empty lock, and never advising a pattern kill (orchestrator need) -----
+#
+# Filed 2026-09-21: `comms daemon --stop` refuses when daemon.lock is present
+# but empty, and the remedy it printed was `pgrep -f 'comms daemon'`. A seat's
+# tmux server carries `comms daemon` in its OWN argv, so the pattern matches the
+# server; the orchestrator's pkill fallback took the sessions of thirteen seats.
+# These four fail against the pre-change client.
+
+def test_empty_lock_does_not_stop_stop_from_working(seat, monkeypatch):
+    """The lock file is a COPY of the pid. The kernel is the owner of the fact.
+
+    Pre-change this raised DaemonWillNotStop with nothing signalled.
+    """
+    from agent_comms.store import Store
+
+    store = operations.message_store(seat / ".comms")
+    held = store.acquire_daemon_lock()
+    holder = int((seat / ".comms" / "daemon.lock").read_text())
+    (seat / ".comms" / "daemon.lock").write_text("")  # the defect, exactly
+
+    signalled = []
+
+    def release(pid, sig):
+        signalled.append(pid)
+        held.close()
+
+    monkeypatch.setattr(operations.os, "kill", release)
+    stopped, pid = operations.stop_daemon(timeout=5.0)
+
+    assert stopped is True
+    assert pid == holder
+    assert signalled == [holder], "signalled the wrong process, or none at all"
+
+
+def test_status_names_the_pid_when_the_lock_file_is_empty(seat):
+    """`running (pid None)` is the state that makes a person reach for pkill."""
+    from agent_comms.store import Store
+
+    store = operations.message_store(seat / ".comms")
+    held = store.acquire_daemon_lock()
+    try:
+        expected = int((seat / ".comms" / "daemon.lock").read_text())
+        (seat / ".comms" / "daemon.lock").write_text("")
+        state = store.daemon_state()
+        assert state.running is True
+        assert state.pid == expected
+        assert "lock file is empty" in state.detail
+    finally:
+        held.close()
+
+
+def test_lock_holder_is_never_guessed(seat, monkeypatch):
+    """No holder findable → None. A guess here is what kills sessions."""
+    from pathlib import Path
+
+    from agent_comms.store import Store
+
+    store = operations.message_store(seat / ".comms")
+    store.ensure()
+    monkeypatch.setattr(Path, "read_text",
+                        lambda self, *a, **k: (_ for _ in ()).throw(OSError("no /proc/locks")))
+    assert store.lock_holder_pid() is None
+
+
+def test_the_refusal_never_recommends_a_pattern_kill(seat, monkeypatch):
+    """Both sources exhausted: say so, name the file, forbid the pattern."""
+    from agent_comms.errors import DaemonWillNotStop
+    from agent_comms.store import Store
+
+    held = Store(seat / ".comms").acquire_daemon_lock()
+    try:
+        monkeypatch.setattr(Store, "lock_holder_pid", lambda self: None)
+        (seat / ".comms" / "daemon.lock").write_text("")
+        with pytest.raises(DaemonWillNotStop) as caught:
+            operations.stop_daemon(timeout=0.3)
+    finally:
+        held.close()
+
+    said = str(caught.value)
+    assert "pgrep" not in said, "still recommending a pattern match"
+    assert "NEVER match on the command line" in said
+    assert "fuser" in said or "lsof" in said, "must name an exact way to find it"
+
+
+# -- cross-project: subscription IS the routing mechanism (§5a) ----------------
+#
+# Measured 2026-09-22: a message posted in a channel this bot does not hold
+# produces NO EVENT AT ALL — not a refusal, not a stored record, not a log line.
+# Silence at the transport layer, before any permission check runs. These gates
+# are the only place in the estate that fact is visible.
+
+def test_a_send_refuses_a_channel_whose_replies_we_could_not_read(seat, monkeypatch):
+    """Posting there would start a topic we cannot follow."""
+    from agent_comms.errors import ChannelNotReachable
+    from agent_comms.hub import Hub
+
+    monkeypatch.setattr(Hub, "subscribed_channels", lambda self: frozenset({"agent-eco"}))
+    monkeypatch.setattr(operations, "_resolve_recipient", lambda s, h, n: n)
+
+    with pytest.raises(ChannelNotReachable) as caught:
+        operations.send("hello", to="orch-arch", subject="x", channel="orchestrator",
+                        transport_factory=lambda c: FakeTransport())
+
+    said = str(caught.value)
+    assert "not subscribed to 'orchestrator'" in said
+    assert "agent-eco" in said, "must say what it CAN reach, not only what it cannot"
+    assert "§5a" in said or "RECIPIENT's channel" in said
+
+
+def test_a_send_to_a_held_channel_is_not_refused(seat, monkeypatch):
+    """The gate must not fire on the ordinary case, or it stops being read."""
+    from agent_comms.hub import Hub
+
+    monkeypatch.setattr(Hub, "subscribed_channels",
+                        lambda self: frozenset({"agent-eco", "orchestrator"}))
+    monkeypatch.setattr(operations, "_resolve_recipient", lambda s, h, n: n)
+    posted = operations.send("hello", to="orch-arch", subject="x", channel="orchestrator",
+                             transport_factory=lambda c: FakeTransport())
+    assert posted.response
+
+
+def test_doctor_fails_when_a_routed_channel_is_unreachable(seat, monkeypatch):
+    """A transports record naming a channel we do not hold is a message that
+    will post and never be answered. Doctor is where that is found out."""
+    import json
+
+    from agent_comms.hub import Hub
+
+    (seat / ".comms").mkdir(parents=True, exist_ok=True)
+    (seat / ".comms" / "routes.json").write_text(json.dumps({"routes": [
+        {"id": "bakehouse.orchestrator.arch",
+         "transports": {"comms": {"channel": "orchestrator", "bot": "orch-arch"}}}]}))
+
+    monkeypatch.setattr(Hub, "subscribed_channels", lambda self: frozenset({"agent-eco"}))
+    monkeypatch.setattr("agent_comms.operations.seat_state_now",
+                        lambda: __import__("agent_comms.seat", fromlist=["x"]).SeatState(
+                            answer="yes", reason="r", runtime="claude", sessions=1,
+                            version="1.0.2", contract="1.0"))
+    report = operations.preflight(transport_factory=lambda c: FakeTransport())
+
+    check = next(c for c in report.checks if c[0] == "reachable channels")
+    assert check[1] is False
+    assert "orchestrator" in check[2]
+
+
+def test_doctor_passes_when_every_routed_channel_is_held(seat, monkeypatch):
+    import json
+
+    from agent_comms.hub import Hub
+
+    (seat / ".comms").mkdir(parents=True, exist_ok=True)
+    (seat / ".comms" / "routes.json").write_text(json.dumps({"routes": [
+        {"transports": {"comms": {"channel": "agent-eco"}}}]}))
+
+    monkeypatch.setattr(Hub, "subscribed_channels", lambda self: frozenset({"agent-eco"}))
+    monkeypatch.setattr("agent_comms.operations.seat_state_now",
+                        lambda: __import__("agent_comms.seat", fromlist=["x"]).SeatState(
+                            answer="yes", reason="r", runtime="claude", sessions=1,
+                            version="1.0.2", contract="1.0"))
+    report = operations.preflight(transport_factory=lambda c: FakeTransport())
+
+    assert next(c for c in report.checks if c[0] == "reachable channels")[1] is True
+
+
+def test_doctor_names_grant_without_subscription_as_drift(seat, monkeypatch):
+    """§5a provisions grant and subscription together, so a routed channel we
+    do not hold is DRIFT — not a state anyone chose — and the remedy is orch's
+    idempotent provisioning replay, not a hand-edit."""
+    import json
+
+    from agent_comms.hub import Hub
+
+    (seat / ".comms").mkdir(parents=True, exist_ok=True)
+    (seat / ".comms" / "routes.json").write_text(json.dumps({"routes": [
+        {"transports": {"comms": {"channel": "orchestrator"}}}]}))
+    monkeypatch.setattr(Hub, "subscribed_channels", lambda self: frozenset({"agent-eco"}))
+    monkeypatch.setattr("agent_comms.operations.seat_state_now",
+                        lambda: __import__("agent_comms.seat", fromlist=["x"]).SeatState(
+                            answer="yes", reason="r", runtime="claude", sessions=1,
+                            version="1.0.2", contract="1.0"))
+    report = operations.preflight(transport_factory=lambda c: FakeTransport())
+
+    check = next(c for c in report.checks if c[0] == "reachable channels")
+    assert check[1] is False
+    assert "GRANT WITHOUT SUBSCRIPTION" in check[2]
+    assert "replay provisioning" in check[2]
+
+
+def test_subscription_without_grant_is_a_note_not_a_warning(seat, monkeypatch):
+    """The other direction loses nothing — ungranted mail is refused by the
+    permission graph, which is the graph working.
+
+    A warning here would fire on every seat holding a test channel, and one
+    that fires every time is learned into invisibility (§9) — it would take the
+    grant-without-subscription failure down with it.
+    """
+    import json
+
+    from agent_comms.hub import Hub
+
+    (seat / ".comms").mkdir(parents=True, exist_ok=True)
+    (seat / ".comms" / "routes.json").write_text(json.dumps({"routes": [
+        {"transports": {"comms": {"channel": "agent-eco"}}}]}))
+    monkeypatch.setattr(Hub, "subscribed_channels",
+                        lambda self: frozenset({"agent-eco", "seat-testing"}))
+    monkeypatch.setattr("agent_comms.operations.seat_state_now",
+                        lambda: __import__("agent_comms.seat", fromlist=["x"]).SeatState(
+                            answer="yes", reason="r", runtime="claude", sessions=1,
+                            version="1.0.2", contract="1.0"))
+    report = operations.preflight(transport_factory=lambda c: FakeTransport())
+
+    assert next(c for c in report.checks if c[0] == "reachable channels")[1] is True
+    assert any("seat-testing" in n for n in report.notes)
+
+
+@pytest.mark.parametrize("contract,warns", [
+    ("1.0", False), ("1.1-draft", False), ("2.0", False), ("2.0-draft", False),
+    ("0.5.1", True), ("3.0", True), ("10.0", True),
+])
+def test_doctor_uses_the_one_contract_predicate(seat, monkeypatch, contract, warns):
+    """THE SAME TRAP, IN A SECOND HOME. `doctor` carried its own
+    `contract.startswith("1.")` — the major-10 trap pinned against in the
+    delivery gate — and it survived the {1,2} widening, firing on every healthy
+    2.0 seat and calling it *older* than the client. Found by agent-skeleton on
+    their install, in shipped 2.0.
+
+    A predicate with two implementations has two behaviours. There is one now,
+    and this test is what stops a third appearing.
+    """
+    from agent_comms.hub import Hub
+    from agent_comms.seat import SeatState
+
+    monkeypatch.setattr(Hub, "subscribed_channels", lambda self: frozenset({"agent-eco"}))
+    monkeypatch.setattr("agent_comms.operations.seat_state_now",
+                        lambda: SeatState(answer="yes", reason="r", runtime="claude",
+                                          sessions=1, version="2.0.0", contract=contract))
+    report = operations.preflight(transport_factory=lambda c: FakeTransport())
+
+    said = " ".join(report.warnings)
+    assert ("does not speak" in said) is warns, f"contract {contract}: warnings={report.warnings}"
+    assert "cannot deliver to an older seat" not in said, "the backwards wording is back"
+
+
+# -- R13: the periodic config sync -------------------------------------------
+
+def test_a_refresh_replaces_the_set_and_never_merges(seat, monkeypatch):
+    """The directory is authoritative (master ruling, 2026-09-23). Merging would
+    make this seat the second authority and keep a withdrawn agent alive locally
+    forever."""
+    import json
+
+    from agent_comms import config_sync
+
+    d = seat / ".comms"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "routes.json").write_text(json.dumps({"generation": 1, "routes": [
+        {"agent": "bakehouse.agent-eco.gone", "delivery": "inject"}]}))
+
+    monkeypatch.setattr(config_sync, "directory_address", lambda: "http://d.invalid")
+    monkeypatch.setattr(config_sync, "_credential", lambda: "t")
+    monkeypatch.setattr(config_sync.urllib.request, "urlopen",
+                        lambda *a, **k: _Resp(json.dumps({
+                            "contract": "0.2", "generation": 2, "assignments": [
+                                {"agent": "bakehouse.agent-eco.kept", "delivery": "inject"}]})))
+    got = config_sync.fetch("agent-eco", "s", d)
+
+    assert got.generation == 2 and got.agents == 1
+    assert list(config_sync.agent_set(d)) == ["bakehouse.agent-eco.kept"], "withdrawn agent survived"
+
+
+def test_an_unreachable_directory_runs_from_the_file(seat, monkeypatch):
+    """The file is the boot source. An outage must not stop a seat working from
+    what it already has."""
+    import json
+
+    from agent_comms import config_sync
+
+    d = seat / ".comms"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "routes.json").write_text(json.dumps({"generation": 5, "fetched_at": "t", "routes": [
+        {"agent": "bakehouse.agent-eco.held"}]}))
+    monkeypatch.setattr(config_sync, "directory_address", lambda: "http://d.invalid")
+    monkeypatch.setattr(config_sync.urllib.request, "urlopen",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError()))
+
+    got = config_sync.fetch("agent-eco", "s", d)
+    assert got.source == "file" and got.generation == 5
+    assert "did not answer" in got.reason
+    assert list(config_sync.agent_set(d)) == ["bakehouse.agent-eco.held"], "the held set was lost"
+
+
+def test_an_unreadable_answer_never_replaces_a_readable_set(seat, monkeypatch):
+    """Fail closed. A set we cannot read must not overwrite one we can."""
+    import json
+
+    from agent_comms import config_sync
+
+    d = seat / ".comms"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "routes.json").write_text(json.dumps({"generation": 5, "routes": [{"agent": "keep.me"}]}))
+    monkeypatch.setattr(config_sync, "directory_address", lambda: "http://d.invalid")
+    monkeypatch.setattr(config_sync.urllib.request, "urlopen",
+                        lambda *a, **k: _Resp(json.dumps({"totally": "unexpected"})))
+
+    got = config_sync.fetch("agent-eco", "s", d)
+    assert got.source == "file" and "not an assignment set" in got.reason
+    assert list(config_sync.agent_set(d)) == ["keep.me"]
+
+
+def test_the_seat_door_is_project_qualified(seat):
+    """Measured: the bare seat name answers 403. /v0/routes is the OPERATOR view."""
+    from agent_comms.config_sync import seat_path
+
+    assert seat_path("agent-eco", "test-claude") == "/v0/seats/agent-eco/test-claude/assignments"
+
+
+class _Resp:
+    def __init__(self, text):
+        self._t = text.encode()
+
+    def read(self):
+        return self._t
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_doctor_names_a_daemon_running_a_different_build(seat, monkeypatch):
+    """The one piece of stale state that CANNOT be removed, so it is reported.
+
+    A seat mid-upgrade genuinely has two versions on it: the daemon is a
+    process and the CLI is whatever is on disk now. This seat lost two messages
+    to exactly that gap while every check read green (catalogue 0.56).
+    """
+    from agent_comms.hub import Hub
+    from agent_comms.seat import SeatState
+    from agent_comms.store import Store
+
+    s = Store(seat / ".comms")
+    s.ensure()
+    s.record_build("1.9.9")
+    monkeypatch.setattr(Store, "daemon_state",
+                        lambda self: __import__("agent_comms.store", fromlist=["x"]).DaemonState(
+                            running=True, pid=1, last_tick=None))
+    monkeypatch.setattr(Hub, "subscribed_channels", lambda self: frozenset({"agent-eco"}))
+    monkeypatch.setattr("agent_comms.operations.seat_state_now",
+                        lambda: SeatState(answer="yes", reason="r", runtime="claude",
+                                          sessions=1, version="2.0.0", contract="2.0"))
+    report = operations.preflight(transport_factory=lambda c: FakeTransport())
+
+    check = next(c for c in report.checks if c[0] == "daemon build")
+    assert check[1] is False
+    assert "1.9.9" in check[2] and "comms daemon --restart" in check[2]
+
+
+def test_doctor_is_quiet_when_the_builds_agree(seat, monkeypatch):
+    """It must not fire on the ordinary case, or it stops being read (§9)."""
+    from agent_comms import __version__
+    from agent_comms.hub import Hub
+    from agent_comms.seat import SeatState
+    from agent_comms.store import Store
+
+    s = Store(seat / ".comms")
+    s.ensure()
+    s.record_build(__version__)
+    monkeypatch.setattr(Store, "daemon_state",
+                        lambda self: __import__("agent_comms.store", fromlist=["x"]).DaemonState(
+                            running=True, pid=1, last_tick=None))
+    monkeypatch.setattr(Hub, "subscribed_channels", lambda self: frozenset({"agent-eco"}))
+    monkeypatch.setattr("agent_comms.operations.seat_state_now",
+                        lambda: SeatState(answer="yes", reason="r", runtime="claude",
+                                          sessions=1, version="2.0.0", contract="2.0"))
+    report = operations.preflight(transport_factory=lambda c: FakeTransport())
+
+    assert next(c for c in report.checks if c[0] == "daemon build")[1] is True
+
+
+# -- R17: the rest of the §6 surface -----------------------------------------
+
+def test_resolve_prints_the_path_and_sends_nothing(seat, monkeypatch):
+    """The command that ends arguments: where would this go, and why.
+
+    Every field failure this client has had looked like "the message went
+    nowhere". This is how a person finds out where it WOULD have gone before
+    they send it — and it must send nothing while answering.
+    """
+    import agent_comms.resolve as R
+
+    sent = []
+    monkeypatch.setattr(R, "_post", lambda *a, **k: (200, {
+        "kind": "resolution-result", "contract": "0.2", "success": True,
+        "status": "resolved", "canonical_id": "bakehouse.agent-eco.arch",
+        "delivery": "inject", "route_revision": 3}))
+    monkeypatch.setattr(R, "directory_address", lambda: "http://d")
+    monkeypatch.setattr(operations, "send", lambda *a, **k: sent.append(a))
+
+    out = "\n".join(operations.resolve_name("arch"))
+    assert "bakehouse.agent-eco.arch" in out
+    assert "channel agent-eco" in out and "bot arch" in out
+    assert "would send  YES" in out
+    assert sent == [], "resolve sent something"
+
+
+def test_resolve_says_why_when_it_would_not_send(seat, monkeypatch):
+    import agent_comms.resolve as R
+
+    monkeypatch.setattr(R, "directory_address", lambda: "")
+    out = "\n".join(operations.resolve_name("nobody"))
+    assert "would send  NO" in out and "unknown" in out
+
+
+def test_queue_shows_what_the_pass_would_send_not_everything(seat):
+    """A queue view that shows more than the pass would send teaches the wrong
+    expectation — the bounds apply here exactly as they do in the pass."""
+    from agent_comms.store import Mention
+
+    store = operations.message_store(seat / ".comms")
+    for i in range(7):
+        store.append(Mention(id=200 + i, sender="agent-eco-arch", channel="agent-eco",
+                             topic="t", content="x", timestamp=NOW, permalink=""))
+    rows = operations.queued_now()
+    assert len(rows) == 3, f"showed {len(rows)}, the pass sends 3"
+    assert rows[0]["of"] == 7, "did not say how many are waiting behind it"
+
+
+def test_retire_by_hand_is_logged_with_its_reason(seat):
+    """A person removing a message is legitimate; doing it by editing a file is
+    how a store stops being evidence. `retired` with no cause is
+    indistinguishable from a bug six months later."""
+    from agent_comms.store import Mention
+
+    store = operations.message_store(seat / ".comms")
+    store.append(Mention(id=301, sender="agent-eco-arch", channel="agent-eco", topic="t",
+                         content="x", timestamp=NOW, permalink=""))
+    said = operations.retire(301, "superseded by a later instruction")
+
+    assert "retired 301" in said and "superseded" in said
+    assert [r["id"] for r in operations.recent(last=9, state="retired")] == [301]
+    assert any("superseded" in r["cause"] for r in store.history(store._find(301)["id"]))
+
+
+def test_requeue_is_the_one_backwards_move_and_needs_a_person(seat):
+    """Everything else is forward-only. An operator resurrecting a message is a
+    DECISION, not a transition, and the record says which."""
+    from agent_comms.store import Mention
+
+    store = operations.message_store(seat / ".comms")
+    store.append(Mention(id=302, sender="agent-eco-arch", channel="agent-eco", topic="t",
+                         content="x", timestamp=NOW, permalink=""))
+    operations.retire(302, "wrongly retired")
+    said = operations.requeue(302, "it was wanted after all")
+
+    assert "requeued 302" in said and "age bound still applies" in said
+    assert [r["id"] for r in operations.recent(last=9, state="queued")] == [302]
+    assert any("requeued by hand" in r["cause"] for r in store.history(store._find(302)["id"]))
+
+
+def test_retire_and_requeue_refuse_an_unknown_id(seat):
+    assert "no message 999" in operations.retire(999, "x")
+    assert "no message 999" in operations.requeue(999, "x")

@@ -14,6 +14,8 @@ property §9 actually turns on.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from agent_comms import operations
@@ -175,7 +177,10 @@ def test_the_do_not_comply_label_is_gone(seat):
     """
     line = compose_turn({"id": 4, "sender": "agent-eco-arch", "topic": "t",
                          "content": "proceed", "permalink": "x", "authorised": True})
-    assert line.startswith("[hub message from agent-eco-arch")
+    # The PROPERTY is that the sender is named first and unmissably, not the
+    # literal prefix: R6 put the monotonic id ahead of it so a context-free
+    # session can tell new from replayed. Sender is still the first ACTOR named.
+    assert re.match(r"\[hub message #\d+ from agent-eco-arch", line), line[:60]
     assert "DO NOT COMPLY" not in compose_turn(
         {"id": 5, "sender": "x", "topic": "t", "content": "c", "permalink": "p",
          "authorised": False}

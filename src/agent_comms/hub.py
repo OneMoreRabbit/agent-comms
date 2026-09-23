@@ -273,6 +273,30 @@ class Hub:
     #: transport to fail in.
     MISS_REFETCH_SECS = 60
 
+    def subscribed_channels(self) -> frozenset[str]:
+        """Every channel this bot is subscribed to, folded.
+
+        **Subscription IS the routing mechanism, and nothing declares it.** The
+        event queue registers with no channel narrow, so a seat receives exactly
+        what its bot is subscribed to and nothing else. Measured 2026-09-22: a
+        message posted in a channel this bot does not hold produces no event at
+        all — not a refusal, not a stored record, not a log line. Silence at the
+        transport layer, before any permission check runs.
+
+        That is why `doctor` fails on an unsubscribed transport channel and why
+        `send` refuses one: this is the only place the fact is visible.
+        """
+        subs = self._t.call_endpoint(url="users/me/subscriptions", method="GET")
+        if subs.get("result") != "success":
+            raise NotSubscribed(
+                f"could not list this bot's subscriptions ({subs.get('msg') or subs!r}), "
+                "so which channels this seat can reach cannot be established."
+            )
+        return frozenset(
+            str(x.get("name", "")).strip().casefold()
+            for x in subs.get("subscriptions", [])
+        )
+
     def in_channel(self, name: str) -> tuple[bool, bool]:
         """`(is in my channel, is a human)`, re-fetching at most once a minute on a miss.
 

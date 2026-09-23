@@ -45,6 +45,11 @@ class Mention:
     #: An unauthorised message is still stored and shown — the agent must be able
     #: to report it — but it is never presented as an instruction.
     authorised: bool = True
+    #: Set when a message was retired instead of delivered — too old, or too
+    #: many attempts. Non-empty means `delivered` is bookkeeping, not a fact
+    #: about an agent having seen it. Separate fields because conflating them
+    #: is exactly what made the 1.0.0 store ambiguous to migrate.
+    retired: str = ""
 
     @property
     def when(self) -> str:
@@ -162,7 +167,62 @@ class Store:
             except ValueError:
                 last_tick = None
 
-        return DaemonState(running=running, pid=pid if running else None, last_tick=last_tick)
+        detail = ""
+        if running and pid is None:
+            # The lock file is empty but somebody holds the lock. The kernel
+            # still knows who, so ask it (see `lock_holder_pid`).
+            pid = self.lock_holder_pid()
+            if pid is not None:
+                detail = "pid read from the kernel's lock table; the lock file is empty"
+
+        return DaemonState(running=running, pid=pid if running else None,
+                           last_tick=last_tick, detail=detail)
+
+    def lock_holder_pid(self) -> int | None:
+        """Ask the OS which process holds the daemon lock.
+
+        The lock file's contents are a **copy** the daemon wrote about itself;
+        the kernel is the owner of the fact. When the copy is missing — an
+        empty lock file — the answer is still knowable, so derive it from the
+        owner rather than telling a person to go hunting.
+
+        This exists because the alternative people reach for is a pattern
+        match, and a pattern match here is dangerous: a seat's tmux server was
+        started as `tmux new -ds comms ... comms daemon`, so its OWN argv
+        contains `comms daemon`. `pkill -f "comms daemon"` matches the server
+        and takes every session inside it. That cost thirteen seats their
+        sessions on 2026-09-21. An inode is exact; a pattern is a guess.
+
+        Returns None where the answer cannot be had (no `/proc/locks`, no
+        matching entry) — never a guess.
+        """
+        lock_path = self.root / "daemon.lock"
+        try:
+            st = os.stat(lock_path)
+            lines = Path("/proc/locks").read_text().splitlines()
+        except OSError:
+            return None
+
+        exact = "%02x:%02x:%d" % (os.major(st.st_dev), os.minor(st.st_dev), st.st_ino)
+        by_inode = None
+        for line in lines:
+            parts = line.split()
+            # ... FLOCK ADVISORY WRITE <pid> <maj:min:inode> <start> <end>
+            if len(parts) < 6 or parts[1] != "FLOCK":
+                continue
+            try:
+                pid = int(parts[4])
+            except ValueError:
+                continue
+            where = parts[5]
+            if where == exact:
+                return pid
+            if where.rsplit(":", 1)[-1] == str(st.st_ino):
+                # Same inode, device spelled differently — a mount namespace
+                # reports its own numbers. Keep it as the fallback rather than
+                # the answer, so an exact match always wins.
+                by_inode = pid
+        return by_inode
 
     def acquire_daemon_lock(self):
         """Take the single-daemon lock, or raise `DaemonAlreadyRunning`.
@@ -252,6 +312,24 @@ class Store:
             self._rewrite(rows)
         return found
 
+    def mark_retired(self, message_id: int, reason: str) -> bool:
+        """Retire a message WITHOUT delivering it. Kept, never deleted.
+
+        `delivered` is set so no pass picks it up again, and `retired` records
+        that it was never actually put in front of anyone — the two facts are
+        separate because conflating them is what made 1.0.0's store unreadable
+        (a refused message carried delivered:true, so 15 refusals would have
+        imported as successes).
+        """
+        rows = self.all()
+        for row in rows:
+            if row.id == message_id:
+                row.delivered = True
+                row.retired = reason
+                self._rewrite(rows)
+                return True
+        return False
+
     def mark_read(self, message_id: int) -> bool:
         rows = self.all()
         found = False
@@ -272,6 +350,24 @@ class Store:
         tmp.replace(self.messages)
 
     # -- queue position ----------------------------------------------------
+
+    def record_build(self, version: str) -> None:
+        """Stamp which build this daemon is. Read by `doctor`, by a LATER CLI.
+
+        The one piece of state here that is not removable: a seat mid-upgrade
+        genuinely has two versions on it, because the running daemon is a
+        process and the CLI is whatever is on disk now. That condition cannot
+        be deleted, so it is reported instead — which is the honest half of
+        catalogue 0.56, not a substitute for the other half.
+        """
+        (self.root / "daemon.build").write_text(version, encoding="utf-8")
+
+    def daemon_build(self) -> str:
+        """The build the RUNNING daemon started as, or empty if it never said."""
+        try:
+            return (self.root / "daemon.build").read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
 
     def save_position(self, queue_id: str, last_event_id: int) -> None:
         """Record where the queue is, and that we were alive to record it.

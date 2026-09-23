@@ -46,6 +46,36 @@ class DirectoryUnreadable(CommsError):
     tag = "directory-unreadable"
 
 
+def short_name(name: str) -> str:
+    """The last segment of an FQN, or the name itself if it has none.
+
+    **The live register spells `permissions.comms.partners` in SHORT seat names
+    while addressing is by FQN** (flagged by arch 2026-09-22; on the review
+    pile as a vocabulary wrinkle). Until one spelling wins, a consumer that
+    understands only one of them silently refuses half the estate — and a
+    silent refusal is the property this whole design exists to remove.
+
+    So both spellings match, and the comparison is on the LAST SEGMENT ONLY.
+    It is never a substring or prefix test: `arch` must not match
+    `arch-shadow`, and `bakehouse.arc-web.arch` must not match
+    `bakehouse.labs.arch`.
+    """
+    return name.strip().casefold().rsplit(".", 1)[-1]
+
+
+def same_project(a: str, b: str) -> bool:
+    """Do two FQNs name agents in the same project?
+
+    Unqualified names are treated as this seat's own project, which is what a
+    short name in a partner list means. An alias never spans a project
+    (estate-addressing-model §7), so neither may a permission.
+    """
+    parts_a, parts_b = a.strip().casefold().split("."), b.strip().casefold().split(".")
+    if len(parts_a) < 3 or len(parts_b) < 3:
+        return True
+    return parts_a[:2] == parts_b[:2]
+
+
 @dataclass
 class Directory:
     """Who this seat may exchange messages with."""
@@ -72,12 +102,22 @@ class Directory:
         fact, which is the whole reason `project: true` needs no names.
         """
         folded = name.strip().casefold()
-        if folded in {b.casefold() for b in self.blocked}:
+        short = short_name(name)
+
+        # `blocked` wins over everything, including an explicit allow. It is the
+        # estate's stop button and must not be argued with by ordering rules.
+        # Matched on both spellings for the same reason `partners` is.
+        if short in {short_name(b) for b in self.blocked}:
             return False
         if is_human:
             return True
-        if folded in {p.casefold() for p in self.partners}:
-            return True
+
+        # Both spellings, last segment only — never a prefix or substring test.
+        for partner in self.partners:
+            if folded == partner.strip().casefold():
+                return True
+            if short == short_name(partner) and same_project(name, partner):
+                return True
         return self.project and in_project
 
     def refusal(self, name: str, *, in_project: bool) -> str:

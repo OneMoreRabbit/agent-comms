@@ -17,7 +17,7 @@ the seat's extensibility, not ours.
 from __future__ import annotations
 
 from . import seat as seat_app
-from .seat import Delivery, SeatTooOld, SeatUnavailable
+from .seat import Delivery, SeatContractUnsupported, SeatUnavailable
 
 #: How much of a message is delivered inline before it is pointed at instead.
 #: Well under the seat's 65536-byte limit: the constraint here is an agent's
@@ -56,8 +56,14 @@ def compose_turn(mention: dict) -> str:
     # turn: a message from a sender the estate has not permitted is refused at the
     # daemon and never composed. The label was always the weaker half — it put the
     # sender's text in front of the agent and asked the agent to police it.
+    # R6: the monotonic id is EXPOSED ON DELIVERY so a context-free session can
+    # tell a new message from a replayed one. ingstr's corollary is why it is
+    # here rather than only in the store: existence proves delivery and says
+    # nothing about continuity — a session that has seen 2950 knows 2946 is
+    # older WITHOUT needing our records, which is the whole point, because after
+    # a restart it does not have our records.
     return (
-        f"[hub message from {sender} — topic '{topic}'] {body} "
+        f"[hub message #{mid} from {sender} — topic '{topic}'] {body} "
         f"[cite {permalink} | reply: comms reply {mid} '<text>']"
     )
 
@@ -76,5 +82,5 @@ def wake(mention: dict, **_ignored) -> Delivery:
     """
     try:
         return seat_app.deliver(compose_turn(mention))
-    except (SeatUnavailable, SeatTooOld) as exc:
+    except (SeatUnavailable, SeatContractUnsupported) as exc:
         raise WakeError(str(exc)) from exc

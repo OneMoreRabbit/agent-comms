@@ -303,5 +303,137 @@ def run() -> None:
         sys.exit(EXIT_FAULT)
 
 
+@main.group()
+def config() -> None:
+    """The local configuration — what this seat holds, and when it arrived."""
+
+
+@config.command("show")
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable.")
+def config_show(as_json: bool) -> None:
+    """What is held now, and how stale it is."""
+    from . import config_sync
+    from .config import load_settings
+
+    settings = load_settings()
+    held = config_sync.load(settings.state_dir)
+    if as_json:
+        click.echo(json.dumps(held or {"routes": []}, indent=2))
+        return
+    if not held:
+        click.echo("no configuration fetched yet — run: comms config refresh")
+        return
+    click.echo(f"generation {held.get('generation', 0)}   "
+               f"fetched {held.get('fetched_at') or 'never'}   "
+               f"source {held.get('source') or '?'}")
+    for record in held.get("routes") or []:
+        click.echo(f"  {record.get('agent', '?'):44} "
+                   f"{record.get('label', '-'):10} {record.get('delivery', '-')}")
+
+
+@config.command("refresh")
+def config_refresh() -> None:
+    """Fetch now, rather than waiting for the timer."""
+    from . import config_sync
+    from .config import load_settings
+
+    settings = load_settings()
+    got = config_sync.fetch(settings.identity.project, settings.identity.seat,
+                            settings.state_dir)
+    click.echo(f"config: {got.line()}")
+    if got.source != "directory":
+        sys.exit(EXIT_FAULT)
+
+
+@main.command()
+@click.option("--last", default=20, help="How many.")
+@click.option("--state", default="", help="Only this state.")
+@click.option("--delivered", "only", flag_value="delivered", help="What reached a session.")
+@click.option("--queued", "only", flag_value="queued", help="Waiting, with attempts.")
+@click.option("--retired", "only", flag_value="retired", help="Abandoned and expired.")
+@click.option("--refused", "only", flag_value="refused", help="Sender not permitted.")
+@click.option("--json", "as_json", is_flag=True)
+def log(last: int, state: str, only: str, as_json: bool) -> None:
+    """Recent messages, any state, one line each."""
+    rows = operations.recent(last=last, state=state or only or "")
+    if as_json:
+        click.echo(json.dumps(rows, indent=2))
+        return
+    if not rows:
+        click.echo("nothing stored yet." if not state else f"nothing in state {state!r}.")
+        return
+    for r in rows:
+        click.echo(f"  {r['id']:>6}  {r['when']}  {r['state']:<10} "
+                   f"{r['sender']:<22} {r['topic'][:46]}")
+
+
+@main.command()
+@click.option("--json", "as_json", is_flag=True,
+              help="For the estate dashboard to poll.")
+def stats(as_json: bool) -> None:
+    """Counts by state, and the health of the queue."""
+    data = operations.stats()
+    if as_json:
+        click.echo(json.dumps(data, indent=2))
+        return
+    click.echo(f"stored {data['stored']}   undelivered {data['undelivered']}   "
+               f"retired {data['retired']}   refused {data['refused']}")
+    if data["oldest_undelivered"]:
+        click.echo(f"oldest undelivered: {data['oldest_undelivered']}")
+    click.echo(f"daemon: {data['daemon']}")
+
+
+@main.command()
+@click.argument("message_id", type=int)
+def trace(message_id: int) -> None:
+    """End to end for one message: what happened to it, and when."""
+    for line in operations.trace(message_id):
+        click.echo(line)
+
+
+@main.command("resolve")
+@click.argument("name")
+def resolve_cmd(name: str) -> None:
+    """What would this address resolve to, and why. Sends nothing."""
+    for line in operations.resolve_name(name):
+        click.echo(line)
+
+
+@main.command("queue")
+@click.option("--json", "as_json", is_flag=True)
+def queue_cmd(as_json: bool) -> None:
+    """Exactly what the next pass would deliver, in order."""
+    rows = operations.queued_now()
+    if as_json:
+        click.echo(json.dumps(rows, indent=2))
+        return
+    if not rows:
+        click.echo("nothing would be delivered on the next pass.")
+        return
+    waiting = rows[0]["of"]
+    click.echo(f"the next pass would deliver {len(rows)} of {waiting} waiting:")
+    for r in rows:
+        click.echo(f"  {r['id']:>6}  {r['when']}  {r['sender']:<22} "
+                   f"{r['topic'][:40]}  attempts {r['attempts']}")
+    if waiting > len(rows):
+        click.echo(f"  ({waiting - len(rows)} more stay queued — the cap is per pass)")
+
+
+@main.command("retire")
+@click.argument("message_id", type=int)
+@click.option("--reason", required=True, help="Why. Recorded with the retirement.")
+def retire_cmd(message_id: int, reason: str) -> None:
+    """Retire a message without delivering it. Logged, never silent."""
+    click.echo(operations.retire(message_id, reason))
+
+
+@main.command("requeue")
+@click.argument("message_id", type=int)
+@click.option("--reason", required=True, help="Why. Recorded with the resurrection.")
+def requeue_cmd(message_id: int, reason: str) -> None:
+    """Put a retired or abandoned message back in the queue. Logged."""
+    click.echo(operations.requeue(message_id, reason))
+
+
 if __name__ == "__main__":
     run()
