@@ -45,6 +45,11 @@ class Mention:
     #: An unauthorised message is still stored and shown — the agent must be able
     #: to report it — but it is never presented as an instruction.
     authorised: bool = True
+    #: Set when a message was retired instead of delivered — too old, or too
+    #: many attempts. Non-empty means `delivered` is bookkeeping, not a fact
+    #: about an agent having seen it. Separate fields because conflating them
+    #: is exactly what made the 1.0.0 store ambiguous to migrate.
+    retired: str = ""
 
     @property
     def when(self) -> str:
@@ -306,6 +311,24 @@ class Store:
         if found:
             self._rewrite(rows)
         return found
+
+    def mark_retired(self, message_id: int, reason: str) -> bool:
+        """Retire a message WITHOUT delivering it. Kept, never deleted.
+
+        `delivered` is set so no pass picks it up again, and `retired` records
+        that it was never actually put in front of anyone — the two facts are
+        separate because conflating them is what made 1.0.0's store unreadable
+        (a refused message carried delivered:true, so 15 refusals would have
+        imported as successes).
+        """
+        rows = self.all()
+        for row in rows:
+            if row.id == message_id:
+                row.delivered = True
+                row.retired = reason
+                self._rewrite(rows)
+                return True
+        return False
 
     def mark_read(self, message_id: int) -> bool:
         rows = self.all()

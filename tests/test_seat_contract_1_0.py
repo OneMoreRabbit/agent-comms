@@ -17,7 +17,17 @@ import subprocess
 
 import pytest
 
-from agent_comms import seat as seat_app
+from agent_comms import operations, seat as seat_app
+
+import time
+
+#: Fixtures must carry a REAL time. `timestamp=1` is 1970 and was a don't-care
+#: value until the 24h staleness bound made it meaningful — the exact trap
+#: catalogue 0.55 records ("the test data encoded an assumption that no rule
+#: existed"), found here in our own suite when the bound landed.
+NOW = int(time.time())
+
+
 from agent_comms.seat import Delivery, SeatUnavailable
 from agent_comms.wake import WakeError, compose_turn, wake
 
@@ -201,7 +211,7 @@ def test_a_held_message_stays_queued_and_is_retried(seat, monkeypatch):
     transport = FakeTransport(event_batches=[{"result": "success", "events": [
         {"id": 1, "type": "message", "flags": ["mentioned"], "message": {
             "id": 500, "sender_full_name": "agent-eco-arch", "display_recipient": "agent-eco",
-            "subject": "agent-comms: q", "content": "?", "timestamp": 1, "stream_id": 7}},
+            "subject": "agent-comms: q", "content": "?", "timestamp": NOW, "stream_id": 7}},
     ]}])
 
     # First the seat has nothing running, so it holds.
@@ -229,7 +239,7 @@ def test_retry_stops_at_the_first_message_that_will_not_land(seat, monkeypatch):
     store = Store(seat / ".comms")
     for mid in (10, 11, 12):
         store.append(Mention(id=mid, sender="agent-eco-arch", channel="agent-eco",
-                             topic="t", content="x", timestamp=1, permalink="",
+                             topic="t", content="x", timestamp=NOW, permalink="",
                              reason="mentioned"))
     fake_seat(monkeypatch, {"success": False, "status": "no-session", "message": "none"},
               code=10)
@@ -245,7 +255,7 @@ def test_a_broken_seat_is_not_hammered(seat, monkeypatch):
 
     store = Store(seat / ".comms")
     store.append(Mention(id=20, sender="agent-eco-arch", channel="agent-eco", topic="t",
-                         content="x", timestamp=1, permalink="", reason="mentioned"))
+                         content="x", timestamp=NOW, permalink="", reason="mentioned"))
     calls = {"n": 0}
 
     seat_app._contract_checked = "1.0"
@@ -270,7 +280,7 @@ def test_a_permanently_failing_message_stops_being_retried(seat, monkeypatch):
 
     store = Store(seat / ".comms")
     store.append(Mention(id=30, sender="agent-eco-arch", channel="agent-eco", topic="t",
-                         content="x", timestamp=1, permalink="", reason="mentioned"))
+                         content="x", timestamp=NOW, permalink="", reason="mentioned"))
     fake_seat(monkeypatch, {"success": False, "status": "failed",
                             "message": "body is 70000 bytes; the limit is 65536"}, code=10)
 
@@ -550,3 +560,88 @@ def test_the_major_is_parsed_as_a_number(spelling, major):
     from agent_comms.seat import _major
 
     assert _major(spelling) == major
+
+
+# -- the bounds, wired into the delivery path ---------------------------------
+#
+# Before this, retry_undelivered took up to TWENTY undelivered messages per pass
+# with NO staleness check, so restoring a seat after an outage replayed its whole
+# backlog as live turns. That is the September incident, and it is what made 2.0
+# undeployable without a manual precaution.
+
+def _old(store, n, age_secs, first_id=100):
+    from agent_comms.store import Mention
+    for i in range(n):
+        store.append(Mention(id=first_id + i, sender="agent-eco-arch", channel="agent-eco",
+                             topic="t", content=f"m{i}", timestamp=int(time.time()) - age_secs,
+                             permalink="", reason="mentioned"))
+
+
+def test_nothing_past_the_age_bound_is_ever_attempted(seat, monkeypatch):
+    """A stale message must not reach a session EVEN ONCE: it arrives looking
+    current, which is what makes it dangerous."""
+    from agent_comms.store import Store
+
+    store = Store(seat / ".comms")
+    _old(store, 5, 48 * 3600)
+    attempted = []
+    monkeypatch.setattr(operations, "wake", lambda m: attempted.append(m["id"]))
+
+    operations.retry_undelivered(transport_factory=lambda c: FakeTransport())
+
+    # id 0 is the retirement summary — one line about the batch, which IS
+    # delivered. What must not be delivered is any of the stale messages.
+    assert [i for i in attempted if i] == [], f"attempted {attempted} past the bound"
+    assert attempted.count(0) == 1, "the batch was not summarised, or was summarised twice"
+    assert all(m.retired for m in store.all()), "retired without being recorded as retired"
+
+
+def test_a_backlog_is_capped_at_three_newest_per_pass(seat, monkeypatch):
+    """THE FLOOD, BOUNDED. Twenty per pass was the old behaviour."""
+    from agent_comms.store import Store
+
+    store = Store(seat / ".comms")
+    _old(store, 20, 60)                       # fresh, so the age bound does not apply
+    delivered = []
+
+    class _Ok:
+        success, retryable, status, message = True, False, "delivered", ""
+
+        def summary(self):
+            return "delivered"
+
+    monkeypatch.setattr(operations, "wake",
+                        lambda m: (delivered.append(m["id"]), _Ok())[1])
+    operations.retry_undelivered(transport_factory=lambda c: FakeTransport())
+
+    assert len(delivered) == 3, f"delivered {len(delivered)}, not 3"
+    assert delivered == sorted(delivered), "delivered out of arrival order"
+    assert delivered == [117, 118, 119], "not the three NEWEST"
+
+
+def test_retirement_says_it_once_with_the_supersession_caveat(seat):
+    """One line for a batch, never N stale turns."""
+    from agent_comms.store import Mention
+
+    retired = [Mention(id=1, sender="s", channel="c", topic="t", content="x",
+                       timestamp=int(time.time()) - 99999, permalink="")]
+    line = operations.retirement_summary(retired, still_waiting=7)
+
+    assert "1 message(s) were not delivered" in line
+    assert "7 more are still queued" in line
+    assert "not instructions" in line and "newest-first" in line
+
+
+def test_retired_mail_is_kept_and_readable(seat, monkeypatch):
+    """Nothing is deleted. `delivered` and `retired` are separate facts, because
+    conflating them is what made the 1.0.0 store ambiguous to migrate."""
+    from agent_comms.store import Store
+
+    store = Store(seat / ".comms")
+    _old(store, 1, 48 * 3600)
+    monkeypatch.setattr(operations, "wake", lambda m: None)
+    operations.retry_undelivered(transport_factory=lambda c: FakeTransport())
+
+    row = store.all()[0]
+    assert row.content == "m0", "the message was destroyed, not retired"
+    assert row.retired and row.delivered is True

@@ -837,25 +837,114 @@ def _announce_held(
     )
 
 
+#: **The bounds, wired into the delivery path.** Before this, `retry_undelivered`
+#: took up to TWENTY undelivered messages per pass with no staleness check at
+#: all, so restoring a seat after an outage replayed its whole backlog as live
+#: turns. That is the September incident, and it is what made 2.0 undeployable
+#: without a manual precaution.
+#:
+#: Configurable, and these are the operator's numbers.
+MAX_AGE_SECS = 24 * 60 * 60
+#: At most this many per pass, so a backlog never arrives as N live turns. The
+#: NEWEST ones, because the newest are the likeliest to still be current — the
+#: rest stay stored and the agent is told once that they exist.
+MAX_PER_PASS = 3
+
+
+def retire_stale(store: Store, max_age_secs: int = MAX_AGE_SECS) -> list[Mention]:
+    """Retire everything past the age bound BEFORE any attempt is made.
+
+    **Checked before every pass, not only before the first attempt.** The design
+    says before the first; that leaves any message which got one attempt
+    unbounded, because nothing fixes a retry interval — so it reaches a session
+    days later, which is the exact thing the rule exists to prevent. Built to
+    the rule's stated intent: *a stale message must not reach a session even
+    once, because it arrives looking current.*
+
+    Nothing is deleted. Retired messages stay in the store and in `comms inbox`,
+    to be read deliberately, newest-first.
+    """
+    now = time.time()
+    retired = []
+    for mention in store.undelivered():
+        if now - mention.timestamp > max_age_secs:
+            store.mark_retired(mention.id, f"older than {max_age_secs // 3600}h")
+            retired.append(mention)
+    return retired
+
+
+def retirement_summary(retired: list[Mention], still_waiting: int) -> str:
+    """ONE line for a batch. Never N stale turns.
+
+    Carries the caveat that earned itself: a context-free seat cannot tell a
+    superseded instruction from a current one, and the neighbours are the
+    evidence.
+    """
+    oldest = min((m.when for m in retired), default="")
+    line = (f"**{len(retired)} message(s) were not delivered** — older than "
+            f"{MAX_AGE_SECS // 3600}h (oldest {oldest}). They are in `comms inbox`, "
+            "unread and unretried.")
+    if still_waiting:
+        line += f" {still_waiting} more are still queued behind this pass."
+    return line + ("\n\nThese are **not instructions**: later messages commonly "
+                   "supersede earlier ones, so read newest-first and check the "
+                   "current state before acting on any of them.")
+
+
+def _tell_agent_once(settings, store, text, transport_factory) -> None:
+    """Put the summary in front of the agent — one line, via the wake path.
+
+    Deliberately not a hub post: this is about mail already on this seat, so
+    telling the channel would be noise to everyone else. Failure to wake is
+    swallowed on purpose — the summary is a courtesy, and a seat that cannot be
+    woken has a louder problem that `doctor` already reports.
+    """
+    try:
+        wake({"id": 0, "sender": "agent-comms", "channel": settings.channel,
+              "topic": "retired mail", "content": text, "timestamp": int(time.time()),
+              "permalink": "", "read": False, "reason": "summary",
+              "delivered": False, "attempts": 0, "authorised": True, "retired": ""})
+    except (WakeError, Exception):  # noqa: BLE001 — a courtesy must not break a pass
+        store.record("warn", "could not deliver the retirement summary")
+
+
 def retry_undelivered(
     transport_factory: Callable[[Credential], Transport] = build_transport,
-    limit: int = 20,
+    limit: int = MAX_PER_PASS,
+    max_age_secs: int = MAX_AGE_SECS,
     **kw,
 ) -> int:
-    """Try the queue again. Returns how many landed this pass.
+    """Try the queue again, BOUNDED. Returns how many landed this pass.
 
-    This is the other half of owning the queue: without it, "stored and will be
-    retried" would be a claim nothing honoured, which is the shape this estate has
-    spent a fortnight removing.
+    Three bounds, each bought by the September incident:
 
-    **Oldest first, and it stops at the first still-undeliverable message.** A
-    conversation delivered out of order is worse than one delivered late, and if
-    the seat cannot take one it will not take the next either — walking the whole
-    queue to collect identical refusals is noise and load for nothing.
+    1. **Age is checked before every attempt.** Anything past the bound is
+       retired here, before delivery is attempted, so nothing stale reaches a
+       session even once.
+    2. **At most `limit` per pass, the NEWEST ones**, so a backlog never arrives
+       as N live turns. Selected newest-first and then delivered in arrival
+       order, because a conversation delivered out of order is worse than one
+       delivered late.
+    3. **One summary line** tells the agent what was retired and what is still
+       waiting — not N turns saying it.
+
+    It stops at the first still-undeliverable message: if the seat cannot take
+    one it will not take the next either.
     """
     settings = load_settings(**kw)
     store = Store(settings.state_dir)
-    pending = [m for m in store.undelivered() if m.authorised][:limit]
+
+    retired = retire_stale(store, max_age_secs)
+    waiting = [m for m in store.undelivered() if m.authorised]
+    # Newest first for the CAP, then arrival order for DELIVERY.
+    pending = sorted(sorted(waiting, key=lambda m: m.id, reverse=True)[:limit],
+                     key=lambda m: m.id)
+    if retired:
+        store.record("warn", f"retired {len(retired)} message(s) past the "
+                             f"{max_age_secs // 3600}h bound without delivering them")
+        _tell_agent_once(settings, store,
+                         retirement_summary(retired, max(0, len(waiting) - len(pending))),
+                         transport_factory)
     if not pending:
         return 0
 
