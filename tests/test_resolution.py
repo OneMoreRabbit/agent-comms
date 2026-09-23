@@ -139,7 +139,7 @@ def test_a_delivery_failure_evicts_the_cached_route(directory, monkeypatch):
         return 200, {"kind": "resolution-result", "contract": "0.1",
                      "success": True, "status": "resolved",
                      "canonical_id": "bakehouse.agent-eco.arch",
-                     "route": {"seat": "agent-eco/arch"}, "route_revision": 12}
+                     "route_revision": 12}
 
     monkeypatch.setattr(R, "_post", answering)
     resolver = R.Resolver(local_agents=AGENTS)
@@ -157,14 +157,14 @@ def test_a_directory_answer_is_never_marked_degraded(directory, monkeypatch):
     monkeypatch.setattr(R, "_post", lambda *a, **k: (200, {
         "kind": "resolution-result", "contract": "0.1",
         "success": True, "status": "resolved", "canonical_id": "bakehouse.agent-eco.arch",
-        "route": {"seat": "agent-eco/arch", "host": "otter"},
+        
         "delivery": "inject", "route_revision": 12}))
     answer = R.Resolver(local_agents=AGENTS).resolve("arch", caller="c")
 
     assert answer.degraded is False
     assert answer.source == R.FROM_DIRECTORY
     assert answer.label().endswith("bakehouse.agent-eco.arch")
-    assert answer.seat == "agent-eco/arch" and answer.route_revision == 12
+    assert answer.route_revision == 12
 
 
 def test_the_credential_file_is_the_name_the_estate_declares():
@@ -379,5 +379,8 @@ def test_a_0_2_answer_tells_us_where_to_send_and_nothing_about_the_seat(director
 
     assert a.success and a.canonical_id == "bakehouse.arc-web.review"
     assert a.delivery == "inject" and a.transports["comms"]["channel"] == "arc-web"
-    assert a.seat == "" and a.host == "", "a seat internal was carried into the client"
-    assert not hasattr(a, "seat_local_id")
+    # The strong form: the fields do not EXIST, so nothing can build on them.
+    # `seat` and `host` were the 0.1 route block and are deleted; 0.2 carries no
+    # route block at all.
+    for internal in ("seat", "host", "seat_local_id"):
+        assert not hasattr(a, internal), f"a seat internal survives: {internal}"

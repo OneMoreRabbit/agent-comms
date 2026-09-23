@@ -84,6 +84,15 @@ def import_jsonl(source: Path, queue: Queue) -> Imported:
             hub_id=hub_id, sender=str(old.get("sender") or "unknown"),
             body=str(old.get("content") or ""), subject=str(old.get("topic") or ""),
             permalink=str(old.get("permalink") or ""), received_at=received_at)
+        # Carry the epoch and the channel across. Without the epoch an imported
+        # message reads as 1970 in `log` and `trace`, and — worse — the age
+        # bound treats the whole imported history as ancient. That is the
+        # epoch-1970 fixture trap (catalogue 0.55) arriving in production data
+        # rather than in test data.
+        queue.db.execute(
+            "UPDATE messages SET received_at_epoch=?, channel=?, reason=? WHERE id=?",
+            (int(when) if isinstance(when, (int, float)) else 0,
+             str(old.get("channel") or ""), str(old.get("reason") or "mentioned"), message))
 
         if queue.state_of(message) != RECEIVED:
             continue                                  # already imported

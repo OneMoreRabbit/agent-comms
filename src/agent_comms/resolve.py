@@ -79,8 +79,11 @@ class Resolution:
     status: str
     requested: str
     canonical_id: str = ""
-    seat: str = ""
-    host: str = ""
+    #: NOTE — `seat` and `host` were the 0.1 route block and are DELETED.
+    #: 0.2 carries no route block at all, so they were always empty, and
+    #: nothing read them: §11 question 1, the same rule that deleted
+    #: `local_route`. A field that governs nothing is deleted, not kept
+    #: "in case" — a phantom does nothing while advertising that it does.
     delivery: str = ""
     transports: dict = field(default_factory=dict)
     permissions: dict = field(default_factory=dict)
@@ -351,7 +354,6 @@ class Resolver:
             success=True, status="resolved", requested=target, source=source,
             reason=reason,
             canonical_id=record.get("id", target),
-            seat=record.get("seat", ""), host=record.get("host", ""),
             delivery=record.get("delivery", ""),
             transports=record.get("transports", {}) or {},
             permissions=record.get("permissions", {}) or {},
@@ -376,7 +378,6 @@ def _read(target: str, body: dict) -> Resolution:
         return Resolution(
             success=True, status=str(body.get("status") or "resolved"), requested=target,
             canonical_id=str(body.get("canonical_id") or ""),
-            seat=str(route.get("seat") or ""), host=str(route.get("host") or ""),
             delivery=str(body.get("delivery") or ""),
             transports=body.get("transports") or {},
             permissions=body.get("permissions") or {},

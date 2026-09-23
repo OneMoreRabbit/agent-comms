@@ -36,7 +36,6 @@ class Plan:
     """What comms hands the seat: an FQN, and the context for the record."""
 
     fqn: str
-    seat: str
     delivery: str
     degraded: bool
     reason: str = ""
@@ -60,7 +59,7 @@ def plan(answer: Resolution) -> Plan:
             "agents and this client carries the name it is given."
         )
 
-    return Plan(fqn=fqn, seat=answer.seat, delivery=answer.delivery,
+    return Plan(fqn=fqn, delivery=answer.delivery,
                 degraded=answer.degraded, reason=answer.reason)
 
 

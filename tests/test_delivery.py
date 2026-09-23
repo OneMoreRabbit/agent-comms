@@ -10,8 +10,7 @@ from agent_comms.resolve import FROM_CACHE, Resolution
 
 def _resolved(**kw):
     base = dict(success=True, status="resolved", requested="arch",
-                canonical_id="bakehouse.agent-eco.arch", seat="agent-eco/arch",
-                delivery="inject")
+                canonical_id="bakehouse.agent-eco.arch",                 delivery="inject")
     base.update(kw)
     return Resolution(**base)
 

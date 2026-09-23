@@ -105,3 +105,16 @@ def test_a_malformed_line_is_skipped_and_named(tmp_path):
     out = import_jsonl(p, q)
 
     assert out.read == 2 and len(out.skipped) == 1
+
+
+def test_the_import_carries_the_timestamp_and_channel(tmp_path):
+    """Without the epoch an imported message reads as 1970 — and the age bound
+    treats the entire imported history as ancient. The epoch-1970 trap
+    (catalogue 0.55) arriving in production data rather than in test data."""
+    src = write(tmp_path, base(id=1, timestamp=1_760_000_000, channel="agent-eco"))
+    q = Queue(tmp_path / "comms.db")
+    import_jsonl(src, q)
+
+    row = q.db.execute("SELECT received_at_epoch, channel FROM messages WHERE id=1").fetchone()
+    assert row["received_at_epoch"] == 1_760_000_000
+    assert row["channel"] == "agent-eco"
