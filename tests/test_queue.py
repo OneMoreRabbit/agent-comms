@@ -387,3 +387,39 @@ def test_the_attempt_bound_is_enforced_on_the_path_the_daemon_USES(tmp_path, mon
     import agent_comms.operations as O
     assert not hasattr(O, "MAX_DELIVERY_ATTEMPTS"), \
         "a second definition of the bound is how the first came to govern nothing"
+
+
+def test_hold_is_honoured_at_the_RECEIVING_end(tmp_path, monkeypatch):
+    """UC-04's hold leg, which failed live. `permitted_to_send` is the SENDER's
+    gate and refuses `none`; `hold` is a receiving decision and the receive
+    path read no delivery mode at all, so it was honoured nowhere.
+
+    It looked honoured on test-claude only because the held agent happened to
+    have no session — a check passing for the wrong reason."""
+    from agent_comms import wake as W
+    import agent_comms.config_sync as CS
+    held_agent = "bakehouse.agent-eco.test-claude-bongo"
+    monkeypatch.setattr(CS, "agent_set", lambda _d: {
+        held_agent: {"delivery": "hold"},
+        "bakehouse.agent-eco.test-claude-new001": {"delivery": "inject"}})
+
+    assert W.holds(held_agent, tmp_path) is True
+    assert W.holds("bakehouse.agent-eco.test-claude-new001", tmp_path) is False
+    # Unknown agent, unknown mode, no set: inject. A mode we cannot read must
+    # never silently withhold mail.
+    assert W.holds("bakehouse.agent-eco.nobody", tmp_path) is False
+    assert W.holds("", tmp_path) is False
+
+
+def test_a_held_message_is_never_handed_to_the_seat(monkeypatch):
+    from agent_comms import wake as W
+    calls = []
+    monkeypatch.setattr(W.seat_app, "deliver",
+                        lambda *a, **k: calls.append(k.get("agent")))
+    monkeypatch.setattr(W, "holds", lambda agent, state_dir=None: True)
+    import pytest
+    with pytest.raises(W.Held):
+        W.wake({"id": 1, "sender": "s", "content": "x", "topic": "t",
+                "agent": "bakehouse.agent-eco.test-claude-bongo",
+                "timestamp": 1758800000, "permalink": "", "channel": "seat-testing"})
+    assert calls == [], "a held message must never reach the seat"

@@ -41,7 +41,7 @@ from .hub import Hub, Registration, Transport, build_transport
 from .seat import SeatUnavailable, speaks_contract
 from .seat import _client_version
 from .seat import state as seat_state_now
-from .wake import WakeError, wake
+from .wake import Held, WakeError, wake
 from .store import DaemonState, Mention, Store
 from .queue import MessageStore
 
@@ -1153,6 +1153,12 @@ def wake_agent(
 
     try:
         result = wake(mention)
+    except Held as held:
+        # `hold`: accepted and stored, never injected. The agent asks for it
+        # with `comms inbox`. Not a failure, so nothing is retried and no
+        # attempt is consumed; the message simply stays queued and readable.
+        store.record("info", f"held: {held}")
+        return f"held: {held}"
     except WakeError as exc:
         # The seat could not be invoked at all — a different fault from anything
         # the seat reports. The message stays ours and stays queued.
@@ -1334,6 +1340,14 @@ def retry_undelivered(
     for mention in pending:
         try:
             result = wake(asdict(mention))
+        except Held as held:
+            # `hold`: accepted and stored, never injected. NOT a failure, so no
+            # attempt is consumed and the bound is not walked towards -- a held
+            # message that burned attempts would be abandoned for obeying its
+            # own declared mode. It stays queued and readable; the age bound
+            # still applies, so it cannot wait forever.
+            store.record("info", f"held: {held}")
+            continue
         except WakeError:
             break  # the seat is not reachable at all; nothing else will land either
         # **The bound is applied HERE, in the same transaction as the attempt.**
