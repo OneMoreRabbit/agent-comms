@@ -519,11 +519,12 @@ def test_a_per_agent_block_from_the_directory_is_enforced(tmp_path, monkeypatch)
     """UC-03, which failed live: the estate authored a block for ONE agent and
     the sender was delivered anyway.
 
-    The block lives in the directory (the source of truth), is cached locally
-    by config_sync, and is enforced at the RECEIVING end -- the only end that
-    can, since the sender is the party being refused. comms.yml declares one
-    policy for the whole seat and cannot express 'another1 blocks test-codex
-    while new001 does not', which is what was authored."""
+    FQN to FQN, never display names. A hub bot name cannot be turned into an
+    FQN -- the directory answers canonical_id: null for `test-codex` and
+    `agent-eco-test-codex` alike -- and display matching was a bypass twice
+    over: short_name splits on dots so the long spelling walked through, and
+    any hyphen rule wide enough to catch it made `blocks-arch` answer to an
+    agent-eco entry of `arch`."""
     from agent_comms.operations import blocks_sender
     import agent_comms.config_sync as CS
     another1 = "bakehouse.agent-eco.test-claude-another1"
@@ -532,20 +533,19 @@ def test_a_per_agent_block_from_the_directory_is_enforced(tmp_path, monkeypatch)
         another1: {"permissions": {"comms": {"blocked": ["test-codex", "probe-two"]}}},
         new001: {"permissions": {"comms": {}}}})
 
-    assert blocks_sender(another1, "test-codex", tmp_path) is True
+    codex = "bakehouse.agent-eco.test-codex"
+    assert blocks_sender(another1, codex, tmp_path) is True
     # Per AGENT: the sibling does not inherit the block.
-    assert blocks_sender(new001, "test-codex", tmp_path) is False
-    # A sender nobody blocked still gets through.
-    assert blocks_sender(another1, "agent-skeleton", tmp_path) is False
-    # BOTH canonical spellings of the bot (ADR-0009 §7a). short_name splits on
-    # dots, so the long form would otherwise walk straight through a block.
-    assert blocks_sender(another1, "agent-eco-test-codex", tmp_path, "agent-eco") is True
-    # ...but only with THIS seat's project prefix. A bare suffix match would
-    # make `blocks-arch` answer to an agent-eco seat's entry of `arch`, which
-    # is the cross-project trap short_name exists to avoid.
+    assert blocks_sender(new001, codex, tmp_path) is False
+    assert blocks_sender(another1, "bakehouse.agent-eco.agent-skeleton", tmp_path) is False
+
+    # A short entry matches the LAST SEGMENT, which is unambiguous now both
+    # sides are FQNs -- and it does NOT reach across projects.
     monkeypatch.setattr(CS, "agent_set", lambda _d: {
-        another1: {"permissions": {"comms": {"blocked": ["arch"]}}}})
-    assert blocks_sender(another1, "blocks-arch", tmp_path, "agent-eco") is False
-    assert blocks_sender(another1, "agent-eco-arch", tmp_path, "agent-eco") is True
-    # No agent addressed, or nothing cached: the seat-level file decides alone.
-    assert blocks_sender("", "test-codex", tmp_path) is False
+        another1: {"permissions": {"comms": {"blocked": ["bakehouse.agent-eco.arch"]}}}})
+    assert blocks_sender(another1, "bakehouse.agent-eco.arch", tmp_path) is True
+    assert blocks_sender(another1, "bakehouse.blocks.arch", tmp_path) is False
+
+    # An unmarked sender states no FQN: no per-agent block can name it, and the
+    # seat-level rules decide alone. A gap in expression, not a silent bypass.
+    assert blocks_sender(another1, "", tmp_path) is False

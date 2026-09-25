@@ -423,3 +423,25 @@ def test_a_held_message_is_never_handed_to_the_seat(monkeypatch):
                 "agent": "bakehouse.agent-eco.test-claude-bongo",
                 "timestamp": 1758800000, "permalink": "", "channel": "seat-testing"})
     assert calls == [], "a held message must never reach the seat"
+
+
+def test_the_envelope_states_both_ends_as_FQNs():
+    """Policy compares FQN to FQN. The recipient's FQN was already in the
+    marker; the sender's is there now because a hub display name cannot be
+    turned into one -- the directory answers canonical_id: null for both
+    spellings of a bot, the answer being not-registered rather than unknown."""
+    from agent_comms.operations import addressed, envelope_from_body, envelope_sender
+    out = addressed("test-claude", "hi",
+                    to_fqn="bakehouse.agent-eco.test-claude-another1",
+                    from_fqn="bakehouse.agent-eco.test-codex")
+    assert envelope_sender(out) == "bakehouse.agent-eco.test-codex"
+    assert envelope_from_body(out) == "bakehouse.agent-eco.test-claude-another1"
+
+    # A to-only marker still parses, and states no sender.
+    old = addressed("test-claude", "hi", to_fqn="bakehouse.agent-eco.test-claude-another1")
+    assert envelope_from_body(old) == "bakehouse.agent-eco.test-claude-another1"
+    assert envelope_sender(old) == ""
+
+    # An unmarked message states neither.
+    assert envelope_sender("@**test-claude** hello") == ""
+    assert envelope_from_body("@**test-claude** hello") == ""

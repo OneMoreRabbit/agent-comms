@@ -525,7 +525,7 @@ def _permalink(site: str, event_msg: dict) -> str:
     return f"{site}/#narrow/channel/{stream_id}-{slug}/topic/{quoted}/near/{event_msg['id']}"
 
 
-def blocks_sender(agent: str, sender: str, state_dir, project: str = "") -> bool:
+def blocks_sender(agent: str, sender_fqn: str, state_dir) -> bool:
     """Does the ADDRESSED AGENT's own directory policy refuse this sender?
 
     **The directory is the source of truth; the local file is its cache.** The
@@ -539,18 +539,28 @@ def blocks_sender(agent: str, sender: str, state_dir, project: str = "") -> bool
     runs FIRST and the seat-level file still applies to everything it does not
     cover: a per-agent block narrows, it never widens.
 
-    Matched on BOTH canonical spellings of a bot (ADR-0009 §7a): the estate
-    writes short names in these lists (`test-codex`), and a bot may arrive as
-    `test-codex` or as `agent-eco-test-codex`. `short_name` splits on dots and
-    so matches only the first -- a blocked sender arriving under its long name
-    would have walked straight through.
+    **FQN to FQN, and nothing else.** `sender_fqn` comes from the envelope,
+    where the sending comms states its own; a hub display name is never used,
+    because it cannot be turned into one -- the directory answers
+    `canonical_id: null` for `test-codex` and `agent-eco-test-codex` alike.
 
-    The long form is only accepted with THIS seat's project prefix, never by
-    bare suffix: `blocks-arch` must not match an entry of `arch` written by an
-    agent-eco seat. That is the cross-project trap `short_name` exists to
-    avoid, and stripping any prefix would reintroduce it.
+    Display-name matching was a bypass twice over. `short_name` splits on
+    dots, so a bot arriving as `agent-eco-test-codex` walked through a block
+    on `test-codex`; and any hyphen-stripping wide enough to catch that also
+    made `blocks-arch` answer to an agent-eco seat's entry of `arch`. There is
+    no spelling rule that is both tight enough and wide enough, which is the
+    signal that the comparison was on the wrong thing.
+
+    A blocked entry is matched as an FQN, or -- because the estate writes
+    short names in these lists today -- as the LAST SEGMENT of one, which is
+    unambiguous once both sides are FQNs.
+
+    An unmarked sender states no FQN, so no per-agent block can name it: the
+    seat-level rules in `comms.yml` decide alone. That is a gap in what the
+    estate can express about older senders, not a silent bypass, and it closes
+    as senders carry the envelope.
     """
-    if not agent or not sender:
+    if not agent or not sender_fqn:
         return False
     from . import config_sync
     from .directory import short_name
@@ -559,14 +569,13 @@ def blocks_sender(agent: str, sender: str, state_dir, project: str = "") -> bool
     except Exception:  # noqa: BLE001 - an unreadable cache must not block mail
         return False
     blocked = ((record.get("permissions") or {}).get("comms") or {}).get("blocked") or []
-    theirs = short_name(sender).casefold()
-    raw = sender.strip().casefold()
-    prefix = f"{project.strip().casefold()}-" if project else None
+    theirs = sender_fqn.strip().casefold()
+    if not theirs:
+        return False
+    last = short_name(theirs)
     for entry in blocked:
-        mine = short_name(str(entry)).casefold()
-        if mine == theirs or mine == raw:
-            return True
-        if prefix and raw == f"{prefix}{mine}":
+        mine = str(entry).strip().casefold()
+        if mine == theirs or (mine == last and "." not in mine):
             return True
     return False
 
@@ -914,7 +923,9 @@ def send(
     warnings = _mention_warnings(hub, content, channel)
     response = hub.send(channel, topic,
                         addressed(recipient, content,
-                                  to_fqn=routed.fqn if routed is not None else ""))
+                                  to_fqn=routed.fqn if routed is not None else "",
+                                  from_fqn=(f"bakehouse.{settings.identity.project}."
+                                            f"{settings.identity.seat}")))
     return Posted(response=response, warnings=warnings)
 
 
@@ -1114,16 +1125,41 @@ def _directory_hint(name: str, **kw) -> str:
 #: store our own reply and hand it back to the agent that wrote it. A marker
 #: the sender writes is carried by a send and not by a reply, which is the
 #: distinction the topic cannot make.
-ENVELOPE = re.compile(r"^@\*\*[^*]+\*\*\s*\u2192`([^`]+)`")
+ENVELOPE = re.compile(
+    r"^@\*\*[^*]+\*\*\s*(?:`([^`]+)`)?\s*\u2192`([^`]+)`")
 
 
 def envelope_from_body(content: str) -> str:
-    """The FQN the sender addressed, from the marker. Empty if unmarked."""
+    """The FQN the sender ADDRESSED, from the marker. Empty if unmarked."""
     m = ENVELOPE.match((content or "").lstrip())
-    return m.group(1).strip() if m else ""
+    return m.group(2).strip() if m else ""
 
 
-def addressed(sender: str, content: str, to_fqn: str = "") -> str:
+def envelope_sender(content: str) -> str:
+    """The FQN the message came FROM, from the marker. Empty if unmarked.
+
+    **Policy compares FQN to FQN, never display names.** A hub bot name cannot
+    be turned into an FQN: the directory recognises `test-codex` and
+    `agent-eco-test-codex` alike and returns `canonical_id: null` for both,
+    because the answer is `not-registered` (known name, no announced slot).
+    So the only FQN for a sender is the one the sender states, and it states
+    it here.
+
+    Matching display names instead is what this replaces, and it was a bypass
+    twice over: `short_name` splits on dots, so a bot arriving as
+    `agent-eco-test-codex` walked straight through a block on `test-codex`;
+    and any hyphen-stripping wide enough to catch it also made `blocks-arch`
+    answer to an agent-eco seat's entry of `arch`.
+
+    This is POLICY, not authentication. The hub's bot attribution is what says
+    who posted; this says which agent behind that bot. A block keeps an agent
+    out of a conversation; it is not a security boundary and was never one.
+    """
+    m = ENVELOPE.match((content or "").lstrip())
+    return (m.group(1) or "").strip() if m else ""
+
+
+def addressed(sender: str, content: str, to_fqn: str = "", from_fqn: str = "") -> str:
     """Prefix a message with an @-mention of the seat it is for.
 
     `to_fqn` adds the envelope marker: one bot serves every agent on a seat, so
@@ -1140,7 +1176,8 @@ def addressed(sender: str, content: str, to_fqn: str = "") -> str:
     this client writes hub syntax.
     """
     name = (sender or "").lstrip("@").strip("*").strip()
-    mark = f" \u2192`{to_fqn}`" if to_fqn else ""
+    mark = (f" `{from_fqn}`\u2192`{to_fqn}`" if to_fqn and from_fqn
+            else f" \u2192`{to_fqn}`" if to_fqn else "")
     if not name:
         return content
     return f"@**{name}**{mark} {content}"
@@ -1932,8 +1969,9 @@ def run_daemon(
                     (event.get("message") or {}).get("subject") or "",
                     config_sync.agent_set(settings.state_dir),
                     body=(event.get("message") or {}).get("content") or "")
-                if blocks_sender(addressed, name, settings.state_dir,
-                                 settings.identity.project):
+                if blocks_sender(addressed,
+                                 envelope_sender((event.get("message") or {}).get("content") or ""),
+                                 settings.state_dir):
                     return False
                 try:
                     return is_permitted(directory, hub, name)
