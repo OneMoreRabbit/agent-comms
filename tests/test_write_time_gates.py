@@ -143,3 +143,64 @@ def test_gate_11_stderr_is_not_swallowed_around_consumed_output():
     pattern = re.compile(r"2>\s*/dev/null|stderr\s*=\s*subprocess\.DEVNULL")
     hits = [(p, n, l) for p, n, l in _live(SRC) if pattern.search(l)]
     _report(hits, "11 (stderr swallowed)")
+
+
+# -- gate 1a: an FQN, channel or bot name is READ, never constructed ----------
+
+def _identity_templates(path: pathlib.Path, skip: set):
+    """f-strings that look like an identity assembled from parts.
+
+    An identity template is a format string whose literal pieces are only
+    SEPARATORS (`.` `-` `_` `/`) and at most bare tokens -- `f"{p}-{s}"`,
+    `f"bakehouse.{p}.{s}"`, `f"{e}.{p}.{a}"`. Prose is excluded by the same
+    test: a sentence has spaces in its literal parts, so it cannot match.
+
+    This is the gate the operator asked for after four of these were found by
+    hand: the bot was `f"{project}-{seat}"` where the directory says
+    `test-claude`; the channel fell back to the project name; the seat's own
+    FQN was `f"bakehouse.{project}.{seat}"` in seven places, estate hardcoded.
+    Channel, bot and FQN all come from the directory (or its cache) and are
+    never built.
+    """
+    tree = ast.parse(path.read_text())
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.JoinedStr) or node.lineno in skip:
+            continue
+        holes = [v for v in node.values if isinstance(v, ast.FormattedValue)]
+        literals = ["".join(v.value for v in node.values
+                            if isinstance(v, ast.Constant) and isinstance(v.value, str))]
+        if len(holes) < 2:
+            continue
+        joined = literals[0]
+        # An identity has no whitespace: a display format string does.
+        if any(ch.isspace() for ch in joined):
+            continue
+        # ...and no path or URL punctuation: those are addresses of another kind.
+        if any(ch in joined for ch in "/#:?=&%"):
+            continue
+        # An identity template SEPARATES its parts with `.` or `-`. Without one
+        # this is concatenation -- `f"{status}{where}"`, `f"{n}h{m}m"` -- which
+        # joins values rather than assembling a name.
+        if "." not in joined and "-" not in joined:
+            continue
+        bare = joined
+        for sep in ".-_":
+            bare = bare.replace(sep, "")
+        if len(bare) > 24:
+            continue            # a long literal is prose, not a separator
+        yield node.lineno
+
+
+def test_gate_1a_no_fqn_channel_or_bot_is_CONSTRUCTED():
+    hits = []
+    for path in sorted(SRC.rglob("*.py")):
+        text = path.read_text()
+        exempt = {n for n, line in enumerate(text.splitlines(), 1) if EXEMPT in line}
+        try:
+            docs = _docstring_lines(ast.parse(text))
+        except SyntaxError:
+            docs = set()
+        for lineno in _identity_templates(path, exempt | docs):
+            line = text.splitlines()[lineno - 1]
+            hits.append((path, lineno, line))
+    _report(hits, "1a (an identity assembled from parts -- read it from the directory)")

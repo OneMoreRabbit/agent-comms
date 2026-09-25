@@ -112,14 +112,15 @@ def fetch(project: str, seat: str, state_dir: Path, timeout: float = 10.0) -> Fe
               "generation": body.get("generation", 0),
               "fetched_at": fetched_at,
               "source": "directory",
-              "routes": _complete(body.get("assignments") or [],
-                                  caller=f"bakehouse.{project}.{seat}")}
+              # Each agent is its own caller when we complete its record:
+              # a seat has no FQN, so there is no seat-level caller to use.
+              "routes": _complete(body.get("assignments") or [])}
     _write_atomic(target, record)
     return Fetched(generation=record["generation"], fetched_at=fetched_at,
                    agents=len(record["routes"]), source="directory")
 
 
-def _complete(assignments: list, caller: str) -> list:
+def _complete(assignments: list) -> list:
     """The assignment list, with anything the directory left out filled in.
 
     **The assignments answer now carries the whole record** -- agent, label,
@@ -151,7 +152,7 @@ def _complete(assignments: list, caller: str) -> list:
         fqn = record.get("agent") or record.get("id")
         if fqn and ("transports" not in record or "permissions" not in record):
             try:
-                answer = resolver.resolve(fqn, caller=caller)
+                answer = resolver.resolve(fqn, caller=fqn)
             except Exception:  # noqa: BLE001 - a sync must not die on one agent
                 answer = None
             if answer is not None and answer.success:

@@ -293,7 +293,7 @@ def test_unrecognisable_bot_name_is_reported(seat):
     report = operations.preflight(
         transport_factory=lambda c: FakeTransport(full_name="zulip-bot-3")
     )
-    assert any("does not identify the seat" in w for w in report.warnings)
+    assert any("not a name this seat is known by" in w for w in report.warnings)
 
 
 def test_human_account_credential_is_reported(seat):
@@ -1119,17 +1119,26 @@ def test_a_send_to_a_held_channel_is_not_refused(seat, monkeypatch):
     assert posted.response
 
 
-def test_doctor_fails_when_a_routed_channel_is_unreachable(seat, monkeypatch):
-    """A transports record naming a channel we do not hold is a message that
-    will post and never be answered. Doctor is where that is found out."""
+def test_doctor_fails_when_our_declared_channel_is_unreachable(seat, monkeypatch):
+    """A channel the directory declares for this seat that its bot does not hold
+    is a message that will post and never be answered.
+
+    **Rewritten 2026-09-26.** This used to plant ANOTHER seat's agent in this
+    seat's cache and expect the later `reachable channels` check to catch it.
+    Two things changed: the cache holds only this seat's own assignments, so the
+    old fixture was not a state that can occur; and the channel is now READ from
+    that cache, so an unsubscribed declared channel is caught by the earlier
+    `subscription` check, which names it. Earlier and more specific is better,
+    and the message a person reads is about the channel rather than about a
+    routing record."""
     import json
 
     from agent_comms.hub import Hub
 
     (seat / ".comms").mkdir(parents=True, exist_ok=True)
     (seat / ".comms" / "routes.json").write_text(json.dumps({"routes": [
-        {"id": "bakehouse.orchestrator.arch",
-         "transports": {"comms": {"channel": "orchestrator", "bot": "orch-arch"}}}]}))
+        {"agent": "bakehouse.agent-eco.agent-comms",
+         "transports": {"comms": {"channel": "orchestrator", "bot": "agent-comms"}}}]}))
 
     monkeypatch.setattr(Hub, "subscribed_channels", lambda self: frozenset({"agent-eco"}))
     monkeypatch.setattr("agent_comms.operations.seat_state_now",
@@ -1138,9 +1147,10 @@ def test_doctor_fails_when_a_routed_channel_is_unreachable(seat, monkeypatch):
                             version="1.0.2", contract="1.0"))
     report = operations.preflight(transport_factory=lambda c: FakeTransport())
 
-    check = next(c for c in report.checks if c[0] == "reachable channels")
-    assert check[1] is False
-    assert "orchestrator" in check[2]
+    failed = [c for c in report.checks if c[1] is False]
+    assert failed, "an unsubscribed declared channel must fail, not warn"
+    assert any("orchestrator" in c[2] for c in failed), \
+        "the failure names the channel the directory declared"
 
 
 def test_doctor_passes_when_every_routed_channel_is_held(seat, monkeypatch):

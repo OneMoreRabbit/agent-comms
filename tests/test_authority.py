@@ -296,7 +296,10 @@ def test_the_body_is_never_rewritten(seat):
     prefix = sent[:-len(body) - 1]
     assert prefix.startswith("@**agent-eco-arch**")
     from agent_comms.operations import envelope_sender, envelope_from_body
-    assert envelope_sender(sent) == "bakehouse.agent-eco.agent-comms"
+    # This fixture has never synced, so the seat holds no agent set and cannot
+    # state a sender -- it posts without a `from:` rather than refusing, which
+    # is what lets a fresh container send at all. See own_fqn().
+    assert envelope_sender(sent) == ""
     assert envelope_from_body(sent) == "", "a bare seat name addresses no agent"
 
 
@@ -519,8 +522,8 @@ def test_this_seat_is_always_permitted_to_address_its_own_agents():
     already dropped the rest."""
     from agent_comms.config import Identity
     me = Identity(project="agent-eco", seat="test-claude")
-    names = {n.casefold() for n in me.canonical_names("component")}
-    assert "test-claude" in names and "agent-eco-test-claude" in names
+    names = {n.casefold() for n in me.known_names()}
+    assert "test-claude" in names, "the seat recognises itself by its own name"
     assert "test-codex" not in names, "another seat must still face the graph"
 
 

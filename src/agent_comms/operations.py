@@ -305,7 +305,7 @@ def preflight(
     # It is loud HERE and silent THERE, which is the whole reason it belongs at
     # the seat: the seat can see what it is supposed to serve; the sender only
     # sees a post that appeared to work.
-    mine = settings.identity.canonical_names(settings.role)
+    mine = settings.identity.known_names()
     assigned = config_sync.agent_set(settings.state_dir)
     # **RESOLVE each one — the assignments answer carries no transports.**
     # Measured 2026-09-25 on test-claude: `/v0/seats/<p>/<s>/assignments`
@@ -315,7 +315,7 @@ def preflight(
     # a check that fires every time and detects nothing (constitution §9).
     # The need asks for the RESOLVED transport, and resolution is where it is.
     from .resolve import Resolver
-    me = f"bakehouse.{settings.identity.project}.{settings.identity.seat}"
+    me = own_fqn(settings)
     resolver = Resolver(local_agents=assigned)
     resolved, unreadable = {}, []
     for fqn in sorted(assigned):
@@ -598,6 +598,57 @@ def blocks_sender(agent: str, sender_fqn: str, state_dir) -> bool:
 LEGACY_SENDER_MATCHING = True
 
 
+class SenderUnknown(CommsError):
+    """This seat serves several agents, so who is sending is not knowable here.
+
+    A seat has no FQN. An FQN names an agent session, and a seat that serves
+    more than one has no single sender to put in `from:`. Picking one would be
+    inventing an identity, so the caller states it.
+    """
+
+    tag = "sender-unknown"
+    exit_code = 1
+
+
+def own_fqn(settings: Settings, explicit: str = "") -> str:
+    """The FQN this seat sends AS. Read, or stated by the caller -- never built.
+
+    Until 2026-09-26 this was `f"bakehouse.{project}.{seat}"` in seven places:
+    an FQN assembled from a seat name, with the estate hardcoded. **A seat has
+    no FQN** -- the model is channel↔seat, bot↔seat, FQN↔agent -- so there was
+    nothing for that template to be right about. It only looked right because
+    `agent-eco/test-claude` happens to serve an agent called
+    `bakehouse.agent-eco.test-claude`.
+
+    Order: what the caller stated, then the one agent this seat serves. With
+    several agents and nothing stated, it REFUSES -- the sending agent is a
+    fact this seat does not hold.
+    """
+    if explicit.strip():
+        return explicit.strip()
+    if settings.identity.fqn:
+        return settings.identity.fqn
+
+    # **Two different unknowns, and only one is a refusal.**
+    #
+    # A seat that has never synced holds no agent set at all, so it cannot
+    # state a sender -- and refusing there would stop a fresh container from
+    # sending its first message, which is the least-exercised path in the
+    # estate. It sends without a `from:`, exactly as every pre-envelope seat
+    # does, and `doctor` reports the unread identity.
+    #
+    # A seat WITH a set and several agents in it is different: the fact exists
+    # and comms simply cannot pick. Choosing one would invent an identity, so
+    # that one refuses and asks.
+    if not settings.identity.declared.known:
+        return ""
+    raise SenderUnknown(
+        "this seat serves more than one agent, so comms cannot tell which one "
+        "is sending. Name it: --from <estate.project.agent>. "
+        f"(assignments say: {settings.identity.declared.source})"
+    )
+
+
 def why_refused(mention, directory: Directory, state_dir,
                 in_project: bool = False) -> str:
     """Which rule refused this sender, and WHERE THAT RULE LIVES.
@@ -724,7 +775,7 @@ def addressed_to_seat(
 
     topic = (msg.get("subject") or "").strip()
     prefix = topic.split(":", 1)[0].strip().casefold() if ":" in topic else ""
-    if prefix and prefix in {n.casefold() for n in settings.identity.bot_names}:
+    if prefix and prefix in {n.strip().casefold() for n in settings.identity.known_names()}:
         return "topic addressed to this seat"
     return None
 
@@ -914,6 +965,7 @@ def send(
     subject: str | None = None,
     topic: str | None = None,
     channel: str | None = None,
+    from_fqn: str | None = None,
     transport_factory: Callable[[Credential], Transport] = build_transport,
     **kw,
 ) -> dict:
@@ -1006,8 +1058,7 @@ def send(
     response = hub.send(channel, topic,
                         addressed(recipient, content,
                                   to_fqn=routed.fqn if routed is not None else "",
-                                  from_fqn=(f"bakehouse.{settings.identity.project}."
-                                            f"{settings.identity.seat}")))
+                                  from_fqn=own_fqn(settings, from_fqn or "")))
     return Posted(response=response, warnings=warnings)
 
 
@@ -1044,7 +1095,7 @@ def _route(settings: Settings, name: str, **kw):
     from .delivery import NotDeliverable, permitted_to_send, plan, transport_for
     from .resolve import Resolver
 
-    me = f"bakehouse.{settings.identity.project}.{settings.identity.seat}"
+    me = own_fqn(settings)
     answer = Resolver(local_agents=config_sync.agent_set(settings.state_dir)).resolve(
         name, caller=me)
 
@@ -1114,7 +1165,7 @@ def _resolve_recipient(settings: Settings, hub: Hub, name: str) -> str:
     contain to resolve. Addressing yourself is refused: a seat ignores its own
     posts, so it is the one mention guaranteed to reach nobody.
     """
-    ours = {n.casefold() for n in settings.identity.canonical_names(settings.role)}
+    ours = {n.strip().casefold() for n in settings.identity.known_names()}
     if name.casefold() in ours:
         raise UnknownRecipient(
             f"'{name}' is this seat. A seat ignores its own posts, so this would "
@@ -1170,7 +1221,7 @@ def _directory_hint(name: str, **kw) -> str:
     try:
         from .resolve import Resolver
         settings = load_settings(**kw)
-        me = f"bakehouse.{settings.identity.project}.{settings.identity.seat}"
+        me = own_fqn(settings)
         answer = Resolver(
             local_agents=config_sync.agent_set(settings.state_dir)).resolve(name, caller=me)
     except Exception:                                    # noqa: BLE001 — a hint
@@ -1275,10 +1326,19 @@ def addressed(sender: str, content: str, to_fqn: str = "", from_fqn: str = "") -
 def reply(
     message_id: int,
     content: str,
+    from_fqn: str | None = None,
     transport_factory: Callable[[Credential], Transport] = build_transport,
     **kw,
 ) -> dict:
-    """Reply in the mention's own topic, so the conversation stays one thread."""
+    """Reply in the mention's own topic, so the conversation stays one thread.
+
+    **A reply states both ends as FQNs too.** `to:` is the FQN the original
+    sender declared in ITS envelope (`sender_fqn`), which is exactly who the
+    reply is for — so a reply is addressed as precisely as a send, and the
+    receiving seat can dispatch it to the agent that asked rather than to its
+    default. Where the original stated no sender FQN, there is no `to:` to
+    state: that sender is on a build that predates the envelope.
+    """
     settings = load_settings(**kw)
     store = message_store(settings.state_dir)
     target = next((m for m in store.all() if m.id == message_id), None)
@@ -1290,8 +1350,8 @@ def reply(
     warnings = _mention_warnings(hub, content, channel)
     result = hub.send(channel, target.topic,
                       addressed(target.sender, content,
-                                from_fqn=(f"bakehouse.{settings.identity.project}."
-                                          f"{settings.identity.seat}")))
+                                to_fqn=getattr(target, "sender_fqn", "") or "",
+                                from_fqn=own_fqn(settings, from_fqn or "")))
     store.mark_read(message_id)
     return Posted(response=result, warnings=warnings)
 
@@ -2087,7 +2147,7 @@ def run_daemon(
                 # an envelope for one of our agents gets here at all --
                 # `addressed_to_seat` has already dropped every other self-post.
                 if name.strip().casefold() in {
-                        n.casefold() for n in settings.identity.canonical_names(settings.role)}:
+                        n.strip().casefold() for n in settings.identity.known_names()}:
                     return True
                 # The ADDRESSED AGENT's own policy, from the directory, first.
                 addressed = addressed_agent(
@@ -2536,7 +2596,7 @@ def resolve_name(name: str, **kw) -> list[str]:
     from .resolve import Resolver
 
     settings = load_settings(**kw)
-    me = f"bakehouse.{settings.identity.project}.{settings.identity.seat}"
+    me = own_fqn(settings)
     answer = Resolver(local_agents=config_sync.agent_set(settings.state_dir)).resolve(
         name, caller=me)
 

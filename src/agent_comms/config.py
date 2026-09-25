@@ -46,70 +46,187 @@ LIFESPAN_ECHO_FEATURE_LEVEL = 481
 SOURCE_VERIFIED_FEATURE_LEVEL = 372
 
 
+class Declared(BaseModel):
+    """What the DIRECTORY says this seat is: its FQN, its bot, its channel.
+
+    **All three are read, never derived** — the addressing model is
+    channel↔seat, bot↔seat, FQN↔agent, and the directory holds all of it
+    (`transports.comms` per agent, plus the agent's own FQN). This class exists
+    because four things in this client used to assemble them from names
+    instead:
+
+    - the channel fell back to the PROJECT NAME. Measured 2026-09-25: both test
+      seats believed they were on `agent-eco` while the directory said
+      `seat-testing`. It worked only because both were subscribed — a check
+      passing for the wrong reason.
+    - the bot was `f"{project}-{seat}"`, giving `agent-eco-test-claude` where
+      the directory says `test-claude`.
+    - the credential filename came from that template, so the code had to try
+      TWO spellings and take whichever existed.
+    - `canonical_names(role)` existed to accept two spellings of the bot,
+      because the derived one might be the wrong one — and `role` itself was
+      guessed from the seat name's suffix, absent from 29/29 manifests.
+
+    One read replaces all four. `role` and `canonical_names` are gone with them.
+    """
+
+    fqn: str = ""
+    bot: str = ""
+    channel: str = ""
+    source: str = "unread"
+
+    @property
+    def known(self) -> bool:
+        return bool(self.bot and self.channel)
+
+
+def declared_identity(project: str, seat: str, state_dir: Path | None = None) -> Declared:
+    """Read this seat's own FQN, bot and channel from the directory's answer.
+
+    The source is the assignments cache this seat already refreshes on a timer
+    (`~/.comms/routes.json`), which carries `transports.comms` per agent since
+    the directory was extended on 2026-09-25.
+
+    **One bot and one channel per seat** — measured across all 29 seats in the
+    estate, and the model says so. If the cached agents disagree about either,
+    that is not something to average: it is reported as unknown, so `doctor`
+    fails loudly rather than this returning a guess.
+
+    **A SEAT HAS NO FQN.** An FQN names an agent session; the addressing model
+    is channel↔seat, bot↔seat, FQN↔**agent**. So `fqn` here is only filled when
+    this seat serves exactly ONE agent, where the sender cannot be anyone else.
+    With several it is left EMPTY and the caller must say which agent is
+    sending — comms has no way to know, and picking one would be inventing an
+    identity.
+
+    A first version of this preferred "the agent whose last segment is the seat
+    name", which is deriving an FQN from a seat name — the exact defect this
+    class exists to remove. The operator caught it. The naming accident that
+    made it look reasonable is that `agent-eco/test-claude` currently serves an
+    agent called `bakehouse.agent-eco.test-claude`; that is a coincidence of
+    naming, not a relationship.
+    """
+    from . import config_sync
+
+    try:
+        agents = config_sync.agent_set(state_dir or (Path.home() / ".comms"))
+    except Exception:  # noqa: BLE001 - a fresh seat has no cache yet
+        return Declared(source="no cache")
+    if not agents:
+        return Declared(source="no cache")
+
+    bots = {((r.get("transports") or {}).get("comms") or {}).get("bot")
+            for r in agents.values()}
+    chans = {((r.get("transports") or {}).get("comms") or {}).get("channel")
+             for r in agents.values()}
+    bots.discard(None)
+    chans.discard(None)
+    if len(bots) != 1 or len(chans) != 1:
+        return Declared(source=f"disagreeing transports: bots={sorted(bots)} "
+                               f"channels={sorted(chans)}")
+
+    names = sorted(agents)
+    only = names[0] if len(names) == 1 else ""
+    return Declared(fqn=only, bot=next(iter(bots)), channel=next(iter(chans)),
+                    source="directory" if only else
+                           f"directory; {len(names)} agents, so no single sender")
+
+
 class Identity(BaseModel):
-    """Who this seat is. Derived from the seat manifest wherever possible."""
+    """Who this seat is.
+
+    `project` and `seat` come from the seat manifest and name the SEAT. They are
+    not an address and nothing is assembled from them — see `Declared`, which
+    reads the FQN, bot and channel the directory holds.
+    """
 
     project: str
     seat: str
+    #: Read from the directory. Empty on a seat that has never synced.
+    declared: Declared = Declared()
+
+    @property
+    def fqn(self) -> str:
+        """The FQN of the one agent this seat serves, or empty.
+
+        **Not "this seat's FQN" — a seat has no FQN.** Empty whenever the seat
+        serves more or fewer than one agent, because then the sending agent is
+        not knowable from here and must be stated by the caller.
+        """
+        return self.declared.fqn
 
     @property
     def bot_name(self) -> str:
-        """`<project>-<seat>`, per ADR-0009 §1a. The estate mints under this name."""
-        return f"{self.project}-{self.seat}"
+        """This seat's bot, as the directory states it.
 
-    @property
-    def credential_path(self) -> Path:
-        """`~/.secrets/zuliprc-<project>-<seat>`, per the hub interface response."""
-        return Path.home() / ".secrets" / f"zuliprc-{self.bot_name}"
-
-    def canonical_names(self, role: str = "component") -> tuple[str, ...]:
-        """Names this seat's bot may carry, per ADR-0009 §7a — by ROLE, not pattern.
-
-        §7a's requirement is **unambiguity in every channel the bot appears in**.
-        The canonical form follows from where a bot appears, so it is conditional
-        on role rather than a flat pattern — and mistaking the pattern for the
-        requirement produces `blocks-blocks-service`, which is worse at the job.
-
-        - **component** — appears only in its own project's channel, where the
-          project is implied, so `<seat>` is unambiguous. `<project>-<seat>` is
-          also unambiguous, just verbose, so it is accepted rather than warned on.
-        - **arch** — appears in several channels, so it **must** carry its
-          project. A bare `<seat>` genuinely is ambiguous there, and is warned on.
+        Falls back to `<project>-<seat>` ONLY on a seat that has never synced,
+        because a fresh seat must still be able to find its credential and say
+        what it is. The fallback is reported by `doctor`, never silent.
         """
-        if role == "arch":
-            return (self.bot_name,)
-        return (self.seat, self.bot_name)
-
-    @property
-    def bot_names(self) -> tuple[str, ...]:
-        return self.canonical_names()
+        return self.declared.bot or f"{self.project}-{self.seat}"  # gate-exempt: the PRE-SYNC fallback only. A seat that has never read the directory must still name itself and find its credential or a fresh container cannot start. Declared.source records that it was not read, and doctor reports it.
 
     @property
     def credential_candidates(self) -> list[Path]:
-        """Credential paths, in the order the estate actually delivers them.
+        """`zuliprc-<bot>`, with the pre-sync fallbacks after it.
 
-        `zuliprc-<seat>` first: that is what a component seat gets under §7a.
-        `zuliprc-<project>-<seat>` second, which is what an arch seat gets. This
-        client warned about the first as a divergence until §7a ruled it correct
-        — a warning that always fires is one nobody reads.
+        The estate names the credential after the BOT — `zuliprc-test-claude`
+        for bot `test-claude`, `zuliprc-agent-eco-arch` for bot
+        `agent-eco-arch`. Reading the bot makes that one rule instead of two
+        guessed spellings; the guesses stay only for a seat with no cache yet.
         """
         secrets = Path.home() / ".secrets"
-        return [secrets / f"zuliprc-{self.seat}", self.credential_path]
+        first = [secrets / f"zuliprc-{self.declared.bot}"] if self.declared.bot else []
+        return first + [secrets / f"zuliprc-{self.seat}",
+                        secrets / f"zuliprc-{self.project}-{self.seat}"]  # gate-exempt: the PRE-SYNC fallback only. A seat that has never read the directory must still name itself and find its credential or a fresh container cannot start. Declared.source records that it was not read, and doctor reports it.
+
+    @property
+    def credential_path(self) -> Path:
+        return self.credential_candidates[0]
+
+    def known_names(self) -> tuple[str, ...]:
+        """Every name this seat is KNOWN by — for recognising itself only.
+
+        Two distinct jobs, and conflating them is what produced
+        `canonical_names(role)`:
+
+        - **posting and credentials** need the ONE name the directory declares:
+          `bot_name`. There is no set there and no choice to make.
+        - **recognising ourselves** — is this topic prefix us, is this sender us,
+          are we addressing ourselves — is asked about names other parties have
+          already written down, in topics and mentions that predate any sync.
+
+        This is the second. Every entry is a value we HOLD: the bot the
+        directory declares, and the seat name from the manifest. Nothing is
+        derived from a pattern, and the `<project>-<seat>` form appears only as
+        the pre-sync fallback `bot_name` already returns.
+
+        Being generous here is safe and being narrow is not: saying yes to a
+        name that is ours costs nothing, while saying no to one makes the seat
+        fail to recognise mail addressed to it and fail its own health check.
+        """
+        names = [self.bot_name, self.seat]
+        if not self.declared.bot:
+            names.append(f"{self.project}-{self.seat}")  # gate-exempt: the PRE-SYNC fallback only. A seat that has never read the directory must still name itself and find its credential or a fresh container cannot start. Declared.source records that it was not read, and doctor reports it.
+        seen, out = set(), []
+        for n in names:
+            k = n.strip().casefold()
+            if k and k not in seen:
+                seen.add(k)
+                out.append(n)
+        return tuple(out)
 
 
 class Settings(BaseModel):
     """Everything the client needs once comms is on."""
 
     identity: Identity
-    channel: str = Field(description="The project channel this seat watches.")
-    role: str = Field(
-        default="component",
+    channel: str = Field(
         description=(
-            "component | arch | estate. Decides the canonical bot name under "
-            "ADR-0009 §7a: a component bot appears only in its own channel so the "
-            "seat name alone is unambiguous; an arch bot appears in several so it "
-            "must carry its project."
-        ),
+            "The channel this seat posts and listens on, READ from the "
+            "directory's `transports.comms.channel` for this seat's own agents. "
+            "It is NOT the project name: measured 2026-09-25, both test seats "
+            "are in project `agent-eco` and on channel `seat-testing`."
+        )
     )
     # `model` and `model_session` used to live here. Deleted in 0.17: the seat
     # declares its runtime and target, and `seat status` reports both. Keeping a
@@ -186,7 +303,7 @@ def _seat_manifest(path: Path | None = None) -> dict[str, str]:
             continue
         key, _, value = line.partition(":")
         key = key.strip()
-        if key in ("project", "seat", "codex_thread_selection", "role"):
+        if key in ("project", "seat", "codex_thread_selection"):
             out[key] = value.strip().strip("'\"")
     return out
 
@@ -234,12 +351,18 @@ def load_settings(state_dir: Path | None = None, seat_manifest: Path | None = No
             "project/seat in config.toml, or AGENT_COMMS_PROJECT / AGENT_COMMS_SEAT."
         )
 
-    identity = Identity(project=project, seat=seat)
+    # **Read this seat's own FQN, bot and channel from the directory.**
+    declared = declared_identity(project, seat, state_dir)
+    identity = Identity(project=project, seat=seat, declared=declared)
     return Settings(
         identity=identity,
         codex_thread_selection=manifest.get("codex_thread_selection"),
-        role=manifest.get("role") or ("arch" if seat == "arch" or seat.endswith("-arch") else "component"),  # gate-exempt: KNOWN GATE-1 VIOLATION, reported to arch 2026-09-25, SEQUENCED by arch 2026-09-25, not merely pending: derives ROLE from the seat name's suffix when the manifest omits it. Identity assembled by convention -- the same suffix trap removed from the permission matcher the same day. The agreed fix is that `role` becomes REQUIRED and this tool fails naming the file and field (constitution §11), never guessing from a name. It ships only after orch confirms whether any deployed seat.yml omits `role`; if one does, it ships with the manifest fix in the same estate pass. It does NOT ship mid-campaign, because role governs canonical_names(), i.e. which bot names this seat answers to
-        channel=os.environ.get("AGENT_COMMS_CHANNEL") or file_cfg.get("channel") or project,
+        # Declared first, then an explicit override, then the file. The
+        # PROJECT NAME is no longer a fallback: it was wrong on both test seats
+        # (project `agent-eco`, channel `seat-testing`) and worked only because
+        # both channels happened to be subscribed.
+        channel=(os.environ.get("AGENT_COMMS_CHANNEL") or declared.channel
+                 or file_cfg.get("channel") or project),
         lifespan_secs=int(file_cfg.get("lifespan_secs", DEFAULT_LIFESPAN_SECS)),
         state_dir=state_dir,
         notify_command=os.environ.get("AGENT_COMMS_NOTIFY") or file_cfg.get("notify_command"),
