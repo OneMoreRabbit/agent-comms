@@ -84,9 +84,16 @@ class Resolution:
     #: nothing read them: §11 question 1, the same rule that deleted
     #: `local_route`. A field that governs nothing is deleted, not kept
     #: "in case" — a phantom does nothing while advertising that it does.
+    #:
+    #: `permissions` was DELETED for the same reason (2026-09-25, found by
+    #: the operator's `role` verification). The directory sends it, we
+    #: parsed it, and nothing ever read it. It is the worse kind of
+    #: phantom: a reader would assume it governs the delivery verdict.
+    #: It does not — `permitted_to_send()` reads `delivery` and nothing
+    #: else. If a permission answer is ever to govern a send, it gets
+    #: wired to a reader in the same change that reintroduces the field.
     delivery: str = ""
     transports: dict = field(default_factory=dict)
-    permissions: dict = field(default_factory=dict)
     route_revision: int | None = None
     near_misses: tuple[str, ...] = ()
     message: str = ""
@@ -356,7 +363,6 @@ class Resolver:
             canonical_id=record.get("id", target),
             delivery=record.get("delivery", ""),
             transports=record.get("transports", {}) or {},
-            permissions=record.get("permissions", {}) or {},
         )
 
 
@@ -374,13 +380,11 @@ def _read(target: str, body: dict) -> Resolution:
                           message="the directory returned something that is not an answer")
 
     if body.get("success"):
-        route = body.get("route") or {}
         return Resolution(
             success=True, status=str(body.get("status") or "resolved"), requested=target,
             canonical_id=str(body.get("canonical_id") or ""),
             delivery=str(body.get("delivery") or ""),
             transports=body.get("transports") or {},
-            permissions=body.get("permissions") or {},
             route_revision=body.get("route_revision"),
         )
 
