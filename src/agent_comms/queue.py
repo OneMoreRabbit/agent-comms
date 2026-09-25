@@ -230,13 +230,16 @@ class Queue:
         self._log(message, was, to, cause, rule, attempt, db=conn)
 
     def record_attempt(self, message: int, *, delivered: bool, detail: str,
-                       consumes_attempt: bool = True) -> None:
+                       consumes_attempt: bool = True) -> int:
         """**The attempt and its outcome, in ONE transaction.**
 
         This method is the fix for the September flood. There is no window in
         which a message has been handed to the seat and not yet recorded,
         because the counter, the state and the transition row all land together
         or none of them do.
+
+        Returns the attempt count after this one, so a caller can see the bound
+        it has reached without asking again and getting a second answer.
         """
         with self._open() as db:                        # one unit of work
             db.execute("BEGIN")
@@ -272,6 +275,7 @@ class Queue:
                     self.move(message, ABANDONED,
                               f"{attempts} attempts reached", rule="max_attempts",
                               attempt=attempts, db=db)
+        return attempts
 
     def record_wake(self, message: int | None, outcome: str, detail: str = "") -> None:
         """A wake is not a message state. Recorded here and nowhere else.
@@ -482,6 +486,22 @@ class MessageStore(Queue):
         return self.db.execute("SELECT * FROM messages WHERE hub_id=?",
                                (str(hub_id),)).fetchone()
 
+    def attempt_by_hub_id(self, hub_id: int, detail: str) -> int:
+        """Record a failed attempt for a HUB id, and return the count after it.
+
+        `MessageStore` speaks hub ids to its callers and row ids to the store,
+        so the translation happens here -- once, explicitly. A shim that did
+        this translation ALSO skipped the bound: it added one to the counter
+        and never abandoned anything, so `max_attempts` governed nothing on the
+        live path and a message reached its eighth attempt against a cap of
+        three (UC-05, 2026-09-25). Translating and enforcing are different
+        jobs; this one only translates.
+        """
+        row = self._find(hub_id)
+        if row is None:
+            return 0
+        return self.record_attempt(row["id"], delivered=False, detail=detail)
+
     def mark_delivered(self, message_id: int) -> bool:
         row = self._find(message_id)
         if row is None:
@@ -508,12 +528,3 @@ class MessageStore(Queue):
         self.db.execute("UPDATE messages SET retired_reason=? WHERE id=?", (reason, row["id"]))
         return True
 
-    def record_attempt_for(self, message_id: int) -> int:
-        """`Store.record_attempt(id) -> count`, kept by name for its callers."""
-        row = self._find(message_id)
-        if row is None:
-            return 0
-        attempts = int(row["attempts"]) + 1
-        self.db.execute("UPDATE messages SET attempts=? WHERE id=?", (attempts, row["id"]))
-        self._log(row["id"], row["state"], row["state"], f"attempt {attempts}", attempt=attempts)
-        return attempts

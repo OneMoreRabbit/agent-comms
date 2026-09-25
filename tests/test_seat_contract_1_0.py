@@ -289,7 +289,7 @@ def test_a_permanently_failing_message_stops_being_retried(seat, monkeypatch):
     fake_seat(monkeypatch, {"success": False, "status": "failed",
                             "message": "body is 70000 bytes; the limit is 65536"}, code=10)
 
-    for _ in range(operations.MAX_DELIVERY_ATTEMPTS + 2):
+    for _ in range(5):  # past the single bound of 3
         operations.retry_undelivered()
 
     assert store.undelivered() == [], "it must leave the queue rather than block it"

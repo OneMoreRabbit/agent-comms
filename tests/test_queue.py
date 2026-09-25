@@ -360,3 +360,30 @@ def test_the_marker_beats_the_topic_and_a_reply_cannot_forge_one():
     # A marker naming an agent we do not serve is not ours to claim.
     foreign = addressed("test-claude", "hi", to_fqn="bakehouse.agent-eco.test-codex-dave")
     assert addressed_agent("whatever: x", mine, foreign) == ""
+
+
+def test_the_attempt_bound_is_enforced_on_the_path_the_daemon_USES(tmp_path, monkeypatch):
+    """UC-05, which failed live. The retry loop called a shim that added one to
+    the counter and enforced nothing, so `max_attempts` governed no live path:
+    a message on test-codex reached its EIGHTH attempt against a cap of three.
+
+    The bound now lives in one place and is applied in the same transaction as
+    the attempt. This drives the REAL path -- `attempt_by_hub_id`, by hub id,
+    as the daemon calls it -- because a test against the store's private API
+    is what let the gap live."""
+    from agent_comms.queue import MessageStore, QUEUED, ABANDONED
+    from agent_comms.store import Mention
+    q = MessageStore(tmp_path / "comms.db", max_attempts=3)
+    q.append(Mention(id=4242, sender="test-codex", channel="seat-testing",
+                     topic="t", content="body", timestamp=1758800000, permalink=""))
+    assert q.state_of(q._find(4242)["id"]) == QUEUED
+
+    counts = [q.attempt_by_hub_id(4242, "no-session") for _ in range(3)]
+    assert counts == [1, 2, 3], counts
+    assert q.state_of(q._find(4242)["id"]) == ABANDONED, \
+        "three attempts against a cap of three must abandon, not keep counting"
+
+    # And there is exactly ONE bound, not a second one somewhere else.
+    import agent_comms.operations as O
+    assert not hasattr(O, "MAX_DELIVERY_ATTEMPTS"), \
+        "a second definition of the bound is how the first came to govern nothing"

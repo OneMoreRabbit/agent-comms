@@ -1336,7 +1336,10 @@ def retry_undelivered(
             result = wake(asdict(mention))
         except WakeError:
             break  # the seat is not reachable at all; nothing else will land either
-        attempts = store.record_attempt_for(mention.id)
+        # **The bound is applied HERE, in the same transaction as the attempt.**
+        # This used to call a shim that added 1 to the counter and enforced
+        # nothing, so `max_attempts` governed no live path at all.
+        attempts = store.attempt_by_hub_id(mention.id, result.summary())
         if not result.success:
             if not result.retryable:
                 # broken, or our own usage error. Leave it stored and stop: both
@@ -1344,7 +1347,7 @@ def retry_undelivered(
                 store.record("warn", f"retry: giving up on {mention.id} — "
                                      f"{result.summary()} is not retryable")
                 break
-            if attempts >= MAX_DELIVERY_ATTEMPTS:
+            if attempts >= store.max_attempts:
                 # Retryable by status, but not in fact. Say so once, loudly, and
                 # leave it stored — a person can see it in `comms inbox`, and the
                 # queue behind it stops being held hostage.
@@ -1354,7 +1357,8 @@ def retry_undelivered(
                     f"no longer being retried — {result.summary()}. It is still "
                     "stored and visible in `comms inbox`.",
                 )
-                store.mark_delivered(mention.id)  # out of the queue, not lost
+                # `record_attempt` has already moved it to `abandoned`, in the
+                # same transaction as the attempt. Nothing to do here but stop.
             break
         store.mark_delivered(mention.id)
         landed += 1
@@ -1977,7 +1981,12 @@ CONFIG_REFRESH_SECS = 300
 #: every time. Unbounded retry would spin on it forever and bury the queue behind
 #: it. Six attempts across the retry cadence is long enough for a seat to be
 #: restarted and short enough that a permanent failure surfaces the same day.
-MAX_DELIVERY_ATTEMPTS = 6
+#: **The attempt bound lives in ONE place: `Queue.max_attempts`, which is 3.**
+#: There were three definitions of it here and in the store, and a shim that
+#: counted attempts while enforcing none of them. A message on test-codex
+#: reached its EIGHTH attempt against a cap of three — measured by UC-05,
+#: 2026-09-25. A bound written down three times and applied nowhere is worse
+#: than no bound, because everyone who reads it believes it.
 
 #: A message must be this old before its absence from the queue is evidence the
 #: queue is broken. Without it, a message arriving between the doorbell firing
