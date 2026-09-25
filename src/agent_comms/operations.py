@@ -1290,6 +1290,37 @@ def reply(
     return Posted(response=result, warnings=warnings)
 
 
+@dataclass(frozen=True)
+class Woken:
+    """What one wake did, as a WORD plus the line a person reads.
+
+    `outcome` is a closed set and it exists because the word used to be the
+    first token of a prose sentence, read by callers as
+    `startswith("queued")`. That is a prefix-match on a closed word set --
+    `queued-for-review` would match `queued` -- and a caller choosing an EXIT
+    CODE from it is choosing a consumer surface by guesswork. Write-time
+    gate 1; fixed on arch's ruling 2026-09-25.
+
+    `str(Woken)` is the human line, so a caller that echoes it is unchanged.
+    """
+
+    outcome: str
+    line: str
+
+    DELIVERED = "delivered"
+    QUEUED = "queued"
+    HELD = "held"
+    REFUSED = "refused"
+
+    def __str__(self) -> str:
+        return self.line
+
+
+def _woken(result) -> "Woken":
+    return Woken(Woken.DELIVERED if result.success else Woken.REFUSED,
+                 result.summary())
+
+
 def wake_agent(
     mention: dict,
     transport_factory: Callable[[Credential], Transport] = build_transport,
@@ -1327,19 +1358,19 @@ def wake_agent(
         # with `comms inbox`. Not a failure, so nothing is retried and no
         # attempt is consumed; the message simply stays queued and readable.
         store.record("info", f"held: {held}")
-        return f"held: {held}"
+        return Woken(Woken.HELD, f"held: {held}")
     except WakeError as exc:
         # The seat could not be invoked at all — a different fault from anything
         # the seat reports. The message stays ours and stays queued.
         store.record("warn", f"delivery could not be attempted for {mid}: {exc}")
         _announce_held(settings, store, mention, str(exc), transport_factory)
-        return f"queued: {exc}"
+        return Woken(Woken.QUEUED, f"queued: {exc}")
 
     if result.success:
         store.mark_delivered(mid) if mid is not None else None
         store.set_sleeping(False)
         store.record("info", f"wake: {result.summary()}")
-        return result.summary()
+        return _woken(result)
 
     store.record("warn", f"wake: {result.summary()}")
 
@@ -1353,7 +1384,7 @@ def wake_agent(
             "until the seat is fixed, because no retry can change this state.",
             transport_factory,
         )
-        return result.summary()
+        return _woken(result)
 
     if not result.retryable:
         # exit 2 — we called the seat wrongly. Ours to fix, and loud about it.
@@ -1362,10 +1393,10 @@ def wake_agent(
         _tell_sender(settings, store, mention,
                      f"could not deliver that to my agent: {result.message}",
                      transport_factory)
-        return result.summary()
+        return _woken(result)
 
     _announce_held(settings, store, mention, result.message, transport_factory)
-    return result.summary()
+    return _woken(result)
 
 
 def _announce_held(
@@ -2322,7 +2353,8 @@ def _flush_pending(
                                  state_dir=settings.state_dir)
         except WakeError:
             break  # already recorded and reported; the seat is not takeable
-        if outcome.startswith("queued"):  # gate-exempt: KNOWN GATE-1 VIOLATION, reported to arch 2026-09-25, decision pending: same prefix-match on an outcome word as cli.py
+        # Exact match on a named outcome; was a prefix-match until 2026-09-25.
+        if outcome.outcome == Woken.QUEUED:
             break  # still dormant — leave the rest in order for the next tick
         store.mark_delivered(mention.id)
         sent += 1

@@ -1570,3 +1570,24 @@ def test_a_seat_whose_agents_all_point_at_it_reports_nothing_wrong():
         "a.b.one": {"transports": {"comms": {"bot": "test-claude"}}},
         "a.b.two": {"transports": {"comms": {"bot": "test-claude"}}},
     }, ("test-claude", "agent-eco-test-claude")) == ([], [])
+
+
+def test_the_wake_outcome_is_a_word_not_a_prefix_of_a_sentence():
+    """Write-time gate 1, fixed 2026-09-25. `wake_agent` returned prose and the
+    CLI chose an EXIT CODE with `outcome.startswith("queued")` -- a
+    prefix-match on a closed word set, picking a consumer surface by guesswork.
+    `queued-for-review` would have matched `queued`.
+
+    The near-miss is the point: a word that STARTS WITH the right word is the
+    wrong word."""
+    from agent_comms.operations import Woken
+    w = Woken(Woken.QUEUED, "queued: the seat could not be invoked")
+    assert w.outcome == Woken.QUEUED
+    # The human line is unchanged for anything that echoes it.
+    assert str(w) == "queued: the seat could not be invoked"
+
+    near = Woken("queued-for-review", "queued-for-review: not a real state")
+    assert near.outcome != Woken.QUEUED, \
+        "an exact match must reject a word that merely starts with the right one"
+    assert near.line.startswith("queued"), \
+        "...and the near-miss really would have passed the old prefix test"
