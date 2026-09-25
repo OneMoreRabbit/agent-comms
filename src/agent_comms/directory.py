@@ -246,7 +246,7 @@ def load(state_dir: Path | None = None, own_project: str = "") -> Directory:
         line = raw.split("#", 1)[0].rstrip()
         if not line.strip():
             continue
-        if pending and line.lstrip().startswith("-"):
+        if pending and line.lstrip().startswith("-"):  # gate-exempt: YAML list syntax, not an identifier
             found.setdefault(pending, [])
             value = line.lstrip()[1:].strip().strip("'\"")
             if value:
@@ -267,7 +267,7 @@ def load(state_dir: Path | None = None, own_project: str = "") -> Directory:
                     f"{path}: project must be true or false, got {value!r}."
                 )
         elif key in ("partners", "blocked"):
-            if value.startswith("["):
+            if value.startswith("["):  # gate-exempt: inline-list syntax, not an identifier
                 inner = value.strip().lstrip("[").rstrip("]")
                 found[key] = [v.strip().strip("'\"") for v in inner.split(",") if v.strip()]
             elif value:

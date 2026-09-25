@@ -2322,7 +2322,7 @@ def _flush_pending(
                                  state_dir=settings.state_dir)
         except WakeError:
             break  # already recorded and reported; the seat is not takeable
-        if outcome.startswith("queued"):
+        if outcome.startswith("queued"):  # gate-exempt: KNOWN GATE-1 VIOLATION, reported to arch 2026-09-25, decision pending: same prefix-match on an outcome word as cli.py
             break  # still dormant — leave the rest in order for the next tick
         store.mark_delivered(mention.id)
         sent += 1

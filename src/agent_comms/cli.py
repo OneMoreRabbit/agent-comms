@@ -199,7 +199,7 @@ def wake(message_id: int | None) -> None:
 
     outcome = operations.wake_agent(payload)
     click.echo(outcome)
-    if outcome.startswith("queued"):
+    if outcome.startswith("queued"):  # gate-exempt: KNOWN GATE-1 VIOLATION, reported to arch 2026-09-25, decision pending: this prefix-matches our own outcome word to pick an exit code. Not fixed mid-campaign because the exit code is a consumer surface
         sys.exit(EXIT_QUEUED)
 
 

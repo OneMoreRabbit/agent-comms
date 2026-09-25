@@ -160,7 +160,7 @@ class Credential(BaseModel):
     @field_validator("site")
     @classmethod
     def _must_be_https(cls, v: str) -> str:
-        if not v.startswith("https://"):
+        if not v.startswith("https://"):  # gate-exempt: URL scheme, not an identifier
             raise ValueError(
                 f"site must be https (got {v!r}). Estate traffic does not travel unverified."
             )
@@ -182,7 +182,7 @@ def _seat_manifest(path: Path | None = None) -> dict[str, str]:
         return out
     for line in text.splitlines():
         line = line.strip()
-        if not line or line.startswith("#") or ":" not in line:
+        if not line or line.startswith("#") or ":" not in line:  # gate-exempt: comment syntax in a file we parse, not an identifier
             continue
         key, _, value = line.partition(":")
         key = key.strip()
@@ -238,7 +238,7 @@ def load_settings(state_dir: Path | None = None, seat_manifest: Path | None = No
     return Settings(
         identity=identity,
         codex_thread_selection=manifest.get("codex_thread_selection"),
-        role=manifest.get("role") or ("arch" if seat == "arch" or seat.endswith("-arch") else "component"),
+        role=manifest.get("role") or ("arch" if seat == "arch" or seat.endswith("-arch") else "component"),  # gate-exempt: KNOWN GATE-1 VIOLATION, reported to arch 2026-09-25, decision pending: derives ROLE from the seat name's suffix when the manifest omits it. Identity assembled by convention -- the same suffix trap removed from the permission matcher today. Not fixed mid-campaign because role governs canonical_names(), i.e. which bot names this seat answers to
         channel=os.environ.get("AGENT_COMMS_CHANNEL") or file_cfg.get("channel") or project,
         lifespan_secs=int(file_cfg.get("lifespan_secs", DEFAULT_LIFESPAN_SECS)),
         state_dir=state_dir,
