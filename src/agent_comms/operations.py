@@ -525,6 +525,52 @@ def _permalink(site: str, event_msg: dict) -> str:
     return f"{site}/#narrow/channel/{stream_id}-{slug}/topic/{quoted}/near/{event_msg['id']}"
 
 
+def blocks_sender(agent: str, sender: str, state_dir, project: str = "") -> bool:
+    """Does the ADDRESSED AGENT's own directory policy refuse this sender?
+
+    **The directory is the source of truth; the local file is its cache.** The
+    agent's `permissions.comms.blocked` is authored at the directory, cached
+    here by `config_sync`, and enforced at the receiving end -- the only end
+    that can, since the sender is the party being refused.
+
+    Per AGENT, not per seat. `comms.yml` declares one policy for the whole
+    seat and cannot say "another1 blocks test-codex while new001 does not",
+    which is exactly what the estate authored (UC-03, 2026-09-25). This check
+    runs FIRST and the seat-level file still applies to everything it does not
+    cover: a per-agent block narrows, it never widens.
+
+    Matched on BOTH canonical spellings of a bot (ADR-0009 §7a): the estate
+    writes short names in these lists (`test-codex`), and a bot may arrive as
+    `test-codex` or as `agent-eco-test-codex`. `short_name` splits on dots and
+    so matches only the first -- a blocked sender arriving under its long name
+    would have walked straight through.
+
+    The long form is only accepted with THIS seat's project prefix, never by
+    bare suffix: `blocks-arch` must not match an entry of `arch` written by an
+    agent-eco seat. That is the cross-project trap `short_name` exists to
+    avoid, and stripping any prefix would reintroduce it.
+    """
+    if not agent or not sender:
+        return False
+    from . import config_sync
+    from .directory import short_name
+    try:
+        record = config_sync.agent_set(state_dir).get(agent) or {}
+    except Exception:  # noqa: BLE001 - an unreadable cache must not block mail
+        return False
+    blocked = ((record.get("permissions") or {}).get("comms") or {}).get("blocked") or []
+    theirs = short_name(sender).casefold()
+    raw = sender.strip().casefold()
+    prefix = f"{project.strip().casefold()}-" if project else None
+    for entry in blocked:
+        mine = short_name(str(entry)).casefold()
+        if mine == theirs or mine == raw:
+            return True
+        if prefix and raw == f"{prefix}{mine}":
+            return True
+    return False
+
+
 def is_permitted(directory: Directory, hub: Hub, sender: str) -> bool:
     """May this sender exchange messages with this seat? ADR-0009 §9.
 
@@ -1881,6 +1927,14 @@ def run_daemon(
                 if name.strip().casefold() in {
                         n.casefold() for n in settings.identity.canonical_names(settings.role)}:
                     return True
+                # The ADDRESSED AGENT's own policy, from the directory, first.
+                addressed = addressed_agent(
+                    (event.get("message") or {}).get("subject") or "",
+                    config_sync.agent_set(settings.state_dir),
+                    body=(event.get("message") or {}).get("content") or "")
+                if blocks_sender(addressed, name, settings.state_dir,
+                                 settings.identity.project):
+                    return False
                 try:
                     return is_permitted(directory, hub, name)
                 except Exception as exc:  # noqa: BLE001 - any hub failure

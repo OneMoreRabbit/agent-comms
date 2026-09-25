@@ -513,3 +513,39 @@ def test_this_seat_is_always_permitted_to_address_its_own_agents():
     names = {n.casefold() for n in me.canonical_names("component")}
     assert "test-claude" in names and "agent-eco-test-claude" in names
     assert "test-codex" not in names, "another seat must still face the graph"
+
+
+def test_a_per_agent_block_from_the_directory_is_enforced(tmp_path, monkeypatch):
+    """UC-03, which failed live: the estate authored a block for ONE agent and
+    the sender was delivered anyway.
+
+    The block lives in the directory (the source of truth), is cached locally
+    by config_sync, and is enforced at the RECEIVING end -- the only end that
+    can, since the sender is the party being refused. comms.yml declares one
+    policy for the whole seat and cannot express 'another1 blocks test-codex
+    while new001 does not', which is what was authored."""
+    from agent_comms.operations import blocks_sender
+    import agent_comms.config_sync as CS
+    another1 = "bakehouse.agent-eco.test-claude-another1"
+    new001 = "bakehouse.agent-eco.test-claude-new001"
+    monkeypatch.setattr(CS, "agent_set", lambda _d: {
+        another1: {"permissions": {"comms": {"blocked": ["test-codex", "probe-two"]}}},
+        new001: {"permissions": {"comms": {}}}})
+
+    assert blocks_sender(another1, "test-codex", tmp_path) is True
+    # Per AGENT: the sibling does not inherit the block.
+    assert blocks_sender(new001, "test-codex", tmp_path) is False
+    # A sender nobody blocked still gets through.
+    assert blocks_sender(another1, "agent-skeleton", tmp_path) is False
+    # BOTH canonical spellings of the bot (ADR-0009 §7a). short_name splits on
+    # dots, so the long form would otherwise walk straight through a block.
+    assert blocks_sender(another1, "agent-eco-test-codex", tmp_path, "agent-eco") is True
+    # ...but only with THIS seat's project prefix. A bare suffix match would
+    # make `blocks-arch` answer to an agent-eco seat's entry of `arch`, which
+    # is the cross-project trap short_name exists to avoid.
+    monkeypatch.setattr(CS, "agent_set", lambda _d: {
+        another1: {"permissions": {"comms": {"blocked": ["arch"]}}}})
+    assert blocks_sender(another1, "blocks-arch", tmp_path, "agent-eco") is False
+    assert blocks_sender(another1, "agent-eco-arch", tmp_path, "agent-eco") is True
+    # No agent addressed, or nothing cached: the seat-level file decides alone.
+    assert blocks_sender("", "test-codex", tmp_path) is False
