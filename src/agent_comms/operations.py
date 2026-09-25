@@ -568,7 +568,18 @@ def addressed_to_seat(
     """
     sender = (msg.get("sender_email") or "").casefold()
     if own_email and sender == own_email.casefold():
-        return None
+        # **Our own post is ours -- unless it is addressed to one of our own
+        # agents.** One bot is one SEAT's mailbox, so an agent addressing a
+        # SIBLING on the same seat posts through this very bot and the message
+        # comes straight back. Dropping every self-post made same-seat
+        # addressing impossible.
+        #
+        # Only the explicit marker counts here, never the topic prefix: an
+        # agent replying in its own thread has a topic naming itself, and
+        # accepting that would hand the agent back its own words forever.
+        # A send carries the marker; a reply does not.
+        return ("addressed to an agent on this seat"
+                if envelope_from_body(msg.get("content") or "") else None)
 
     if "mentioned" in flags:
         return "mentioned"
@@ -602,7 +613,8 @@ def mention_from_event(
         sender=msg.get("sender_full_name") or msg.get("sender_email", "unknown"),
         channel=msg.get("display_recipient") if isinstance(msg.get("display_recipient"), str) else "",
         topic=msg.get("subject") or "",
-        agent=addressed_agent(msg.get("subject") or "", serves),
+        agent=addressed_agent(msg.get("subject") or "", serves,
+                              body=msg.get("content") or ""),
         content=msg.get("content") or "",
         timestamp=msg.get("timestamp", 0),
         permalink=_permalink(site, msg),
@@ -614,7 +626,7 @@ def mention_from_event(
     )
 
 
-def addressed_agent(topic: str, serves: Collection[str] = ()) -> str:
+def addressed_agent(topic: str, serves: Collection[str] = (), body: str = "") -> str:
     """The FQN a message was addressed to, from its topic prefix. Empty if none.
 
     The sender writes the topic as `<what --to named>: <subject>`, so when a
@@ -644,6 +656,10 @@ def addressed_agent(topic: str, serves: Collection[str] = ()) -> str:
     Fails safe: an empty assigned set yields no `--agent`, so the seat's
     default answers — the 1.0 behaviour, never worse than before.
     """
+    marked = envelope_from_body(body)
+    if marked:
+        return marked if marked in set(serves) else ""
+
     prefix = (topic or "").split(":", 1)[0].strip()
     if not prefix or any(c.isspace() for c in prefix):
         return ""
@@ -850,7 +866,9 @@ def send(
     require_reachable(hub, channel)
 
     warnings = _mention_warnings(hub, content, channel)
-    response = hub.send(channel, topic, addressed(recipient, content))
+    response = hub.send(channel, topic,
+                        addressed(recipient, content,
+                                  to_fqn=routed.fqn if routed is not None else ""))
     return Posted(response=response, warnings=warnings)
 
 
@@ -1040,8 +1058,30 @@ def _directory_hint(name: str, **kw) -> str:
     return ""
 
 
-def addressed(sender: str, content: str) -> str:
+#: The envelope marker the sender writes and the receiver reads:
+#: `@**seat-bot** \u2192`estate.project.agent` body`.
+#:
+#: **Why the body and not the topic.** The topic cannot tell "addressed to"
+#: from "thread named after": a reply stays in the topic it answers, so an
+#: agent replying in its own thread looks exactly like a message addressed to
+#: that agent. That is harmless across seats and a LOOP on one seat -- we would
+#: store our own reply and hand it back to the agent that wrote it. A marker
+#: the sender writes is carried by a send and not by a reply, which is the
+#: distinction the topic cannot make.
+ENVELOPE = re.compile(r"^@\*\*[^*]+\*\*\s*\u2192`([^`]+)`")
+
+
+def envelope_from_body(content: str) -> str:
+    """The FQN the sender addressed, from the marker. Empty if unmarked."""
+    m = ENVELOPE.match((content or "").lstrip())
+    return m.group(1).strip() if m else ""
+
+
+def addressed(sender: str, content: str, to_fqn: str = "") -> str:
     """Prefix a message with an @-mention of the seat it is for.
+
+    `to_fqn` adds the envelope marker: one bot serves every agent on a seat, so
+    the mention says WHICH SEAT and the marker says WHICH AGENT.
 
     Without this the arch↔component loop is invisible from the arch side: a
     seat's inbox is mention-based, and a reply posted into
@@ -1054,9 +1094,10 @@ def addressed(sender: str, content: str) -> str:
     this client writes hub syntax.
     """
     name = (sender or "").lstrip("@").strip("*").strip()
+    mark = f" \u2192`{to_fqn}`" if to_fqn else ""
     if not name:
         return content
-    return f"@**{name}** {content}"
+    return f"@**{name}**{mark} {content}"
 
 
 def reply(

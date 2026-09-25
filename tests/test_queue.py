@@ -307,3 +307,56 @@ def test_the_seat_is_told_which_agent(monkeypatch):
     W.wake({"id": 2, "sender": "s", "content": "x", "topic": "t", "agent": "",
             "timestamp": 1758800000, "permalink": "", "channel": "seat-testing"})
     assert seen["agent"] is None
+
+
+# -- same-seat addressing: one bot, sibling agents ---------------------------
+
+def test_the_sender_writes_an_explicit_envelope():
+    from agent_comms.operations import addressed, envelope_from_body
+    out = addressed("test-claude", "hello", to_fqn="bakehouse.agent-eco.test-claude-another1")
+    assert out.startswith("@**test-claude** →`bakehouse.agent-eco.test-claude-another1` ")
+    assert envelope_from_body(out) == "bakehouse.agent-eco.test-claude-another1"
+    # Unaddressed sends are unchanged — no marker, no behaviour change.
+    assert addressed("test-claude", "hello") == "@**test-claude** hello"
+    assert envelope_from_body("@**test-claude** hello") == ""
+
+
+def test_our_own_post_is_kept_only_when_it_addresses_one_of_our_agents():
+    """SAME-SEAT ADDRESSING. The FQN is the agent and the bot is the seat, so an
+    agent addressing a sibling posts through this very bot and the message
+    comes straight back. Dropping every self-post made that impossible.
+
+    But an agent REPLYING in its own thread has a topic naming itself, and
+    accepting that would hand the agent its own words back forever. A send
+    carries the marker; a reply does not — which is the distinction the topic
+    cannot make."""
+    from agent_comms.operations import addressed_to_seat, addressed
+    from agent_comms.config import Settings, Identity
+
+    settings = Settings(identity=Identity(project="agent-eco", seat="test-claude"),
+                        channel="seat-testing", role="component")
+    me = "test-claude-bot@example.com"
+    sibling = "bakehouse.agent-eco.test-claude-another1"
+
+    addressed_to_sibling = {"sender_email": me, "subject": f"{sibling}: x",
+                            "content": addressed("test-claude", "hi", to_fqn=sibling)}
+    assert addressed_to_seat(settings, addressed_to_sibling, [], me) == \
+        "addressed to an agent on this seat"
+
+    # A reply from that same agent, in its own topic, carries NO marker.
+    our_own_reply = {"sender_email": me, "subject": f"{sibling}: x",
+                     "content": "@**test-codex** thanks, noted"}
+    assert addressed_to_seat(settings, our_own_reply, [], me) is None
+
+
+def test_the_marker_beats_the_topic_and_a_reply_cannot_forge_one():
+    from agent_comms.operations import addressed_agent, addressed
+    mine = {"bakehouse.agent-eco.test-claude-another1",
+            "bakehouse.agent-eco.test-claude-new001"}
+    body = addressed("test-claude", "hi", to_fqn="bakehouse.agent-eco.test-claude-new001")
+    # Topic says another1, the marker says new001 — the marker is the address.
+    assert addressed_agent("bakehouse.agent-eco.test-claude-another1: x", mine, body) == \
+        "bakehouse.agent-eco.test-claude-new001"
+    # A marker naming an agent we do not serve is not ours to claim.
+    foreign = addressed("test-claude", "hi", to_fqn="bakehouse.agent-eco.test-codex-dave")
+    assert addressed_agent("whatever: x", mine, foreign) == ""
