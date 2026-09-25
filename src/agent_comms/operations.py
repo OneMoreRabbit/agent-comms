@@ -580,6 +580,24 @@ def blocks_sender(agent: str, sender_fqn: str, state_dir) -> bool:
     return False
 
 
+#: **FOR RETIREMENT after the estate has migrated.** A sender that states no
+#: FQN in its envelope is compared on its hub display name instead.
+#:
+#: It is kept because every seat in the estate is one of those until it
+#: upgrades, and refusing them would stop estate comms dead. It is not a
+#: design: a display name names a SEAT, so it cannot name the agent that
+#: wrote, and matching on it needs a spelling rule simultaneously tight enough
+#: to keep `blocks-arch` from matching `arch` and wide enough to catch
+#: `agent-eco-test-codex` against `test-codex`. No such rule exists.
+#:
+#: **Retire when no seat in the estate sends without an envelope.** The check
+#: is `comms stats --json` reporting zero legacy senders across a full poll on
+#: every seat. Then delete this flag, the `sender` parameter below and the
+#: display-name branch in `Directory.permits`, and make an absent FQN a
+#: refusal. Tracked with arch on the navigator.
+LEGACY_SENDER_MATCHING = True
+
+
 def is_permitted(directory: Directory, hub: Hub, sender: str,
                  sender_fqn: str = "") -> bool:
     """May this sender exchange messages with this seat? ADR-0009 §9.
@@ -1140,13 +1158,14 @@ def _directory_hint(name: str, **kw) -> str:
 #: the sender writes is carried by a send and not by a reply, which is the
 #: distinction the topic cannot make.
 ENVELOPE = re.compile(
-    r"^@\*\*[^*]+\*\*\s*(?:`([^`]+)`)?\s*\u2192`([^`]+)`")
+    r"^@\*\*[^*]+\*\*\s*(?:`([^`]+)`)?\s*\u2192(?:`([^`]+)`)?")
 
 
 def envelope_from_body(content: str) -> str:
     """The FQN the sender ADDRESSED, from the marker. Empty if unmarked."""
     m = ENVELOPE.match((content or "").lstrip())
-    return m.group(2).strip() if m else ""
+    # `to` is optional -- a reply states its sender and addresses no agent.
+    return (m.group(2) or "").strip() if m else ""
 
 
 def envelope_sender(content: str) -> str:
@@ -1190,8 +1209,14 @@ def addressed(sender: str, content: str, to_fqn: str = "", from_fqn: str = "") -
     this client writes hub syntax.
     """
     name = (sender or "").lstrip("@").strip("*").strip()
+    # **Both ends are stated whenever they are known.** A REPLY knows its
+    # sender and not its recipient agent -- it answers a seat, in a thread --
+    # so `to` is omitted and `from` is still stated. Without that, an upgraded
+    # seat's replies looked exactly like a legacy sender's and fell to the
+    # display-name comparison for no reason.
     mark = (f" `{from_fqn}`\u2192`{to_fqn}`" if to_fqn and from_fqn
-            else f" \u2192`{to_fqn}`" if to_fqn else "")
+            else f" \u2192`{to_fqn}`" if to_fqn
+            else f" `{from_fqn}`\u2192" if from_fqn else "")
     if not name:
         return content
     return f"@**{name}**{mark} {content}"
@@ -1213,7 +1238,10 @@ def reply(
     hub = Hub(transport_factory(credential), settings, credential)
     channel = target.channel or settings.channel
     warnings = _mention_warnings(hub, content, channel)
-    result = hub.send(channel, target.topic, addressed(target.sender, content))
+    result = hub.send(channel, target.topic,
+                      addressed(target.sender, content,
+                                from_fqn=(f"bakehouse.{settings.identity.project}."
+                                          f"{settings.identity.seat}")))
     store.mark_read(message_id)
     return Posted(response=result, warnings=warnings)
 

@@ -288,7 +288,16 @@ def test_the_body_is_never_rewritten(seat):
     body = "ask @blocks-android about it, and mail a@b.com — see @**x**"
     operations.send(body, to="agent-eco-arch", subject="the ask",
                     transport_factory=lambda c: transport)
-    assert transport.sent[-1]["content"] == f"@**agent-eco-arch** {body}"
+    # The prefix is ADDRESSING -- the mention and the envelope marker. What
+    # follows it is the sender's text, byte for byte, with nothing scanned,
+    # converted or escaped.
+    sent = transport.sent[-1]["content"]
+    assert sent.endswith(f" {body}")
+    prefix = sent[:-len(body) - 1]
+    assert prefix.startswith("@**agent-eco-arch**")
+    from agent_comms.operations import envelope_sender, envelope_from_body
+    assert envelope_sender(sent) == "bakehouse.agent-eco.agent-comms"
+    assert envelope_from_body(sent) == "", "a bare seat name addresses no agent"
 
 
 def test_send_to_addresses_by_plain_seat_name(seat):

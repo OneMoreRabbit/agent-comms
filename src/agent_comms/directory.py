@@ -169,8 +169,11 @@ class Directory:
                 if entry_matches_fqn(partner, folded, self.own_project):
                     return True
             else:
-                # Legacy: a sender that states no FQN, compared on the display
-                # name. Every seat is one of these until it upgrades.
+                # LEGACY, FOR RETIREMENT (operations.LEGACY_SENDER_MATCHING):
+                # a sender that states no FQN, compared on its hub display
+                # name. Every seat is one of these until it upgrades. Delete
+                # this branch when none is left; an absent FQN becomes a
+                # refusal, not a fallback.
                 if folded == partner.strip().casefold():
                     return True
                 if short == short_name(partner) and same_project(name, partner):

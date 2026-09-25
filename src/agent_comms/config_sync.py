@@ -112,50 +112,53 @@ def fetch(project: str, seat: str, state_dir: Path, timeout: float = 10.0) -> Fe
               "generation": body.get("generation", 0),
               "fetched_at": fetched_at,
               "source": "directory",
-              "routes": _enriched(body.get("assignments") or [], caller=f"bakehouse.{project}.{seat}")}
+              "routes": _complete(body.get("assignments") or [],
+                                  caller=f"bakehouse.{project}.{seat}")}
     _write_atomic(target, record)
     return Fetched(generation=record["generation"], fetched_at=fetched_at,
                    agents=len(record["routes"]), source="directory")
 
 
-def _enriched(assignments: list, caller: str) -> list:
-    """The assignment list, completed from the directory's own answer per agent.
+def _complete(assignments: list, caller: str) -> list:
+    """The assignment list, with anything the directory left out filled in.
 
-    **The directory is the source of truth and this file is its cache**, so the
-    cache must hold everything the seat needs about its own agents -- not half
-    of it. The assignments endpoint carries the agent, its label, runtime and
-    delivery mode, and NO transports and NO permissions (measured 2026-09-25 on
-    test-claude). Those live in the resolution answer, which this seat may ask
-    for with its own credential.
+    **The assignments answer now carries the whole record** -- agent, label,
+    runtime, delivery, transports and permissions -- since the directory was
+    extended on 2026-09-25. One call for one seat's agents, which is what the
+    cache is for.
 
-    So each agent is resolved once per sync and the answer folded in. Without
-    this the seat cached half its own configuration and enforced none of the
-    rest: a block authored at the directory for one of our agents was never
-    seen here, and the blocked sender was delivered (UC-03, measured).
+    Before that it carried no transports and no permissions, so this resolved
+    each agent separately to complete the record. That fallback stays for a
+    directory that has not been extended yet: a seat cached half its own
+    configuration and enforced none of the rest, and a blocked sender was
+    delivered (UC-03, measured). It costs nothing when the fields are present.
 
-    **An agent that will not resolve keeps whatever the assignment gave**,
-    rather than being dropped or blanked. A failed lookup is not a statement
-    that a value is absent, and treating it as one would quietly widen a
-    permission the moment the directory hiccuped.
+    **An agent that will not resolve keeps whatever the assignment gave.** A
+    failed lookup is not a statement that a value is absent, and treating it as
+    one would quietly widen a permission the moment the directory hiccuped.
     """
-    from .resolve import Resolver
+    missing = [a for a in assignments
+               if a.get("agent") or a.get("id")
+               if "transports" not in a or "permissions" not in a]
+    if not missing:
+        return [dict(a) for a in assignments]
 
+    from .resolve import Resolver
     resolver = Resolver()
     out = []
     for record in assignments:
         record = dict(record)
         fqn = record.get("agent") or record.get("id")
-        if fqn:
+        if fqn and ("transports" not in record or "permissions" not in record):
             try:
                 answer = resolver.resolve(fqn, caller=caller)
             except Exception:  # noqa: BLE001 - a sync must not die on one agent
                 answer = None
             if answer is not None and answer.success:
-                record.setdefault("delivery", answer.delivery)
                 if answer.delivery:
                     record["delivery"] = answer.delivery
-                record["transports"] = answer.transports or record.get("transports") or {}
-                record["permissions"] = answer.permissions or record.get("permissions") or {}
+                record.setdefault("transports", answer.transports or {})
+                record.setdefault("permissions", answer.permissions or {})
         out.append(record)
     return out
 
