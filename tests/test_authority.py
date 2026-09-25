@@ -497,3 +497,19 @@ def test_each_unreachable_name_is_named_once(seat):
                              to="agent-skeleton", subject="s",
                              transport_factory=lambda c: transport)
     assert len(posted.warnings) == 2
+
+
+def test_this_seat_is_always_permitted_to_address_its_own_agents():
+    """A sibling message crosses no trust boundary: this seat's bot, this
+    seat's agents, this machine. The permission graph governs who may reach us
+    from OUTSIDE, and making a seat list itself as its own partner is a config
+    trap that reads as an error when omitted.
+
+    Narrow on purpose -- only a self-post carrying an envelope for one of our
+    own agents reaches the permission check at all; addressed_to_seat has
+    already dropped the rest."""
+    from agent_comms.config import Identity
+    me = Identity(project="agent-eco", seat="test-claude")
+    names = {n.casefold() for n in me.canonical_names("component")}
+    assert "test-claude" in names and "agent-eco-test-claude" in names
+    assert "test-codex" not in names, "another seat must still face the graph"

@@ -1850,6 +1850,19 @@ def run_daemon(
 
             def _permitted(name: str) -> bool:
                 nonlocal undetermined
+                # **This seat is always permitted to address its own agents.**
+                # A sibling message never crosses a trust boundary: it is this
+                # seat's bot, this seat's agents, and this machine. The
+                # permission graph governs who may reach us from OUTSIDE, and
+                # making a seat list itself as its own partner would be a
+                # config trap that reads as an error when it is omitted.
+                #
+                # Narrow on purpose: only a post from our own bot that carries
+                # an envelope for one of our agents gets here at all --
+                # `addressed_to_seat` has already dropped every other self-post.
+                if name.strip().casefold() in {
+                        n.casefold() for n in settings.identity.canonical_names(settings.role)}:
+                    return True
                 try:
                     return is_permitted(directory, hub, name)
                 except Exception as exc:  # noqa: BLE001 - any hub failure
