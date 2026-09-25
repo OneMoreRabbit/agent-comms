@@ -63,6 +63,32 @@ def short_name(name: str) -> str:
     return name.strip().casefold().rsplit(".", 1)[-1]
 
 
+def entry_matches_fqn(entry: str, fqn: str) -> bool:
+    """Does an authored partner/blocked entry name this FQN?
+
+    The estate writes SHORT names in these lists (`test-codex`) while
+    addressing is by FQN (`bakehouse.agent-eco.test-codex`), so both spellings
+    have to be read -- but they mean different things and must not be conflated:
+
+    - **A qualified entry matches that FQN and nothing else.** Expanding it to
+      its last segment would make `bakehouse.arc-web.arch` admit
+      `bakehouse.labs.arch`, which is the cross-project trap. Caught by
+      `test_a_short_name_never_matches_across_projects` the moment I did it.
+    - **A short entry means "this project's X"**, so it matches on the agent
+      segment and only within the same project.
+
+    The sender's FQN is never respelled. Guessing a spelling on that side is
+    what needed a rule both tight enough to keep `blocks-arch` from matching
+    `arch` and wide enough to catch `agent-eco-test-codex` against
+    `test-codex` -- and no such rule exists.
+    """
+    folded = entry.strip().casefold()
+    target = fqn.strip().casefold()
+    if folded.count(".") == 2:
+        return folded == target
+    return folded == short_name(target) and same_project(target, folded)
+
+
 def same_project(a: str, b: str) -> bool:
     """Do two FQNs name agents in the same project?
 
@@ -103,21 +129,34 @@ class Directory:
         """
         folded = name.strip().casefold()
         short = short_name(name)
+        # **An FQN is `estate.project.agent` -- three segments.** A hub display
+        # name has none, and telling them apart matters: for an FQN the last
+        # segment is the agent and `same_project` means something; for a
+        # display name there is no project to compare and the whole string is
+        # all there is.
+        is_fqn = folded.count(".") == 2 and all(folded.split("."))
 
         # `blocked` wins over everything, including an explicit allow. It is the
         # estate's stop button and must not be argued with by ordering rules.
-        # Matched on both spellings for the same reason `partners` is.
-        if short in {short_name(b) for b in self.blocked}:
+        if is_fqn:
+            if any(entry_matches_fqn(b, folded) for b in self.blocked):
+                return False
+        elif short in {short_name(b) for b in self.blocked}:
             return False
         if is_human:
             return True
 
-        # Both spellings, last segment only — never a prefix or substring test.
         for partner in self.partners:
-            if folded == partner.strip().casefold():
-                return True
-            if short == short_name(partner) and same_project(name, partner):
-                return True
+            if is_fqn:
+                if entry_matches_fqn(partner, folded):
+                    return True
+            else:
+                # Legacy: a sender that states no FQN, compared on the display
+                # name. Every seat is one of these until it upgrades.
+                if folded == partner.strip().casefold():
+                    return True
+                if short == short_name(partner) and same_project(name, partner):
+                    return True
         return self.project and in_project
 
     def refusal(self, name: str, *, in_project: bool) -> str:

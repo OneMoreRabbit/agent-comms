@@ -40,6 +40,17 @@ class Mention:
     #: Empty means addressed to the seat, which delivers to the seat's default
     #: agent — the 1.0 behaviour, unchanged.
     agent: str = ""
+    #: The FQN the message came FROM, when the sender stated one.
+    #:
+    #: **Addressing is by FQN — including who a message is from.** The hub can
+    #: only tell us a bot display name, and a bot is a SEAT, so a display name
+    #: cannot name the agent that wrote. Every policy comparison wants the FQN,
+    #: and this is where it is kept.
+    #:
+    #: Empty for a sender that states none. Those fall back to the display
+    #: name, which is a migration, not a design: it is marked as such at every
+    #: point it is used.
+    sender_fqn: str = ""
     #: Why this message was stored — mention, topic, or direct message. Shown in
     #: the inbox so a seat can tell an explicit summons from a topic it owns.
     reason: str = "mentioned"

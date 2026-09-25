@@ -580,7 +580,8 @@ def blocks_sender(agent: str, sender_fqn: str, state_dir) -> bool:
     return False
 
 
-def is_permitted(directory: Directory, hub: Hub, sender: str) -> bool:
+def is_permitted(directory: Directory, hub: Hub, sender: str,
+                 sender_fqn: str = "") -> bool:
     """May this sender exchange messages with this seat? ADR-0009 §9.
 
     Declared by the estate in `~/.comms/comms.yml`, never by the seat. Compared
@@ -592,7 +593,19 @@ def is_permitted(directory: Directory, hub: Hub, sender: str) -> bool:
     morning is permitted this afternoon with no file to edit.
     """
     in_project, is_human = hub.in_channel(sender)
-    return directory.permits(sender, in_project=in_project, is_human=is_human)
+    # **Compare the FQN when the sender states one.** A hub display name names
+    # a SEAT, so it cannot name the agent that wrote, and matching on it needed
+    # a spelling rule that had to be tight enough to keep `blocks-arch` from
+    # matching `arch` and wide enough to catch `agent-eco-test-codex` against
+    # `test-codex`. No such rule exists -- which is the signal the comparison
+    # was on the wrong thing.
+    #
+    # A sender that states no FQN still gets the display-name comparison. Not
+    # because it is right, but because every seat in the estate is one of those
+    # until it upgrades, and refusing them would stop estate comms dead. It
+    # narrows to nothing as senders carry the envelope.
+    return directory.permits(sender_fqn or sender, in_project=in_project,
+                             is_human=is_human)
 
 
 def addressed_to_seat(
@@ -670,6 +683,7 @@ def mention_from_event(
         topic=msg.get("subject") or "",
         agent=addressed_agent(msg.get("subject") or "", serves,
                               body=msg.get("content") or ""),
+        sender_fqn=envelope_sender(msg.get("content") or ""),
         content=msg.get("content") or "",
         timestamp=msg.get("timestamp", 0),
         permalink=_permalink(site, msg),
@@ -1974,7 +1988,9 @@ def run_daemon(
                                  settings.state_dir):
                     return False
                 try:
-                    return is_permitted(directory, hub, name)
+                    return is_permitted(
+                        directory, hub, name,
+                        envelope_sender((event.get("message") or {}).get("content") or ""))
                 except Exception as exc:  # noqa: BLE001 - any hub failure
                     undetermined = True
                     store.record(

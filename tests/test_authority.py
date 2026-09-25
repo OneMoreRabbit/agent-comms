@@ -549,3 +549,39 @@ def test_a_per_agent_block_from_the_directory_is_enforced(tmp_path, monkeypatch)
     # An unmarked sender states no FQN: no per-agent block can name it, and the
     # seat-level rules decide alone. A gap in expression, not a silent bypass.
     assert blocks_sender(another1, "", tmp_path) is False
+
+
+# -- the seat-level gate, compared on FQNs -----------------------------------
+
+def test_the_seat_gate_compares_the_senders_FQN():
+    """Addressing is by FQN, and that includes who a message is FROM. A hub
+    display name names a SEAT, so it cannot name the agent that wrote."""
+    from agent_comms.directory import Directory
+    d = Directory(project=False, partners=("test-codex",), source="test")
+    # Short entry means "this project's X": matches on the agent segment,
+    # within the project.
+    assert d.permits("bakehouse.agent-eco.test-codex", in_project=False) is True
+    assert d.permits("bakehouse.blocks.test-codex", in_project=False) is False
+
+
+def test_a_qualified_entry_matches_that_FQN_and_nothing_else():
+    """Expanding a qualified entry to its last segment would make
+    `bakehouse.arc-web.arch` admit `bakehouse.labs.arch`. I did exactly that
+    and the cross-project test caught it in one run."""
+    from agent_comms.directory import entry_matches_fqn
+    assert entry_matches_fqn("bakehouse.arc-web.arch", "bakehouse.arc-web.arch") is True
+    assert entry_matches_fqn("bakehouse.arc-web.arch", "bakehouse.labs.arch") is False
+    # A short entry is scoped to the project, never a bare suffix.
+    assert entry_matches_fqn("arch", "bakehouse.agent-eco.arch") is True
+    assert entry_matches_fqn("arch", "bakehouse.agent-eco.arch-shadow") is False
+
+
+def test_a_sender_stating_no_FQN_still_reaches_the_seat():
+    """Every seat in the estate states no FQN until it upgrades. Refusing them
+    would stop estate comms dead, so the display-name comparison remains for
+    exactly those -- a migration, not a design. It narrows to nothing as
+    senders carry the envelope."""
+    from agent_comms.directory import Directory
+    d = Directory(project=False, partners=("test-codex",), source="test")
+    assert d.permits("test-codex", in_project=False) is True
+    assert d.permits("someone-else", in_project=False) is False
