@@ -354,7 +354,11 @@ def test_a_seat_that_does_not_exist_is_refused(seat):
     from tests.conftest import FakeTransport
 
     transport = FakeTransport()
-    with pytest.raises(UnknownRecipient, match="no seat named .blocks-andriod. exists"):
+    # Asserts the PROPERTY — the refusal names the subject and helps — not the
+    # old literal sentence. Until 2026-09-25 the only thing a bad address ever
+    # got was "check the spelling", which refused a correctly-spelled estate
+    # name as a typo.
+    with pytest.raises(UnknownRecipient, match="blocks-andriod"):
         operations.send("hi", to="blocks-andriod", subject="typo",
                         transport_factory=lambda c: transport)
     assert transport.sent == []

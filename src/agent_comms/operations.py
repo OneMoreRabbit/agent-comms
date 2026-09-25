@@ -674,14 +674,113 @@ def send(
 
     credential = load_credential(settings.identity)
     hub = Hub(transport_factory(credential), settings, credential)
-    recipient = _resolve_recipient(settings, hub, recipient)
 
-    channel = channel or settings.channel
+    # **Resolve first, and only fall back to a seat name.** Until 2026-09-25
+    # this went straight to `_resolve_recipient`, a hub seat-name lookup, so
+    # R7/R10/R15 were built, tested, green and NOT CONNECTED: an FQN was
+    # refused as an unknown seat while `comms resolve` answered `resolved` for
+    # the same name in the same second. Found by running UC-02, not by reading
+    # the code — a suite that cannot fail on an unwired component is not
+    # evidence about wiring.
+    routed = _route(settings, recipient)
+    if routed is not None:
+        # **The derived bot must be an account the hub actually has.**
+        # R15 derives `bot` from the FQN's agent segment, which assumes one hub
+        # identity PER AGENT. The deployed hub has one per SEAT. Measured
+        # 2026-09-25: `bakehouse.agent-eco.test-claude-new001` derives
+        # `test-claude-new001`, which is not an account, so the post mentioned
+        # nobody — posted, `sent` reported, read by no one. A successful
+        # delivery to the wrong audience, which is the thing nobody notices.
+        #
+        # So this checks before posting and refuses loudly. It does NOT guess a
+        # substitute: falling back to the seat's bot would deliver to the seat's
+        # default agent while the caller named a different one, which is the
+        # same silent-wrong-recipient failure wearing a helpful face.
+        if not hub.addressable(routed.bot):
+            raise UnknownRecipient(
+                f"'{recipient}' resolves to {routed.fqn}, whose transport derives the "
+                f"hub identity '{routed.bot}' — and the hub has no such account.\n"
+                "  Nothing was posted. A message mentioning an account that does not "
+                "exist reaches nobody while reporting success.\n"
+                "  The estate declares per-agent transports in the directory's "
+                "`transports.comms` block; this agent has none, so the name was "
+                "derived from the FQN (project → channel, agent → bot). Either the "
+                "hub identity is missing or the directory must declare the override.")
+        recipient, channel = routed.bot, channel or routed.channel
+    else:
+        recipient = _resolve_recipient(settings, hub, recipient)
+        channel = channel or settings.channel
+
     require_reachable(hub, channel)
 
     warnings = _mention_warnings(hub, content, channel)
     response = hub.send(channel, topic, addressed(recipient, content))
     return Posted(response=response, warnings=warnings)
+
+
+@dataclass
+class Routed:
+    """Where the directory says a name goes, and as whom."""
+
+    fqn: str
+    channel: str
+    bot: str
+    delivery: str
+
+
+def _route(settings: Settings, name: str, **kw):
+    """Ask the directory where a name goes. `None` means 'not an estate name'.
+
+    Three things happen here that used not to happen at all:
+
+    1. **The name is resolved** against the directory (R7), so an FQN or an
+       authored alias addresses an AGENT rather than being mistaken for a seat.
+    2. **The delivery mode is honoured at send** (R10) — `none` refuses here,
+       and a value outside `inject | hold | none` refuses with the value
+       quoted. Comms is the only component that ever reads this field.
+    3. **The transport is derived from the FQN** (R15) — project is the
+       channel, agent is the bot — with a declared override taking precedence.
+
+    Returning `None` for a name the directory does not know is deliberate: a
+    bare seat name is still a legitimate address between seats, and this must
+    add a capability without removing one. But a name the directory REFUSES is
+    an error we raise, not a seat name to try next — falling through would turn
+    'you may not address that' into 'no such seat', which is the wrong-cause
+    class.
+    """
+    from .delivery import NotDeliverable, permitted_to_send, plan, transport_for
+    from .resolve import Resolver
+
+    me = f"bakehouse.{settings.identity.project}.{settings.identity.seat}"
+    answer = Resolver(local_agents=config_sync.agent_set(settings.state_dir)).resolve(
+        name, caller=me)
+
+    if not answer.success:
+        if answer.status == "not-permitted":
+            # A permission DECISION. Refusing here is the point; falling
+            # through would turn "you may not address that" into "no such
+            # seat", which is the wrong-cause class this change exists to fix.
+            raise UnknownRecipient(
+                f"'{name}' is not permitted: {answer.message or 'no reason given'}")
+        # Anything else — `unknown` (not an estate name) or `not-registered`
+        # (known, no route yet) — means the DIRECTORY cannot route it, not that
+        # the message cannot be sent. A bare seat name is still a legitimate
+        # address between seats, and most estate agents have no announced slot
+        # today: refusing here would break every send that works now. Add a
+        # capability without removing one.
+        return None
+
+    allowed, why = permitted_to_send(answer.delivery or "inject")
+    if not allowed:
+        raise UnknownRecipient(f"'{name}' will not be sent to: {why}")
+
+    p = plan(answer)
+    try:
+        t = transport_for(p.fqn, answer.transports)
+    except NotDeliverable as exc:
+        raise UnknownRecipient(str(exc)) from None
+    return Routed(fqn=p.fqn, channel=t["channel"], bot=t["bot"],
+                  delivery=p.delivery)
 
 
 def require_reachable(hub: Hub, channel: str) -> None:
@@ -752,10 +851,57 @@ def _resolve_recipient(settings: Settings, hub: Hub, name: str) -> str:
             "a channel you both sit in, or ask the estate to subscribe it. "
             f"Reachable from here: {others}."
         )
+    # **Say WHY it failed, not just that it did.** Until 2026-09-25 this was the
+    # only sentence a bad address ever got, so a correctly-spelled,
+    # never-authored estate shorthand was refused as a typo — "check the
+    # spelling" against a name spelled perfectly. A refusal naming the wrong
+    # cause is worse than a bare refusal, because it is actionable in the wrong
+    # direction. Ask the directory, and if it has something to say, say that
+    # instead.
+    hint = _directory_hint(name)
+    if hint:
+        raise UnknownRecipient(hint + f"\n  Seats reachable from here: {others}.")
     raise UnknownRecipient(
-        f"no seat named '{name}' exists on the hub — check the spelling. "
-        f"Reachable from here: {others}."
+        f"no seat named '{name}' exists on the hub, and the directory does not "
+        f"know it either — check the spelling. Reachable from here: {others}."
     )
+
+
+def _directory_hint(name: str, **kw) -> str:
+    """What the directory says about a name `send` could not place, or "".
+
+    This is the same answer `comms resolve` gives, brought to the place a
+    person actually hits the problem. Best-effort: a directory that cannot be
+    reached costs the hint, never the refusal.
+    """
+    try:
+        from .resolve import Resolver
+        settings = load_settings(**kw)
+        me = f"bakehouse.{settings.identity.project}.{settings.identity.seat}"
+        answer = Resolver(
+            local_agents=config_sync.agent_set(settings.state_dir)).resolve(name, caller=me)
+    except Exception:                                    # noqa: BLE001 — a hint
+        return ""
+    if answer.near_misses:
+        hint = (f"'{name}' is not a seat, and the directory does not know it as an "
+                f"agent either.\n  Did you mean: {', '.join(answer.near_misses[:5])}")
+        # The bare-role note only when it IS one — the same name ending several
+        # FQNs in different projects. On a plain typo it is noise, and a hint
+        # that explains something the reader did not do is a hint they stop
+        # reading.
+        tail = name.strip().casefold()
+        projects = {m.split(".")[1] for m in answer.near_misses
+                    if m.count(".") >= 2 and m.rsplit(".", 1)[-1].casefold() == tail}
+        if len(projects) > 1:
+            hint += ("\n  (A bare role like this is never authored as an alias — it "
+                     "exists in several projects, so which one is meant depends on "
+                     "who is asking. Use the full name.)")
+        return hint
+    if answer.status == "not-registered":
+        return (f"'{name}' IS a known estate agent, but the directory has no route "
+                "for it yet — it has not been assigned and announced. This is not a "
+                "spelling mistake.")
+    return ""
 
 
 def addressed(sender: str, content: str) -> str:

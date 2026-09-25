@@ -1461,3 +1461,56 @@ def test_requeue_is_the_one_backwards_move_and_needs_a_person(seat):
 def test_retire_and_requeue_refuse_an_unknown_id(seat):
     assert "no message 999" in operations.retire(999, "x")
     assert "no message 999" in operations.requeue(999, "x")
+
+
+def test_a_derived_bot_the_hub_does_not_have_is_refused_not_posted(seat, monkeypatch):
+    """MEASURED 2026-09-25 on the test containers, and it was a silent
+    non-delivery of my own making.
+
+    R15 derives the hub identity from the FQN's agent segment, which assumes one
+    hub account PER AGENT. The deployed hub has one per SEAT. So
+    `bakehouse.agent-eco.test-claude-new001` derived `test-claude-new001`, the
+    post mentioned an account that does not exist, `sent` was reported, and the
+    message reached nobody.
+
+    It refuses instead — and does NOT fall back to the seat's bot, because
+    delivering to the seat's default agent when the caller named a different one
+    is the same wrong-recipient failure wearing a helpful face.
+    """
+    from agent_comms.hub import Hub
+    from agent_comms.operations import UnknownRecipient
+
+    monkeypatch.setattr(Hub, "subscribed_channels", lambda self: frozenset({"agent-eco"}))
+    monkeypatch.setattr(Hub, "addressable_names", lambda self: ["test-claude", "agent-eco-arch"])
+    monkeypatch.setattr(operations, "_route", lambda s, n, **k: operations.Routed(
+        fqn="bakehouse.agent-eco.test-claude-new001", channel="agent-eco",
+        bot="test-claude-new001", delivery="inject"))
+
+    posted = []
+    monkeypatch.setattr(Hub, "send", lambda self, c, t, b: posted.append((c, t)))
+
+    with pytest.raises(UnknownRecipient) as caught:
+        operations.send("x", to="bakehouse.agent-eco.test-claude-new001", subject="s",
+                        transport_factory=lambda c: FakeTransport())
+
+    said = str(caught.value)
+    assert "test-claude-new001" in said and "no such account" in said
+    assert "Nothing was posted" in said
+    assert posted == [], "it posted anyway"
+
+
+def test_a_derived_bot_the_hub_does_have_is_posted(seat, monkeypatch):
+    """The gate must not fire on the working case, or it stops being read."""
+    from agent_comms.hub import Hub
+
+    monkeypatch.setattr(Hub, "subscribed_channels", lambda self: frozenset({"agent-eco"}))
+    monkeypatch.setattr(Hub, "addressable_names", lambda self: ["test-claude"])
+    monkeypatch.setattr(operations, "_route", lambda s, n, **k: operations.Routed(
+        fqn="bakehouse.agent-eco.test-claude", channel="agent-eco",
+        bot="test-claude", delivery="inject"))
+    posted = []
+    monkeypatch.setattr(Hub, "send", lambda self, c, t, b: posted.append((c, t)) or {"id": 1})
+
+    operations.send("x", to="bakehouse.agent-eco.test-claude", subject="s",
+                    transport_factory=lambda c: FakeTransport())
+    assert posted and posted[0][0] == "agent-eco"

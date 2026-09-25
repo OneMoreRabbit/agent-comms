@@ -297,6 +297,16 @@ class Hub:
             for x in subs.get("subscriptions", [])
         )
 
+    def addressable(self, name: str) -> bool:
+        """Does the hub have an account by this name, in a channel we share?
+
+        Asked before posting a derived mention. A mention of a name the hub does
+        not hold renders as plain text and notifies nobody, so the post succeeds
+        and the message is never read.
+        """
+        folded = name.strip().casefold()
+        return any(folded == n.strip().casefold() for n in self.addressable_names())
+
     def in_channel(self, name: str) -> tuple[bool, bool]:
         """`(is in my channel, is a human)`, re-fetching at most once a minute on a miss.
 
