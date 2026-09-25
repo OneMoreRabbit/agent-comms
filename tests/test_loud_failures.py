@@ -1533,9 +1533,22 @@ def test_an_agent_declaring_another_seats_bot_is_named_as_wrong():
             {"transports": {"comms": {"bot": "test-claude", "channel": "seat-testing"}}},
         "bakehouse.agent-eco.stray":
             {"transports": {"comms": {"bot": "some-other-seat", "channel": "seat-testing"}}},
-    }, "test-claude")
+    }, ("test-claude", "agent-eco-test-claude"))
     assert wrong == ["bakehouse.agent-eco.stray \u2192 bot 'some-other-seat'"]
     assert undeclared == []
+
+
+def test_both_canonical_spellings_of_this_seats_bot_are_accepted():
+    """ADR-0009 §7a: a component bot is unambiguous as <seat> in its own channel
+    and as <project>-<seat> anywhere. BOTH are correct, and the directory
+    authors the short one. Accepting only `identity.bot_name` failed every
+    correctly-declared agent on every component seat -- measured on test-claude
+    2026-09-25, calling a provably working delivery 'delivering to nobody'."""
+    from agent_comms.operations import agents_reaching
+    assert agents_reaching(
+        {"a.b.one": {"transports": {"comms": {"bot": "test-claude"}}},
+         "a.b.two": {"transports": {"comms": {"bot": "agent-eco-test-claude"}}}},
+        ("test-claude", "agent-eco-test-claude")) == ([], [])
 
 
 def test_an_undeclared_agent_is_a_note_not_a_failure():
@@ -1545,7 +1558,8 @@ def test_an_undeclared_agent_is_a_note_not_a_failure():
     constitution §9's speech when it should be silent."""
     from agent_comms.operations import agents_reaching
     wrong, undeclared = agents_reaching(
-        {"bakehouse.agent-eco.pending": {"transports": {}}}, "test-claude")
+        {"bakehouse.agent-eco.pending": {"transports": {}}},
+        ("test-claude", "agent-eco-test-claude"))
     assert wrong == []
     assert undeclared == ["bakehouse.agent-eco.pending"]
 
@@ -1555,4 +1569,4 @@ def test_a_seat_whose_agents_all_point_at_it_reports_nothing_wrong():
     assert agents_reaching({
         "a.b.one": {"transports": {"comms": {"bot": "test-claude"}}},
         "a.b.two": {"transports": {"comms": {"bot": "test-claude"}}},
-    }, "test-claude") == ([], [])
+    }, ("test-claude", "agent-eco-test-claude")) == ([], [])

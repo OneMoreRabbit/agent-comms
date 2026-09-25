@@ -169,25 +169,35 @@ class Preflight:
             self.ok = False
 
 
-def agents_reaching(assigned: dict, mine: str) -> tuple[list[str], list[str]]:
+def agents_reaching(assigned: dict, mine) -> tuple[list[str], list[str]]:
     """Split this seat's assigned agents into those pointing elsewhere and those
     pointing nowhere. `doctor`'s mirror check, kept testable.
 
     Returns `(wrong, undeclared)`:
 
-    - **wrong** — the declared bot is some OTHER seat's. This is the dangerous
-      one: a sender obeying it posts where no bot of ours is subscribed, and a
+    `mine` is EVERY name this seat's bot may carry, not one name. ADR-0009 §7a
+    makes the canonical form conditional on role: a component bot is unambiguous
+    as `<seat>` in its own channel and as `<project>-<seat>` anywhere, and
+    **both are correct**. The directory authors the short form;
+    `identity.bot_name` is the long one. Comparing against one alone fails every
+    correctly-declared agent on every component seat — measured on test-claude
+    2026-09-25, where this check called a provably working delivery
+    "delivering to nobody".
+
+    - **wrong** — the declared bot is not a name this seat answers to. The
+      dangerous one: a sender obeying it posts where no bot of ours is subscribed, and a
       post no bot holds produces no event at all. Success reported, nothing
       delivered, nobody told.
     - **undeclared** — no transport at all. Not dangerous since derivation was
       removed: the send is refused at the sender and nothing is posted.
     """
+    names = {mine} if isinstance(mine, str) else set(mine)
     wrong, undeclared = [], []
     for fqn, record in sorted(assigned.items()):
         bot = ((record.get("transports") or {}).get("comms") or {}).get("bot")
         if not bot:
             undeclared.append(fqn)
-        elif bot != mine:
+        elif bot not in names:
             wrong.append(f"{fqn} → bot '{bot}'")
     return wrong, undeclared
 
@@ -295,18 +305,41 @@ def preflight(
     # It is loud HERE and silent THERE, which is the whole reason it belongs at
     # the seat: the seat can see what it is supposed to serve; the sender only
     # sees a post that appeared to work.
-    mine = settings.identity.bot_name
+    mine = settings.identity.canonical_names(settings.role)
     assigned = config_sync.agent_set(settings.state_dir)
-    wrong, undeclared = agents_reaching(assigned, mine)
+    # **RESOLVE each one — the assignments answer carries no transports.**
+    # Measured 2026-09-25 on test-claude: `/v0/seats/<p>/<s>/assignments`
+    # returns agent, seat_local_id, label, runtime, delivery, route_revision
+    # and NO transports block. Reading the cache for them would report every
+    # agent as undeclared forever and could never catch the wrong-bot case --
+    # a check that fires every time and detects nothing (constitution §9).
+    # The need asks for the RESOLVED transport, and resolution is where it is.
+    from .resolve import Resolver
+    me = f"bakehouse.{settings.identity.project}.{settings.identity.seat}"
+    resolver = Resolver(local_agents=assigned)
+    resolved, unreadable = {}, []
+    for fqn in sorted(assigned):
+        answer = resolver.resolve(fqn, caller=me)
+        if answer.success:
+            resolved[fqn] = {"transports": answer.transports}
+        else:
+            unreadable.append(f"{fqn} ({answer.status})")
+    wrong, undeclared = agents_reaching(resolved, mine)
+    if unreadable:
+        # We could not ask. Saying "undeclared" would be asserting an absence
+        # we did not observe -- the difference between a no and a silence.
+        report.notes.append(
+            f"could not resolve assigned agent(s), so their transport is unchecked: "
+            f"{', '.join(unreadable)}")
     if wrong:
         report.add(
             "agents reach this seat", False,
             f"DELIVERING TO NOBODY — this seat is assigned agent(s) whose declared "
-            f"transport names a different bot: {'; '.join(wrong)}. This seat's bot is "
-            f"'{mine}'. A sender obeying those records posts where no bot of ours is "
+            f"transport names a different bot: {'; '.join(wrong)}. This seat answers to "
+            f"{' or '.join(repr(n) for n in mine)}. A sender obeying those records posts where no bot of ours is "
             f"subscribed, and a post no bot holds produces no event at all — the send "
             f"reports success and nothing ever arrives. Fix the directory's "
-            f"`transports.comms` for those agents to name '{mine}'.")
+            f"`transports.comms` for those agents to name {mine[0]!r}.")
     elif undeclared:
         # NOT a failure. Derivation is gone (§5, amended 2026-09-25), so an
         # undeclared agent is refused at the sender, loudly, with nothing
@@ -319,7 +352,7 @@ def preflight(
             f"is posted.")
     elif assigned:
         report.add("agents reach this seat", True,
-                   f"all {len(assigned)} assigned agent(s) declare bot '{mine}'")
+                   f"all {len(resolved)} resolved agent(s) declare a bot this seat answers to")
 
     try:
         registration = hub.register_queue()
