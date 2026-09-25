@@ -237,17 +237,37 @@ def test_the_addressed_fqn_is_read_from_the_topic():
     """One bot is one SEAT's mailbox, so the agent cannot ride on the mention.
     The topic prefix is what --to named, and that is the envelope address."""
     from agent_comms.operations import addressed_agent
-    assert addressed_agent("bakehouse.agent-eco.test-claude-another1: uc01") == \
+    mine = {"bakehouse.agent-eco.test-claude-another1",
+            "bakehouse.agent-eco.test-claude-new001"}
+    assert addressed_agent("bakehouse.agent-eco.test-claude-another1: uc01", mine) == \
         "bakehouse.agent-eco.test-claude-another1"
     # A bare seat name is NOT an agent address — this is what keeps seat-name
     # addressing working exactly as it did at 1.0.
-    assert addressed_agent("test-claude: uc01") == ""
-    assert addressed_agent("") == ""
-    assert addressed_agent("no colon here") == ""
+    assert addressed_agent("test-claude: uc01", mine) == ""
+    assert addressed_agent("", mine) == ""
+    assert addressed_agent("no colon here", mine) == ""
     # Shape is three segments. Two or four is not an FQN, and a guess here
     # would be the prefix-matching trap the estate has already paid for.
-    assert addressed_agent("agent-eco.test-claude: x") == ""
-    assert addressed_agent("a.b.c.d: x") == ""
+    assert addressed_agent("agent-eco.test-claude: x", mine) == ""
+    assert addressed_agent("a.b.c.d: x", mine) == ""
+
+
+def test_a_reply_in_someone_elses_topic_is_not_an_envelope_address():
+    """THE REPLY TRAP. A reply stays in the topic it answers, so the prefix
+    names whoever the THREAD was opened to — not whoever this message is for.
+
+    Measured 2026-09-25: test-claude's agent replied to test-codex in topic
+    `bakehouse.agent-eco.test-claude-another1: uc01-another1`. test-codex read
+    that as its envelope address and its seat answered `unknown-agent` —
+    'assigned to another seat'. The reply sat queued and undelivered."""
+    from agent_comms.operations import addressed_agent
+    theirs = "bakehouse.agent-eco.test-claude-another1"
+    # On test-codex, which serves none of test-claude's agents:
+    assert addressed_agent(f"{theirs}: uc01-another1",
+                           {"bakehouse.agent-eco.test-codex-dave"}) == ""
+    # Fails safe: nothing assigned yet means no --agent, so the seat's default
+    # answers. Never worse than 1.0.
+    assert addressed_agent(f"{theirs}: uc01-another1", set()) == ""
 
 
 def test_the_envelope_address_survives_the_store(tmp_path):

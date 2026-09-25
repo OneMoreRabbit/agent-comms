@@ -18,7 +18,7 @@ import time
 import urllib.parse
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Collection
 
 from .config import Credential, Settings, load_credential, load_settings
 from .directory import Directory
@@ -596,12 +596,13 @@ def mention_from_event(
     reason = addressed_to_seat(settings, msg, event.get("flags") or [], own_email)
     if reason is None:
         return None
+    serves = config_sync.agent_set(settings.state_dir)
     return Mention(
         id=msg["id"],
         sender=msg.get("sender_full_name") or msg.get("sender_email", "unknown"),
         channel=msg.get("display_recipient") if isinstance(msg.get("display_recipient"), str) else "",
         topic=msg.get("subject") or "",
-        agent=addressed_agent(msg.get("subject") or ""),
+        agent=addressed_agent(msg.get("subject") or "", serves),
         content=msg.get("content") or "",
         timestamp=msg.get("timestamp", 0),
         permalink=_permalink(site, msg),
@@ -613,7 +614,7 @@ def mention_from_event(
     )
 
 
-def addressed_agent(topic: str) -> str:
+def addressed_agent(topic: str, serves: Collection[str] = ()) -> str:
     """The FQN a message was addressed to, from its topic prefix. Empty if none.
 
     The sender writes the topic as `<what --to named>: <subject>`, so when a
@@ -626,17 +627,30 @@ def addressed_agent(topic: str) -> str:
     A bare seat name (`test-claude: uc01`) has no dots and returns empty, which
     is what keeps plain seat-name addressing working exactly as it did.
 
-    This does NOT check the seat serves the name. The seat is the only party
-    that resolves an agent to a session (comms-design §5), and contract 2.0 §3
-    gives it `unknown-agent` at exit 10 to say so. Checking here would put a
-    second opinion in front of the authority and fail quietly where the seat
-    fails loudly.
+    **It must also name an agent THIS seat is assigned.** A REPLY stays in the
+    topic it answers, so the prefix names whoever the thread was opened to —
+    not whoever this message is for. Measured 2026-09-25: test-claude's agent
+    replied to test-codex in topic
+    `bakehouse.agent-eco.test-claude-another1: uc01-another1`; test-codex read
+    that prefix as its envelope address, and its seat answered `unknown-agent`
+    — *"assigned to another seat"*. The reply sat queued and undelivered.
+
+    So the seat's assigned set is the filter. It is not a second opinion on the
+    seat's authority: the question here is not "does this seat serve the name"
+    but "is this prefix MY envelope, or somebody else's thread name". Whether a
+    name we DO claim can be delivered to remains the seat's call, answered
+    loudly as `unknown-agent` at exit 10.
+
+    Fails safe: an empty assigned set yields no `--agent`, so the seat's
+    default answers — the 1.0 behaviour, never worse than before.
     """
     prefix = (topic or "").split(":", 1)[0].strip()
     if not prefix or any(c.isspace() for c in prefix):
         return ""
     parts = prefix.split(".")
-    return prefix if len(parts) == 3 and all(parts) else ""
+    if len(parts) != 3 or not all(parts):
+        return ""
+    return prefix if prefix in set(serves) else ""
 
 
 def inbox(unread_only: bool = True, **kw) -> list[Mention]:
