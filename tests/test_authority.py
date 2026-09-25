@@ -598,3 +598,42 @@ def test_a_sender_stating_no_FQN_still_reaches_the_seat():
     d = Directory(project=False, partners=("test-codex",), source="test")
     assert d.permits("test-codex", in_project=False) is True
     assert d.permits("someone-else", in_project=False) is False
+
+
+def test_a_refusal_names_the_rule_that_fired_and_where_it_lives(tmp_path, monkeypatch):
+    """A correct decision explained from the wrong layer sends the reader to a
+    file where nothing is wrong.
+
+    Measured on the swept seats 2026-09-25: a message correctly refused by an
+    agent's directory-authored blocked list was reported as 'not a permitted
+    partner' -- the SEAT-level sentence -- while comms.yml listed that sender
+    in `partners` with an empty `blocked`."""
+    from agent_comms.operations import why_refused
+    from agent_comms.directory import Directory
+    from agent_comms.store import Mention
+    import agent_comms.config_sync as CS
+
+    another1 = "bakehouse.agent-eco.test-claude-another1"
+    codex = "bakehouse.agent-eco.test-codex"
+    monkeypatch.setattr(CS, "agent_set", lambda _d: {
+        another1: {"permissions": {"comms": {"blocked": ["test-codex"]}}}})
+    # comms.yml PERMITS this sender -- the per-agent rule is what refused it.
+    d = Directory(project=False, partners=("test-codex",), source="~/.comms/comms.yml",
+                  own_project="agent-eco")
+
+    m = Mention(id=1, sender="test-codex", channel="seat-testing", topic="t",
+                content="x", timestamp=1, permalink="",
+                agent=another1, sender_fqn=codex)
+    why = why_refused(m, d, tmp_path)
+    assert another1 in why and "blocked list" in why
+    assert "directory" in why
+    assert "comms.yml is not where this was decided" in why, \
+        "it must say the seat file is NOT the cause, or the reader edits it"
+
+    # A sender with no per-agent rule against it falls to the seat-level
+    # sentence, which names comms.yml because that IS where it was decided.
+    m2 = Mention(id=2, sender="stranger", channel="seat-testing", topic="t",
+                 content="x", timestamp=1, permalink="",
+                 agent=another1, sender_fqn="bakehouse.agent-eco.stranger")
+    why2 = why_refused(m2, d, tmp_path)
+    assert "comms.yml" in why2 and "blocked list" not in why2

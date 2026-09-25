@@ -598,6 +598,40 @@ def blocks_sender(agent: str, sender_fqn: str, state_dir) -> bool:
 LEGACY_SENDER_MATCHING = True
 
 
+def why_refused(mention, directory: Directory, state_dir) -> str:
+    """Which rule refused this sender, and WHERE THAT RULE LIVES.
+
+    There are two layers and they are held in different places by different
+    parties. A refusal that names the wrong one sends a person to a file where
+    nothing is wrong:
+
+    - the **agent's own** `permissions.comms.blocked`, authored at the
+      directory and cached here, which applies to one agent on this seat;
+    - the **seat's** `partners`/`blocked` in `~/.comms/comms.yml`, written by
+      the orchestrator, which applies to everything the seat serves.
+
+    Measured 2026-09-25 on the swept seats: a message correctly refused by the
+    first was reported as *"not a permitted partner"* -- the second's sentence
+    -- while `comms.yml` listed that very sender in `partners` and had an empty
+    `blocked`. The decision was right and the explanation pointed at a file
+    that said the opposite.
+
+    The per-agent rule is checked first because that is the order the decision
+    itself uses; saying otherwise would be a second opinion, not a report.
+    """
+    agent = getattr(mention, "agent", "") or ""
+    sender_fqn = getattr(mention, "sender_fqn", "") or ""
+    if agent and sender_fqn and blocks_sender(agent, sender_fqn, state_dir):
+        return (f"{sender_fqn} is on {agent}'s blocked list, which the estate "
+                f"authors at the directory (permissions.comms.blocked) and this "
+                f"seat caches in ~/.comms/routes.json. It applies to that agent "
+                f"alone, not to this seat -- ~/.comms/comms.yml is not where "
+                f"this was decided")
+    return (f"{mention.sender!r} is not a permitted sender for this seat: "
+            f"{directory.describe()} -- declared by the estate in "
+            f"~/.comms/comms.yml")
+
+
 def is_permitted(directory: Directory, hub: Hub, sender: str,
                  sender_fqn: str = "") -> bool:
     """May this sender exchange messages with this seat? ADR-0009 §9.
@@ -1529,7 +1563,8 @@ def _refuse_sender(
     """
     store.record(
         "warn",
-        f"refused message {mention.id} from {mention.sender!r}: not a permitted partner",
+        f"refused message {mention.id} from {mention.sender!r}: "
+        f"{why_refused(mention, directory, settings.state_dir)}",
     )
     key = mention.sender.strip().casefold()
     if key in bounced:
