@@ -169,6 +169,29 @@ class Preflight:
             self.ok = False
 
 
+def agents_reaching(assigned: dict, mine: str) -> tuple[list[str], list[str]]:
+    """Split this seat's assigned agents into those pointing elsewhere and those
+    pointing nowhere. `doctor`'s mirror check, kept testable.
+
+    Returns `(wrong, undeclared)`:
+
+    - **wrong** — the declared bot is some OTHER seat's. This is the dangerous
+      one: a sender obeying it posts where no bot of ours is subscribed, and a
+      post no bot holds produces no event at all. Success reported, nothing
+      delivered, nobody told.
+    - **undeclared** — no transport at all. Not dangerous since derivation was
+      removed: the send is refused at the sender and nothing is posted.
+    """
+    wrong, undeclared = [], []
+    for fqn, record in sorted(assigned.items()):
+        bot = ((record.get("transports") or {}).get("comms") or {}).get("bot")
+        if not bot:
+            undeclared.append(fqn)
+        elif bot != mine:
+            wrong.append(f"{fqn} → bot '{bot}'")
+    return wrong, undeclared
+
+
 def preflight(
     transport_factory: Callable[[Credential], Transport] = build_transport, **kw
 ) -> Preflight:
@@ -258,6 +281,45 @@ def preflight(
                     "it. Nothing is lost — mail from there is refused by the permission "
                     "graph — but after a narrowing, a subscription left behind is what "
                     "the provisioning replay tidies.")
+
+    # THE MIRROR OF THE CHECK ABOVE, asked for by ansible-platform
+    # (ansible-needs-comms-multi-agent-seat-delivery 0.1, ask 3).
+    #
+    # The channel check catches "we cannot reach where mail is addressed". This
+    # catches the other half: an agent assigned to THIS seat whose declared
+    # transport names a bot that is NOT this seat's. A sender obeying that
+    # record posts where no bot of ours is subscribed, and §6 is measured on
+    # this — a message posted where no bot is subscribed produces **no event at
+    # all**. Not a refusal, not a log line. Silence.
+    #
+    # It is loud HERE and silent THERE, which is the whole reason it belongs at
+    # the seat: the seat can see what it is supposed to serve; the sender only
+    # sees a post that appeared to work.
+    mine = settings.identity.bot_name
+    assigned = config_sync.agent_set(settings.state_dir)
+    wrong, undeclared = agents_reaching(assigned, mine)
+    if wrong:
+        report.add(
+            "agents reach this seat", False,
+            f"DELIVERING TO NOBODY — this seat is assigned agent(s) whose declared "
+            f"transport names a different bot: {'; '.join(wrong)}. This seat's bot is "
+            f"'{mine}'. A sender obeying those records posts where no bot of ours is "
+            f"subscribed, and a post no bot holds produces no event at all — the send "
+            f"reports success and nothing ever arrives. Fix the directory's "
+            f"`transports.comms` for those agents to name '{mine}'.")
+    elif undeclared:
+        # NOT a failure. Derivation is gone (§5, amended 2026-09-25), so an
+        # undeclared agent is refused at the sender, loudly, with nothing
+        # posted. That is a missing record, not a silent loss.
+        report.notes.append(
+            f"assigned agent(s) with no declared transport: {', '.join(undeclared)}. "
+            f"A seat serving more than one agent REQUIRES them, because one bot is one "
+            f"seat's mailbox and nothing derives a per-agent one. Until they are "
+            f"authored, a send to those names is refused at the sender and nothing "
+            f"is posted.")
+    elif assigned:
+        report.add("agents reach this seat", True,
+                   f"all {len(assigned)} assigned agent(s) declare bot '{mine}'")
 
     try:
         registration = hub.register_queue()

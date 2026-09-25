@@ -1518,3 +1518,41 @@ def test_a_derived_bot_the_hub_does_have_is_posted(seat, monkeypatch):
     operations.send("x", to="bakehouse.agent-eco.test-claude", subject="s",
                     transport_factory=lambda c: FakeTransport())
     assert posted and posted[0][0] == "agent-eco"
+
+
+# -- doctor's mirror check: agents assigned here must reach THIS seat --------
+
+def test_an_agent_declaring_another_seats_bot_is_named_as_wrong():
+    """The silent case, made loud at the seat. A sender obeying a record naming
+    someone else's bot posts where no bot of ours is subscribed, and a post no
+    bot holds produces NO EVENT AT ALL — success reported, nothing delivered.
+    The seat can see this; the sender cannot."""
+    from agent_comms.operations import agents_reaching
+    wrong, undeclared = agents_reaching({
+        "bakehouse.agent-eco.test-claude-new001":
+            {"transports": {"comms": {"bot": "test-claude", "channel": "seat-testing"}}},
+        "bakehouse.agent-eco.stray":
+            {"transports": {"comms": {"bot": "some-other-seat", "channel": "seat-testing"}}},
+    }, "test-claude")
+    assert wrong == ["bakehouse.agent-eco.stray \u2192 bot 'some-other-seat'"]
+    assert undeclared == []
+
+
+def test_an_undeclared_agent_is_a_note_not_a_failure():
+    """Derivation is gone, so an undeclared agent is refused at the sender with
+    nothing posted — a missing record, not a silent loss. Failing on it would
+    fire on every seat mid-authoring, and a check that always fires is
+    constitution §9's speech when it should be silent."""
+    from agent_comms.operations import agents_reaching
+    wrong, undeclared = agents_reaching(
+        {"bakehouse.agent-eco.pending": {"transports": {}}}, "test-claude")
+    assert wrong == []
+    assert undeclared == ["bakehouse.agent-eco.pending"]
+
+
+def test_a_seat_whose_agents_all_point_at_it_reports_nothing_wrong():
+    from agent_comms.operations import agents_reaching
+    assert agents_reaching({
+        "a.b.one": {"transports": {"comms": {"bot": "test-claude"}}},
+        "a.b.two": {"transports": {"comms": {"bot": "test-claude"}}},
+    }, "test-claude") == ([], [])
