@@ -27,6 +27,19 @@ class Mention:
     timestamp: int
     permalink: str
     read: bool = False
+    #: The FQN this message was addressed to, when it was addressed to an agent
+    #: rather than to the seat at large. **This is the envelope address.**
+    #:
+    #: The hub cannot carry it: one bot is one SEAT's mailbox (comms-design §5),
+    #: so several agents on a seat share one `@`-mention. The design's rule is
+    #: therefore "the agent is nothing on the hub — the addressed FQN travels
+    #: inside the message, and the receiving comms hands it to its seat"
+    #: (comms-design-v1_0 §5, the `agent` row). This field is that FQN, and
+    #: `wake()` is where it is handed over as `seat msg --agent <FQN>`.
+    #:
+    #: Empty means addressed to the seat, which delivers to the seat's default
+    #: agent — the 1.0 behaviour, unchanged.
+    agent: str = ""
     #: Why this message was stored — mention, topic, or direct message. Shown in
     #: the inbox so a seat can tell an explicit summons from a topic it owns.
     reason: str = "mentioned"

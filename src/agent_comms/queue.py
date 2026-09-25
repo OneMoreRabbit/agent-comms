@@ -432,6 +432,7 @@ class MessageStore(Queue):
             sender=row["sender"], channel=row["channel"], topic=row["subject"],
             content=row["body"], timestamp=int(row["received_at_epoch"] or 0),
             permalink=row["permalink"], read=bool(row["read_at"]),
+            agent=row["agent"] or "",
             reason=row["reason"] or "mentioned",
             delivered=state in (DELIVERED, RETRIEVED, REFUSED, EXPIRED, ABANDONED),
             attempts=int(row["attempts"]),
@@ -446,6 +447,7 @@ class MessageStore(Queue):
         """Store one arrival. Idempotent on the hub id, as `receive` is."""
         mid = self.receive(hub_id=str(mention.id), sender=mention.sender,
                            body=mention.content, subject=mention.topic,
+                           agent=getattr(mention, "agent", "") or "",
                            permalink=mention.permalink,
                            received_at=datetime.fromtimestamp(
                                mention.timestamp, tz=timezone.utc).isoformat(timespec="seconds"))

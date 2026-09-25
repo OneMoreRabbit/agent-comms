@@ -229,3 +229,61 @@ def test_the_permalink_is_stored_not_discarded(q):
                   permalink="https://hub/#narrow/channel/5-agent-eco/topic/t/near/1")
     row = q.db.execute("SELECT permalink FROM messages WHERE id=?", (m,)).fetchone()
     assert row["permalink"].endswith("/near/1")
+
+
+# -- the envelope address: one bot, several agents ---------------------------
+
+def test_the_addressed_fqn_is_read_from_the_topic():
+    """One bot is one SEAT's mailbox, so the agent cannot ride on the mention.
+    The topic prefix is what --to named, and that is the envelope address."""
+    from agent_comms.operations import addressed_agent
+    assert addressed_agent("bakehouse.agent-eco.test-claude-another1: uc01") == \
+        "bakehouse.agent-eco.test-claude-another1"
+    # A bare seat name is NOT an agent address — this is what keeps seat-name
+    # addressing working exactly as it did at 1.0.
+    assert addressed_agent("test-claude: uc01") == ""
+    assert addressed_agent("") == ""
+    assert addressed_agent("no colon here") == ""
+    # Shape is three segments. Two or four is not an FQN, and a guess here
+    # would be the prefix-matching trap the estate has already paid for.
+    assert addressed_agent("agent-eco.test-claude: x") == ""
+    assert addressed_agent("a.b.c.d: x") == ""
+
+
+def test_the_envelope_address_survives_the_store(tmp_path):
+    """It is no use reading the FQN if it is dropped on the way to the seat."""
+    from agent_comms.store import Mention
+    from agent_comms.queue import MessageStore
+    q = MessageStore(tmp_path / "comms.db")
+    m = Mention(id=9001, sender="test-codex", channel="seat-testing",
+                topic="bakehouse.agent-eco.test-claude-another1: uc01",
+                agent="bakehouse.agent-eco.test-claude-another1",
+                content="body", timestamp=1758800000, permalink="")
+    q.append(m)
+    row = q.db.execute("SELECT agent FROM messages WHERE hub_id='9001'").fetchone()
+    assert row["agent"] == "bakehouse.agent-eco.test-claude-another1"
+    assert q.all()[-1].agent == "bakehouse.agent-eco.test-claude-another1"
+
+
+def test_the_seat_is_told_which_agent(monkeypatch):
+    """THE WIRING. Without this the seat delivers to its DEFAULT agent and says
+    `delivered` — a silent delivery to the wrong recipient. Measured on
+    test-claude 2026-09-25 before this was connected."""
+    from agent_comms import wake as W
+    seen = {}
+
+    def fake_deliver(body, timeout=30, agent=None):
+        seen["agent"] = agent
+        from agent_comms.seat import Delivery
+        return Delivery(success=True, status="delivered", message="typed in")
+
+    monkeypatch.setattr(W.seat_app, "deliver", fake_deliver)
+    W.wake({"id": 1, "sender": "s", "content": "x", "topic": "t",
+            "agent": "bakehouse.agent-eco.test-claude-another1",
+            "timestamp": 1758800000, "permalink": "", "channel": "seat-testing"})
+    assert seen["agent"] == "bakehouse.agent-eco.test-claude-another1"
+
+    # Addressed to the seat: no --agent, so the seat's default answers.
+    W.wake({"id": 2, "sender": "s", "content": "x", "topic": "t", "agent": "",
+            "timestamp": 1758800000, "permalink": "", "channel": "seat-testing"})
+    assert seen["agent"] is None

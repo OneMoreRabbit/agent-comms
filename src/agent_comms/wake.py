@@ -81,6 +81,17 @@ def wake(mention: dict, **_ignored) -> Delivery:
     than quietly honoured.
     """
     try:
-        return seat_app.deliver(compose_turn(mention))
+        # **Dispatch on the envelope FQN, and nothing else.** A seat can serve
+        # several agents behind one bot, so "it arrived at the seat" is not
+        # "it arrived at the agent": without this the seat delivers to its
+        # DEFAULT agent and reports `delivered`, which is a silent delivery to
+        # the wrong recipient. Measured on test-claude 2026-09-25 — a message
+        # addressed to `test-claude-another1` landed in new001's session and
+        # another1's had nothing.
+        #
+        # Empty means the message was addressed to the seat, and no `--agent`
+        # is passed: the seat's declared default answers, as it did at 1.0.
+        return seat_app.deliver(compose_turn(mention),
+                                agent=(mention.get("agent") or None))
     except (SeatUnavailable, SeatContractUnsupported) as exc:
         raise WakeError(str(exc)) from exc

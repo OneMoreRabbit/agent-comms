@@ -506,6 +506,7 @@ def mention_from_event(
         sender=msg.get("sender_full_name") or msg.get("sender_email", "unknown"),
         channel=msg.get("display_recipient") if isinstance(msg.get("display_recipient"), str) else "",
         topic=msg.get("subject") or "",
+        agent=addressed_agent(msg.get("subject") or ""),
         content=msg.get("content") or "",
         timestamp=msg.get("timestamp", 0),
         permalink=_permalink(site, msg),
@@ -515,6 +516,32 @@ def mention_from_event(
             else permitted(msg.get("sender_full_name") or msg.get("sender_email", ""))
         ),
     )
+
+
+def addressed_agent(topic: str) -> str:
+    """The FQN a message was addressed to, from its topic prefix. Empty if none.
+
+    The sender writes the topic as `<what --to named>: <subject>`, so when a
+    caller addressed an FQN the topic prefix IS that FQN. That is the only
+    place it survives: the body carries an `@`-mention of the seat's bot, and
+    one bot serves every agent on the seat.
+
+    **Shape only, and deliberately not a lookup.** An FQN is
+    `estate.project.agent` — three non-empty dot-separated segments, no spaces.
+    A bare seat name (`test-claude: uc01`) has no dots and returns empty, which
+    is what keeps plain seat-name addressing working exactly as it did.
+
+    This does NOT check the seat serves the name. The seat is the only party
+    that resolves an agent to a session (comms-design §5), and contract 2.0 §3
+    gives it `unknown-agent` at exit 10 to say so. Checking here would put a
+    second opinion in front of the authority and fail quietly where the seat
+    fails loudly.
+    """
+    prefix = (topic or "").split(":", 1)[0].strip()
+    if not prefix or any(c.isspace() for c in prefix):
+        return ""
+    parts = prefix.split(".")
+    return prefix if len(parts) == 3 and all(parts) else ""
 
 
 def inbox(unread_only: bool = True, **kw) -> list[Mention]:
