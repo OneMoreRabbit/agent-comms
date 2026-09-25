@@ -557,7 +557,8 @@ def test_the_seat_gate_compares_the_senders_FQN():
     """Addressing is by FQN, and that includes who a message is FROM. A hub
     display name names a SEAT, so it cannot name the agent that wrote."""
     from agent_comms.directory import Directory
-    d = Directory(project=False, partners=("test-codex",), source="test")
+    d = Directory(project=False, partners=("test-codex",), source="test",
+                  own_project="agent-eco")
     # Short entry means "this project's X": matches on the agent segment,
     # within the project.
     assert d.permits("bakehouse.agent-eco.test-codex", in_project=False) is True
@@ -572,8 +573,11 @@ def test_a_qualified_entry_matches_that_FQN_and_nothing_else():
     assert entry_matches_fqn("bakehouse.arc-web.arch", "bakehouse.arc-web.arch") is True
     assert entry_matches_fqn("bakehouse.arc-web.arch", "bakehouse.labs.arch") is False
     # A short entry is scoped to the project, never a bare suffix.
-    assert entry_matches_fqn("arch", "bakehouse.agent-eco.arch") is True
-    assert entry_matches_fqn("arch", "bakehouse.agent-eco.arch-shadow") is False
+    assert entry_matches_fqn("arch", "bakehouse.agent-eco.arch", "agent-eco") is True
+    assert entry_matches_fqn("arch", "bakehouse.agent-eco.arch-shadow", "agent-eco") is False
+    # ...and scoped to THIS seat's project. Without the scope a short entry
+    # admitted any project with an agent of that name.
+    assert entry_matches_fqn("arch", "bakehouse.blocks.arch", "agent-eco") is False
 
 
 def test_a_sender_stating_no_FQN_still_reaches_the_seat():

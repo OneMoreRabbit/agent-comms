@@ -384,7 +384,7 @@ def preflight(
     # means permissions are a default rather than a declaration, and nobody
     # should have to read source to find that out.
     try:
-        directory = load_directory(settings.state_dir)
+        directory = load_directory(settings.state_dir, settings.identity.project)
         report.add("directory", True, directory.summary())
         report.warnings.extend(directory.warnings)
         refused = [m for m in Store(settings.state_dir).all() if not m.authorised]
@@ -1059,7 +1059,7 @@ def _resolve_recipient(settings: Settings, hub: Hub, name: str) -> str:
         # Reachable is not permitted. The hub says a message *can* arrive; the
         # directory says whether the estate allows it. Same rule as inbound, so
         # a link cannot be one-way by accident.
-        directory = load_directory(settings.state_dir)
+        directory = load_directory(settings.state_dir, settings.identity.project)
         if not is_permitted(directory, hub, match):
             in_project, _ = hub.in_channel(match)
             raise UnknownRecipient(
@@ -1891,7 +1891,7 @@ def run_daemon(
         store.record("warn", notice)
     hub.verify_subscription()
 
-    directory = load_directory(settings.state_dir)
+    directory = load_directory(settings.state_dir, settings.identity.project)
     for notice in directory.warnings:
         store.record("warn", notice)
     store.record("info", f"comms directory: {directory.summary()}")

@@ -63,7 +63,7 @@ def short_name(name: str) -> str:
     return name.strip().casefold().rsplit(".", 1)[-1]
 
 
-def entry_matches_fqn(entry: str, fqn: str) -> bool:
+def entry_matches_fqn(entry: str, fqn: str, own_project: str = "") -> bool:
     """Does an authored partner/blocked entry name this FQN?
 
     The estate writes SHORT names in these lists (`test-codex`) while
@@ -75,7 +75,12 @@ def entry_matches_fqn(entry: str, fqn: str) -> bool:
       `bakehouse.labs.arch`, which is the cross-project trap. Caught by
       `test_a_short_name_never_matches_across_projects` the moment I did it.
     - **A short entry means "this project's X"**, so it matches on the agent
-      segment and only within the same project.
+      segment and only within THIS SEAT's project. `own_project` is that
+      project. Without it a short entry matched any project with an agent of
+      that name -- `test-codex` admitted `bakehouse.blocks.test-codex` --
+      because `same_project` returns True whenever either side is unqualified
+      and `Directory` never knew which project it was in. Found by this
+      audit's own test, not in the field.
 
     The sender's FQN is never respelled. Guessing a spelling on that side is
     what needed a rule both tight enough to keep `blocks-arch` from matching
@@ -86,7 +91,15 @@ def entry_matches_fqn(entry: str, fqn: str) -> bool:
     target = fqn.strip().casefold()
     if folded.count(".") == 2:
         return folded == target
-    return folded == short_name(target) and same_project(target, folded)
+    if folded != short_name(target):
+        return False
+    if not own_project:
+        # We do not know our project, so we cannot scope the entry. Match, as
+        # before, rather than refuse mail over a fact we simply lack -- and the
+        # loader supplies it on every real path.
+        return True
+    parts = target.split(".")
+    return len(parts) < 3 or parts[1] == own_project.strip().casefold()
 
 
 def same_project(a: str, b: str) -> bool:
@@ -114,6 +127,11 @@ class Directory:
     blocked: tuple[str, ...] = ()
     #: Where it came from, for `comms doctor`. Empty when running on the default.
     source: str = ""
+    #: This seat's own project, which is what a SHORT entry in `partners` or
+    #: `blocked` is scoped to. Empty means unknown, and an unknown scope
+    #: matches rather than refuses -- mail must not be refused over a fact we
+    #: simply lack. Every real path supplies it.
+    own_project: str = ""
     warnings: list[str] = field(default_factory=list)
 
     @property
@@ -139,7 +157,7 @@ class Directory:
         # `blocked` wins over everything, including an explicit allow. It is the
         # estate's stop button and must not be argued with by ordering rules.
         if is_fqn:
-            if any(entry_matches_fqn(b, folded) for b in self.blocked):
+            if any(entry_matches_fqn(b, folded, self.own_project) for b in self.blocked):
                 return False
         elif short in {short_name(b) for b in self.blocked}:
             return False
@@ -148,7 +166,7 @@ class Directory:
 
         for partner in self.partners:
             if is_fqn:
-                if entry_matches_fqn(partner, folded):
+                if entry_matches_fqn(partner, folded, self.own_project):
                     return True
             else:
                 # Legacy: a sender that states no FQN, compared on the display
@@ -198,7 +216,7 @@ class Directory:
 _KEY = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*)$")
 
 
-def load(state_dir: Path | None = None) -> Directory:
+def load(state_dir: Path | None = None, own_project: str = "") -> Directory:
     """Read the directory, or return the default if there is none.
 
     Parsed by hand, like the seat's own manifests: three flat keys, a bool and
@@ -209,7 +227,7 @@ def load(state_dir: Path | None = None) -> Directory:
     root = state_dir or Path.home() / ".comms"
     path = Path(root) / "comms.yml"
     if not path.exists():
-        return Directory()
+        return Directory(own_project=own_project, )
 
     try:
         text = path.read_text(encoding="utf-8")
