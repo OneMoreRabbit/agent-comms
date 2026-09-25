@@ -707,9 +707,15 @@ def addressed_to_seat(
         # daemon as "addressed to an agent on this seat" and was delivered to
         # its own main. A silent delivery to the wrong recipient, one layer up
         # from the one this envelope was built to fix.
+        # **Name the agent.** "an agent on this seat" does not say WHICH, so a
+        # recipient cannot tell whether the message is for it. Reported by a
+        # live agent on test-claude 2026-09-25: it read the unnamed line as
+        # "some OTHER agent on my seat", inferred that the addressee shared
+        # its seat, and declined to act -- correctly, on a wrong label. A right
+        # answer and a wrong answer must not read alike (write-time gate 9).
         marked = envelope_from_body(msg.get("content") or "")
         mine = marked and marked in set(serves or ())
-        return "addressed to an agent on this seat" if mine else None
+        return f"addressed to {marked}, an agent on this seat" if mine else None
 
     if "mentioned" in flags:
         return "mentioned"

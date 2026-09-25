@@ -342,8 +342,9 @@ def test_our_own_post_is_kept_only_when_it_addresses_one_of_our_agents():
 
     addressed_to_sibling = {"sender_email": me, "subject": f"{sibling}: x",
                             "content": addressed("test-claude", "hi", to_fqn=sibling)}
-    assert addressed_to_seat(settings, addressed_to_sibling, [], me, serves) == \
-        "addressed to an agent on this seat"
+    reason = addressed_to_seat(settings, addressed_to_sibling, [], me, serves)
+    assert reason and sibling in reason, \
+        "kept, and the line names WHICH agent it was for (gate 9)"
 
     # A reply from that same agent, in its own topic, carries NO marker.
     our_own_reply = {"sender_email": me, "subject": f"{sibling}: x",
@@ -462,3 +463,28 @@ def test_the_envelope_states_both_ends_as_FQNs():
     # An unmarked message states neither.
     assert envelope_sender("@**test-claude** hello") == ""
     assert envelope_from_body("@**test-claude** hello") == ""
+
+
+def test_the_reason_line_names_which_agent_it_was_for():
+    """Write-time gate 9. `reached me by: addressed to an agent on this seat`
+    does not say WHICH agent, so the recipient cannot tell whether it is the
+    recipient.
+
+    Reported by a live agent on test-claude 2026-09-25: it read the unnamed
+    line as "some other agent on my seat", inferred the addressee shared its
+    seat, and declined to act. It reasoned correctly from a label that did not
+    name its subject."""
+    from agent_comms.operations import addressed_to_seat, addressed
+    from agent_comms.config import Settings, Identity
+
+    settings = Settings(identity=Identity(project="agent-eco", seat="test-claude"),
+                        channel="seat-testing", role="component")
+    me = "test-claude-bot@example.com"
+    sibling = "bakehouse.agent-eco.test-claude-another1"
+    msg = {"sender_email": me, "subject": f"{sibling}: x",
+           "content": addressed("test-claude", "hi", to_fqn=sibling)}
+    reason = addressed_to_seat(settings, msg, [], me, {sibling})
+    assert sibling in reason, "the line must name the agent it was addressed to"
+    # And the near-miss: an unnamed line reads the same whoever it was for,
+    # which is the property gate 9 forbids.
+    assert reason != "addressed to an agent on this seat"
