@@ -238,7 +238,7 @@ def load_settings(state_dir: Path | None = None, seat_manifest: Path | None = No
     return Settings(
         identity=identity,
         codex_thread_selection=manifest.get("codex_thread_selection"),
-        role=manifest.get("role") or ("arch" if seat == "arch" or seat.endswith("-arch") else "component"),  # gate-exempt: KNOWN GATE-1 VIOLATION, reported to arch 2026-09-25, decision pending: derives ROLE from the seat name's suffix when the manifest omits it. Identity assembled by convention -- the same suffix trap removed from the permission matcher today. Not fixed mid-campaign because role governs canonical_names(), i.e. which bot names this seat answers to
+        role=manifest.get("role") or ("arch" if seat == "arch" or seat.endswith("-arch") else "component"),  # gate-exempt: KNOWN GATE-1 VIOLATION, reported to arch 2026-09-25, SEQUENCED by arch 2026-09-25, not merely pending: derives ROLE from the seat name's suffix when the manifest omits it. Identity assembled by convention -- the same suffix trap removed from the permission matcher the same day. The agreed fix is that `role` becomes REQUIRED and this tool fails naming the file and field (constitution §11), never guessing from a name. It ships only after orch confirms whether any deployed seat.yml omits `role`; if one does, it ships with the manifest fix in the same estate pass. It does NOT ship mid-campaign, because role governs canonical_names(), i.e. which bot names this seat answers to
         channel=os.environ.get("AGENT_COMMS_CHANNEL") or file_cfg.get("channel") or project,
         lifespan_secs=int(file_cfg.get("lifespan_secs", DEFAULT_LIFESPAN_SECS)),
         state_dir=state_dir,
