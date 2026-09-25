@@ -1399,8 +1399,12 @@ def test_resolve_prints_the_path_and_sends_nothing(seat, monkeypatch):
 
     out = "\n".join(operations.resolve_name("arch"))
     assert "bakehouse.agent-eco.arch" in out
-    assert "channel agent-eco" in out and "bot arch" in out
-    assert "would send  YES" in out
+    # `resolve` tells the truth about what WOULD happen. Since 2026-09-25 that
+    # is a refusal for an agent with no declared transport — so it must say so
+    # here, before a person sends, rather than printing a transport it would
+    # not actually use.
+    assert "would send  NO" in out
+    assert "no comms transport is declared" in out
     assert sent == [], "resolve sent something"
 
 
