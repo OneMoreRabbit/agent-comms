@@ -598,7 +598,8 @@ def blocks_sender(agent: str, sender_fqn: str, state_dir) -> bool:
 LEGACY_SENDER_MATCHING = True
 
 
-def why_refused(mention, directory: Directory, state_dir) -> str:
+def why_refused(mention, directory: Directory, state_dir,
+                in_project: bool = False) -> str:
     """Which rule refused this sender, and WHERE THAT RULE LIVES.
 
     There are two layers and they are held in different places by different
@@ -627,9 +628,7 @@ def why_refused(mention, directory: Directory, state_dir) -> str:
                 f"seat caches in ~/.comms/routes.json. It applies to that agent "
                 f"alone, not to this seat -- ~/.comms/comms.yml is not where "
                 f"this was decided")
-    return (f"{mention.sender!r} is not a permitted sender for this seat: "
-            f"{directory.describe()} -- declared by the estate in "
-            f"~/.comms/comms.yml")
+    return directory.refusal(mention.sender, in_project=in_project)
 
 
 def is_permitted(directory: Directory, hub: Hub, sender: str,
@@ -661,7 +660,8 @@ def is_permitted(directory: Directory, hub: Hub, sender: str,
 
 
 def addressed_to_seat(
-    settings: Settings, msg: dict, flags: list[str], own_email: str | None = None
+    settings: Settings, msg: dict, flags: list[str], own_email: str | None = None,
+    serves: Collection[str] = (),
 ) -> str | None:
     """Is this message for this seat? Returns why, or None.
 
@@ -698,8 +698,18 @@ def addressed_to_seat(
         # agent replying in its own thread has a topic naming itself, and
         # accepting that would hand the agent back its own words forever.
         # A send carries the marker; a reply does not.
-        return ("addressed to an agent on this seat"
-                if envelope_from_body(msg.get("content") or "") else None)
+        #
+        # **And the marker must name an agent THIS SEAT SERVES.** Asking only
+        # whether a marker EXISTS admits every message this seat sends to
+        # anyone -- which every seat on the channel then stores and hands to
+        # its own default agent. Measured on test-codex 2026-09-25: a message
+        # it had sent to `…test-claude-another1` came back through its own
+        # daemon as "addressed to an agent on this seat" and was delivered to
+        # its own main. A silent delivery to the wrong recipient, one layer up
+        # from the one this envelope was built to fix.
+        marked = envelope_from_body(msg.get("content") or "")
+        mine = marked and marked in set(serves or ())
+        return "addressed to an agent on this seat" if mine else None
 
     if "mentioned" in flags:
         return "mentioned"
@@ -724,10 +734,10 @@ def mention_from_event(
     if event.get("type") != "message":
         return None
     msg = event["message"]
-    reason = addressed_to_seat(settings, msg, event.get("flags") or [], own_email)
+    serves = config_sync.agent_set(settings.state_dir)
+    reason = addressed_to_seat(settings, msg, event.get("flags") or [], own_email, serves)
     if reason is None:
         return None
-    serves = config_sync.agent_set(settings.state_dir)
     return Mention(
         id=msg["id"],
         sender=msg.get("sender_full_name") or msg.get("sender_email", "unknown"),
@@ -1581,7 +1591,8 @@ def _refuse_sender(
         settings, store, mention.channel or settings.channel,
         mention.topic or f"{settings.identity.seat}: not a permitted sender",
         f"@**{mention.sender}** **your message was not delivered to "
-        f"{settings.identity.seat}.** {directory.refusal(mention.sender, in_project=in_project)}"
+        f"{settings.identity.seat}.** "
+        f"{why_refused(mention, directory, settings.state_dir, in_project=in_project)}"
         f"\n\nIt is stored on the seat and visible to the operator, but it did not reach "
         f"the agent. Cite: {mention.permalink}\n\n"
         "Further messages from you to this seat are refused without a reply until the "

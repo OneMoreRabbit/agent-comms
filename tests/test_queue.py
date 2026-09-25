@@ -338,15 +338,32 @@ def test_our_own_post_is_kept_only_when_it_addresses_one_of_our_agents():
     me = "test-claude-bot@example.com"
     sibling = "bakehouse.agent-eco.test-claude-another1"
 
+    serves = {sibling, "bakehouse.agent-eco.test-claude-new001"}
+
     addressed_to_sibling = {"sender_email": me, "subject": f"{sibling}: x",
                             "content": addressed("test-claude", "hi", to_fqn=sibling)}
-    assert addressed_to_seat(settings, addressed_to_sibling, [], me) == \
+    assert addressed_to_seat(settings, addressed_to_sibling, [], me, serves) == \
         "addressed to an agent on this seat"
 
     # A reply from that same agent, in its own topic, carries NO marker.
     our_own_reply = {"sender_email": me, "subject": f"{sibling}: x",
                      "content": "@**test-codex** thanks, noted"}
-    assert addressed_to_seat(settings, our_own_reply, [], me) is None
+    assert addressed_to_seat(settings, our_own_reply, [], me, serves) is None
+
+    # **THE GAP THIS TEST USED TO HAVE.** It checked marker-present against
+    # marker-absent and never a marker naming SOMEONE ELSE'S agent — so it
+    # passed while the code admitted every message this seat sent to anyone.
+    # Measured on test-codex 2026-09-25: a message it had sent to another
+    # seat's agent came back through its own daemon as "addressed to an agent
+    # on this seat" and was delivered to its own main.
+    theirs = "bakehouse.agent-eco.test-codex-dave"
+    to_another_seat = {"sender_email": me, "subject": f"{theirs}: x",
+                       "content": addressed("test-codex", "hi", to_fqn=theirs)}
+    assert addressed_to_seat(settings, to_another_seat, [], me, serves) is None, \
+        "our own post to ANOTHER seat's agent is not ours to store"
+
+    # And with nothing assigned, no self-post is ours: fails safe.
+    assert addressed_to_seat(settings, addressed_to_sibling, [], me, set()) is None
 
 
 def test_the_marker_beats_the_topic_and_a_reply_cannot_forge_one():

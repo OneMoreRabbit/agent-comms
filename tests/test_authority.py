@@ -636,4 +636,14 @@ def test_a_refusal_names_the_rule_that_fired_and_where_it_lives(tmp_path, monkey
                  content="x", timestamp=1, permalink="",
                  agent=another1, sender_fqn="bakehouse.agent-eco.stranger")
     why2 = why_refused(m2, d, tmp_path)
-    assert "comms.yml" in why2 and "blocked list" not in why2
+    assert "not a permitted partner" in why2 and "blocked list" not in why2
+
+    # **The sender-facing bounce must not contradict itself.** Measured on the
+    # swept seats: a refusal read "'test-codex' is not a permitted partner …
+    # Permitted: test-codex, agent-comms, agent-skeleton" -- naming the sender
+    # in the same breath as permitted and not permitted, because the per-agent
+    # rule refused it and the seat-level sentence explained it.
+    listed = d.describe()
+    assert not ("test-codex" in listed and "test-codex" in why and
+                "not a permitted partner" in why), \
+        "a per-agent refusal must not be explained with the seat-level sentence"
