@@ -398,6 +398,26 @@ def trace(message_id: int) -> None:
         click.echo(line)
 
 
+@main.command("partners")
+@click.option("--from", "from_fqn", default="",
+              help="The FQN whose addressable set to ask about. A CLAIM, not "
+                   "identity: anyone may ask about anyone. Omit it for the whole "
+                   "estate.")
+def partners_cmd(from_fqn: str) -> None:
+    """Who the directory says an agent may address. Discovery, not permission.
+
+    Wraps `GET /v0/addressable?from=<FQN>`. The surface is tokenless, so this
+    reads public information and does not speak for you: `?from` is a claim the
+    directory evaluates, not proof of who is asking.
+
+    **Appearing here does not authorise a send.** `comms send` resolves every
+    message at the moment it sends it, which is the only answer that cannot go
+    stale between the asking and the sending.
+    """
+    for line in operations.partners(from_fqn=from_fqn):
+        click.echo(line)
+
+
 @main.command("resolve")
 @click.argument("name")
 @click.option("--from", "from_fqn", required=True, help="The FQN of the AGENT asking — estate.project.agent. Required: the permission verdict depends on who is asking, so asking as the wrong agent prints the wrong answer.")

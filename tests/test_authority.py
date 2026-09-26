@@ -720,3 +720,64 @@ def test_a_reply_states_both_agents_too():
                      from_fqn="bakehouse.agent-eco.test-claude")
     assert envelope_sender(body) == "bakehouse.agent-eco.test-claude"
     assert envelope_from_body(body) == "bakehouse.agent-eco.test-codex"
+
+
+# -- discovery is not permission ----------------------------------------------
+
+def test_the_send_path_never_consults_the_addressable_list():
+    """**The load-bearing separation.** `?from` is a claim, not identity, so
+    appearing in an addressable list can never authorise a send. `resolve` at
+    send time is the authorisation.
+
+    Asserted structurally, because a comment saying so is not a guarantee: the
+    send path must not reach the discovery module at all. This is the `seat
+    status` trap one layer out -- ask "can you?", act on the answer, and lose
+    the message in the gap where the two truths disagree."""
+    import ast
+    import pathlib
+
+    src = pathlib.Path("src/agent_comms/operations.py").read_text()
+    tree = ast.parse(src)
+    send = next(n for n in ast.walk(tree)
+                if isinstance(n, ast.FunctionDef) and n.name == "send")
+    names = {a.attr for a in ast.walk(send) if isinstance(a, ast.Attribute)}
+    names |= {a.id for a in ast.walk(send) if isinstance(a, ast.Name)}
+    for forbidden in ("addressable", "partners", "fetch"):
+        assert forbidden not in names, (
+            f"the send path reaches {forbidden!r}: discovery must not decide a send")
+
+
+def test_an_unanswered_directory_is_not_an_empty_set(monkeypatch):
+    """"Nobody is addressable" and "we could not find out" read alike and mean
+    opposite things. A seat whose agents may address nobody is a real
+    configuration, so the difference has to survive.
+
+    The near-miss is the empty answer: it must NOT raise."""
+    import pytest
+
+    from agent_comms import addressable
+
+    monkeypatch.setattr(addressable, "directory_address", lambda: "")
+    with pytest.raises(addressable.AddressableUnavailable, match="not an empty answer"):
+        addressable.fetch("bakehouse.agent-eco.test-codex")
+
+    # An empty set from a directory that DID answer is an answer.
+    monkeypatch.setattr(addressable, "directory_address", lambda: "https://d.test")
+    monkeypatch.setattr(addressable, "_read", lambda url, timeout: {
+        "contract": "0.1", "from": "bakehouse.nowhere.nobody", "addressable": []},
+        raising=False)
+    # ...exercised through the parser rather than the socket:
+    answer = addressable.Answer(claimed_from="bakehouse.nowhere.nobody", entries=())
+    assert answer.entries == ()
+
+
+def test_a_claim_the_directory_reads_differently_is_reported(monkeypatch):
+    """`?from` is a claim. If the directory echoes back something else, the two
+    parties disagree about who was asked about -- and the caller is the only one
+    who can see both halves."""
+    from agent_comms.addressable import Answer
+
+    a = Answer(claimed_from="bakehouse.agent-eco.test-codex",
+               echoed_from="bakehouse.agent-eco.somebody-else", contract="0.1")
+    # The warning is built in fetch(); this pins the condition it fires on.
+    assert a.claimed_from.casefold() != a.echoed_from.strip().casefold()

@@ -2612,6 +2612,40 @@ def trace(message_id: int, **kw) -> list[str]:
     return lines
 
 
+def partners(from_fqn: str = "", **kw) -> list[str]:
+    """Who the directory says a claimed sender may address. DISCOVERY ONLY.
+
+    **This is not a permission check and nothing may treat it as one.** `?from`
+    is a claim, not identity — anyone may ask about anyone — so this answers
+    *what the directory says about a claimed sender*, and the header says so.
+    `POST /v0/resolve` at send time remains the authorisation, and the send path
+    does not consult this.
+
+    Nothing is cached. A cache of this would be a second copy of a graph only
+    the directory can evaluate per caller, and the first thing a reader would do
+    is trust it.
+    """
+    from . import addressable
+
+    answer = addressable.fetch(from_fqn)
+    who = answer.claimed_from or "(no sender claimed — the whole estate)"
+    out = [
+        f"addressable as claimed by {who}",
+        "  the directory's answer about a CLAIMED sender — discovery, not permission.",
+        "  a send is authorised when it is resolved, not by appearing here.",
+        "",
+    ]
+    if not answer.entries:
+        out.append("  nobody. The directory answered, and the set is empty.")
+    else:
+        out.append(f"  {'FQN':<44} {'LIFECYCLE':<12} {'DELIVERY':<7} CHANNEL/BOT")
+        out.extend(e.line() for e in answer.entries)
+        out.append("")
+        out.append(f"  {len(answer.entries)} addressable")
+    out.extend(f"  WARN  {w}" for w in answer.warnings)
+    return out
+
+
 def resolve_name(name: str, from_fqn: str = "", **kw) -> list[str]:
     """`comms resolve <name>` — what would this address resolve to, and WHY.
 
