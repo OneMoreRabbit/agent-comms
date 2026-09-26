@@ -70,7 +70,11 @@ class Declared(BaseModel):
     One read replaces all four. `role` and `canonical_names` are gone with them.
     """
 
-    fqn: str = ""
+    #: **No `fqn` here, deliberately.** A seat has no FQN: the model is
+    #: channel↔seat, bot↔seat, FQN↔AGENT. A field holding "this seat's FQN"
+    #: is a category error however it is filled, and it invites the next
+    #: reader to treat a seat as addressable. The sending agent states itself
+    #: with `--from`; see `operations.sending_agent()`.
     bot: str = ""
     channel: str = ""
     source: str = "unread"
@@ -92,19 +96,13 @@ def declared_identity(project: str, seat: str, state_dir: Path | None = None) ->
     that is not something to average: it is reported as unknown, so `doctor`
     fails loudly rather than this returning a guess.
 
-    **A SEAT HAS NO FQN.** An FQN names an agent session; the addressing model
-    is channel↔seat, bot↔seat, FQN↔**agent**. So `fqn` here is only filled when
-    this seat serves exactly ONE agent, where the sender cannot be anyone else.
-    With several it is left EMPTY and the caller must say which agent is
-    sending — comms has no way to know, and picking one would be inventing an
-    identity.
-
-    A first version of this preferred "the agent whose last segment is the seat
-    name", which is deriving an FQN from a seat name — the exact defect this
-    class exists to remove. The operator caught it. The naming accident that
-    made it look reasonable is that `agent-eco/test-claude` currently serves an
-    agent called `bakehouse.agent-eco.test-claude`; that is a coincidence of
-    naming, not a relationship.
+    **Only the bot and the channel, because only those belong to a seat.** No
+    FQN is read or kept here: an FQN names an agent session, so "this seat's
+    FQN" is a category error however it is filled. This class held one briefly
+    — first preferring "the agent whose last segment is the seat name", which
+    is deriving an FQN from a seat name, and then "the one agent this seat
+    serves". The operator rejected both, and correctly: the sending agent
+    states itself with `--from`, and nothing else needs a seat-level FQN.
     """
     from . import config_sync
 
@@ -125,11 +123,8 @@ def declared_identity(project: str, seat: str, state_dir: Path | None = None) ->
         return Declared(source=f"disagreeing transports: bots={sorted(bots)} "
                                f"channels={sorted(chans)}")
 
-    names = sorted(agents)
-    only = names[0] if len(names) == 1 else ""
-    return Declared(fqn=only, bot=next(iter(bots)), channel=next(iter(chans)),
-                    source="directory" if only else
-                           f"directory; {len(names)} agents, so no single sender")
+    return Declared(bot=next(iter(bots)), channel=next(iter(chans)),
+                    source=f"directory ({len(agents)} agent(s))")
 
 
 class Identity(BaseModel):
@@ -142,18 +137,9 @@ class Identity(BaseModel):
 
     project: str
     seat: str
-    #: Read from the directory. Empty on a seat that has never synced.
+    #: The bot and channel the directory declares for this seat. Read, never
+    #: derived — and carrying no FQN, because a seat has no FQN.
     declared: Declared = Declared()
-
-    @property
-    def fqn(self) -> str:
-        """The FQN of the one agent this seat serves, or empty.
-
-        **Not "this seat's FQN" — a seat has no FQN.** Empty whenever the seat
-        serves more or fewer than one agent, because then the sending agent is
-        not knowable from here and must be stated by the caller.
-        """
-        return self.declared.fqn
 
     @property
     def bot_name(self) -> str:

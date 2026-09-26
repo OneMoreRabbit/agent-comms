@@ -37,7 +37,6 @@ def test_the_declared_bot_is_the_estates_real_name(project, seat, bot, cred):
     """One value, read. No set, no role, no spelling rule."""
     identity = Identity(project=project, seat=seat,
                         declared=Declared(bot=bot, channel="irrelevant-here",
-                                          fqn=f"bakehouse.{project}.{seat}",
                                           source="directory"))
     assert identity.bot_name == bot
     assert identity.credential_candidates[0].name == cred, \
@@ -76,7 +75,6 @@ def test_known_names_is_for_recognising_ourselves_not_for_posting():
     parties may already have written in a topic or a mention."""
     identity = Identity(project="agent-eco", seat="test-claude",
                         declared=Declared(bot="test-claude", channel="seat-testing",
-                                          fqn="bakehouse.agent-eco.test-claude",
                                           source="directory"))
     assert identity.bot_name == "test-claude"            # posting: one value
     known = {n.casefold() for n in identity.known_names()}
@@ -84,3 +82,19 @@ def test_known_names_is_for_recognising_ourselves_not_for_posting():
     # ...and nothing invented: the project-prefixed form is NOT offered once the
     # directory has spoken, because the estate did not mint it.
     assert "agent-eco-test-claude" not in known
+
+
+def test_a_seat_carries_no_FQN_at_all():
+    """**A seat has no FQN**, so nothing holds one against a seat.
+
+    `Declared` briefly did — first preferring "the agent whose last segment is
+    the seat name" (deriving an FQN from a seat name, the exact defect the class
+    exists to remove), then "the one agent this seat serves". Both were rejected:
+    an FQN names an agent session, so a seat-level FQN is a category error
+    however it is filled, and keeping one invites the next reader to treat a
+    seat as addressable.
+
+    The sending agent states itself with `--from`."""
+    from agent_comms.config import Declared, Identity
+    assert not hasattr(Declared(), "fqn"), "a seat-level FQN must not exist"
+    assert not hasattr(Identity(project="agent-eco", seat="test-claude"), "fqn")
