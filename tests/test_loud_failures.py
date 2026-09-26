@@ -1610,3 +1610,32 @@ def test_the_wake_outcome_is_a_word_not_a_prefix_of_a_sentence():
         "an exact match must reject a word that merely starts with the right one"
     assert near.line.startswith("queued"), \
         "...and the near-miss really would have passed the old prefix test"
+
+
+def test_a_check_with_nothing_to_verify_says_so_by_name():
+    """Write-time gate 9, ruled by arch 2026-09-26.
+
+    `agents reach this seat` used to be omitted entirely when there was nothing
+    to verify. Measured on a fresh test-codex: doctor reported 11 checks where
+    test-claude reported 12, with nothing saying which was missing or why.
+
+    **An absent check and a passing check are indistinguishable to anyone
+    counting** — the diagnostic-without-information class, in the one tool whose
+    whole job is information. The check now always appears; what varies is what
+    it says."""
+    import ast
+    import pathlib
+
+    src = pathlib.Path("src/agent_comms/operations.py").read_text()
+    tree = ast.parse(src)
+    pre = next(n for n in ast.walk(tree)
+               if isinstance(n, ast.FunctionDef) and n.name == "preflight")
+    # Every branch of the mirror check must add the check, so no path omits it.
+    adds = [n for n in ast.walk(pre)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "add"
+            and n.args and isinstance(n.args[0], ast.Constant)
+            and n.args[0].value == "agents reach this seat"]
+    assert len(adds) >= 4, (
+        f"only {len(adds)} branches name this check; a branch that omits it makes "
+        "an absent check read as a passing one")

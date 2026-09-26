@@ -344,16 +344,37 @@ def preflight(
     elif undeclared:
         # NOT a failure. Derivation is gone (§5, amended 2026-09-25), so an
         # undeclared agent is refused at the sender, loudly, with nothing
-        # posted. That is a missing record, not a silent loss.
-        report.notes.append(
-            f"assigned agent(s) with no declared transport: {', '.join(undeclared)}. "
-            f"A seat serving more than one agent REQUIRES them, because one bot is one "
-            f"seat's mailbox and nothing derives a per-agent one. Until they are "
-            f"authored, a send to those names is refused at the sender and nothing "
-            f"is posted.")
-    elif assigned:
+        # posted. That is a missing record, not a silent loss. It is still a
+        # CHECK rather than only a note, so the line exists either way.
+        report.add(
+            "agents reach this seat", True,
+            f"nothing to verify for {', '.join(undeclared)} — no declared transport "
+            f"yet. A seat serving more than one agent REQUIRES them, because one bot "
+            f"is one seat's mailbox and nothing derives a per-agent one. Until they "
+            f"are authored, a send to those names is refused at the sender with "
+            f"nothing posted.")
+    elif resolved:
         report.add("agents reach this seat", True,
-                   f"all {len(resolved)} resolved agent(s) declare a bot this seat answers to")
+                   f"all {len(resolved)} resolved agent(s) declare a bot this seat "
+                   f"answers to")
+    else:
+        # **A CHECK WITH NOTHING TO VERIFY SAYS SO BY NAME.**
+        #
+        # This branch used to be silent: no agents assigned, or none of them
+        # resolvable, and the check simply did not appear. Measured on the fresh
+        # test-codex 2026-09-26 — doctor reported 11 checks where test-claude
+        # reported 12, with nothing saying which was missing or why.
+        #
+        # An absent check and a passing check are indistinguishable to anyone
+        # counting, which is the diagnostic-without-information class in the one
+        # tool whose whole job is information. Ruled by arch the same day: a
+        # check with nothing to verify says so by name, never silently absent.
+        why = (f"could not resolve any of them ({', '.join(unreadable)})" if unreadable
+               else "this seat is assigned no agents yet" if not assigned
+               else f"{len(assigned)} assigned and none resolvable")
+        report.add("agents reach this seat", True,
+                   f"nothing to verify — {why}. Stated rather than omitted: an absent "
+                   f"check reads the same as a passing one.")
 
     try:
         registration = hub.register_queue()
