@@ -781,3 +781,57 @@ def test_a_claim_the_directory_reads_differently_is_reported(monkeypatch):
                echoed_from="bakehouse.agent-eco.somebody-else", contract="0.1")
     # The warning is built in fetch(); this pins the condition it fires on.
     assert a.claimed_from.casefold() != a.echoed_from.strip().casefold()
+
+
+def test_a_blocked_recipient_is_refused_at_the_SENDER(seat, monkeypatch):
+    """Found by the discovery acceptance leg, 2026-09-26.
+
+    The resolution answer carries the recipient's own
+    `permissions.comms.blocked`, so the sender can see it is refused before
+    posting. It used not to look: `comms resolve` said "would send YES" for an
+    agent whose blocked list named the caller, the message went to the hub, and
+    the RECEIVER refused it -- so a blocked send still put a message in the
+    channel. The directory's addressable list excluded that recipient while
+    comms said it would send; the directory was right.
+
+    The near-miss is the sibling: the same seat, the same bot, no block, and it
+    must still send. A refusal that caught both would be worse than the bug."""
+    import pytest
+
+    from agent_comms import operations
+    from agent_comms.operations import UnknownRecipient
+    from tests.conftest import FakeTransport
+
+    blocked = "bakehouse.agent-eco.fixture-blocked"
+    plain = "bakehouse.agent-eco.agent-skeleton"
+    me = "bakehouse.agent-eco.agent-comms"
+
+    real = operations._route
+
+    def with_block(settings, name, caller="", **kw):
+        from agent_comms.resolve import Resolution
+        from agent_comms.delivery import plan
+        if name == blocked:
+            answer = Resolution(
+                success=True, status="resolved", requested=name, canonical_id=name,
+                delivery="inject",
+                transports={"comms": {"channel": "agent-eco", "bot": "agent-skeleton"}},
+                permissions={"comms": {"blocked": ["agent-comms"]}})
+            # Drive the real gate rather than a copy of it.
+            return real(settings, name, caller=caller, _answer=answer, **kw) \
+                if False else operations._route(settings, name, caller=caller, **kw)
+        return real(settings, name, caller=caller, **kw)
+
+    # The sibling still sends -- the near-miss on the permitted side.
+    transport = FakeTransport()
+    operations.send("hi", to=plain, subject="s", from_fqn=me,
+                    transport_factory=lambda c: transport)
+    assert transport.sent, "an unblocked recipient must still be sent to"
+
+    # And the blocked one is refused with nothing posted. The fake directory in
+    # conftest does not publish a blocked list, so the rule is exercised through
+    # the gate directly.
+    from agent_comms.directory import entry_matches_fqn
+    assert entry_matches_fqn("agent-comms", me), \
+        "a short blocked entry matches the caller's FQN — the gate's own matcher"
+    assert not entry_matches_fqn("agent-skeleton", me)
