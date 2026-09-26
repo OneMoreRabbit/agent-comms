@@ -2164,7 +2164,11 @@ def run_daemon(
             )
             if mention is None:
                 return
-            store.append(mention)
+            # The addressed agent's declared mode decides the arrival state:
+            # `hold` lands in HELD, which is the only state RETRIEVED can be
+            # reached from. Read once here rather than at every delivery pass.
+            from .wake import holds
+            store.append(mention, held=holds(mention.agent or "", settings.state_dir))
             stored += 1
             if not mention.authorised:
                 # **Refused, not delivered.** Labelling it and handing it to the

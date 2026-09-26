@@ -467,8 +467,20 @@ class MessageStore(Queue):
     def _rows(self):
         return self.db.execute("SELECT * FROM messages ORDER BY seq").fetchall()
 
-    def append(self, mention) -> None:
-        """Store one arrival. Idempotent on the hub id, as `receive` is."""
+    def append(self, mention, held: bool = False) -> None:
+        """Store one arrival. Idempotent on the hub id, as `receive` is.
+
+        `held` means the addressed agent's declared delivery mode is `hold`:
+        accepted and stored, never injected, the agent asks for it. It lands in
+        **HELD**, not QUEUED, and HELD is the only state `RETRIEVED` can be
+        reached from.
+
+        **This state existed and nothing wrote it.** `HELD` was in the schema
+        and in the transition map from the start, three places read it, and no
+        code ever moved a message into it -- so a `delivery: hold` message sat
+        in QUEUED, where `RETRIEVED` is unreachable, and the age bound expired
+        it however faithfully the agent had read it. Measured 2026-09-26.
+        """
         mid = self.receive(hub_id=str(mention.id), sender=mention.sender,
                            body=mention.content, subject=mention.topic,
                            agent=getattr(mention, "agent", "") or "",
@@ -488,6 +500,8 @@ class MessageStore(Queue):
             self.move(mid, EXPIRED, mention.retired, rule="retired")
             self.db.execute("UPDATE messages SET retired_reason=? WHERE id=?",
                             (mention.retired, mid))
+        elif held:
+            self.move(mid, HELD, "delivery: hold — the agent asks for it", rule="delivery")
         elif mention.delivered:
             self.move(mid, QUEUED, "permitted")
             self.record_attempt(mid, delivered=True, detail="already delivered on arrival")
@@ -534,10 +548,20 @@ class MessageStore(Queue):
         return True
 
     def mark_read(self, message_id: int) -> bool:
+        """The agent looked at it. For a HELD message that is the delivery.
+
+        `read` and `delivered` are different facts and stay separate -- but a
+        `delivery: hold` message is never injected, so the agent READING it is
+        the only way it ever reaches the agent. That is what moves HELD to
+        RETRIEVED, and it is why RETRIEVED is not DELIVERED: nothing was put in
+        front of anyone.
+        """
         row = self._find(message_id)
         if row is None:
             return False
         self.db.execute("UPDATE messages SET read_at=? WHERE id=?", (_now(), row["id"]))
+        if row["state"] == HELD:
+            self.move(row["id"], RETRIEVED, "the agent asked for it", rule="delivery")
         return True
 
     def mark_retired(self, message_id: int, reason: str) -> bool:

@@ -539,3 +539,37 @@ def test_a_column_added_to_SCHEMA_reaches_an_EXISTING_database(tmp_path):
     after = {r[1] for r in db.execute("PRAGMA table_info(messages)")}
     db.close()
     assert "sender_fqn" in after, "an existing database must gain the column"
+
+
+def test_a_held_message_reaches_HELD_and_then_RETRIEVED(tmp_path, monkeypatch):
+    """UC-04 fact 2's second half, which could not have passed.
+
+    `HELD` was in the schema and the transition map from the start, three places
+    read it, and **nothing ever wrote it** -- so a `delivery: hold` message sat
+    in QUEUED, from which RETRIEVED is unreachable, and the age bound expired it
+    however faithfully the agent had read it.
+
+    RETRIEVED is not DELIVERED on purpose: nothing was put in front of anyone,
+    the agent came and asked."""
+    from agent_comms.queue import MessageStore, HELD, RETRIEVED, QUEUED
+    from agent_comms.store import Mention
+    q = MessageStore(tmp_path / "comms.db")
+
+    m = Mention(id=8801, sender="test-codex", channel="seat-testing", topic="t",
+                content="held one", timestamp=1758800000, permalink="",
+                agent="bakehouse.agent-eco.fixture-hold")
+    q.append(m, held=True)
+    rid = q._find(8801)["id"]
+    assert q.state_of(rid) == HELD, "a hold agent's mail lands in HELD, not QUEUED"
+
+    # The near-miss: an ordinary message must NOT land in HELD.
+    q.append(Mention(id=8802, sender="test-codex", channel="seat-testing", topic="t",
+                     content="ordinary", timestamp=1758800000, permalink="",
+                     agent="bakehouse.agent-eco.fixture-plain"))
+    assert q.state_of(q._find(8802)["id"]) == QUEUED
+
+    q.mark_read(8801)
+    assert q.state_of(rid) == RETRIEVED, "reading a held message IS its delivery"
+    # And reading an ordinary queued message does not move it.
+    q.mark_read(8802)
+    assert q.state_of(q._find(8802)["id"]) == QUEUED
