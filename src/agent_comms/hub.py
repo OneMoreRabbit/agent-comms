@@ -379,6 +379,26 @@ class Hub:
             if u.get("is_active") and u.get("full_name")
         )
 
+    def in_realm(self, name: str) -> bool:
+        """Does the hub have an account by this name — anywhere in the realm?
+
+        **Existence, not reachability.** `addressable_names()` answers "in the
+        realm AND in this channel", which is the right question for *can a
+        mention from here arrive*. It is the wrong question for *does this
+        account exist*: a cross-project recipient's bot is legitimately not in
+        our channel, and the two failures have different remedies — a missing
+        account is the estate's to mint, an unreachable channel is a
+        subscription to grant.
+
+        Separated 2026-09-26, when refusing unresolvable bots made the
+        existence check fire first and it started refusing real cross-project
+        bots as nonexistent.
+        """
+        users = self._t.call_endpoint(url="users", method="GET")
+        folded = name.strip().casefold()
+        return any(u.get("full_name", "").strip().casefold() == folded
+                   for u in users.get("members", []))
+
     def addressable_names(self) -> list[str]:
         """The seats this seat can reach: in the realm **and** in this channel.
 

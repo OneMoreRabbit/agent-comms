@@ -1023,18 +1023,46 @@ def send(
         # substitute: falling back to the seat's bot would deliver to the seat's
         # default agent while the caller named a different one, which is the
         # same silent-wrong-recipient failure wearing a helpful face.
-        if not hub.addressable(routed.bot):
+        # EXISTENCE, not reachability: a cross-project recipient's bot is
+        # legitimately outside this seat's channel, and `require_reachable`
+        # below is what judges the channel.
+        if not hub.in_realm(routed.bot):
             raise UnknownRecipient(
-                f"'{recipient}' resolves to {routed.fqn}, whose transport derives the "
-                f"hub identity '{routed.bot}' — and the hub has no such account.\n"
+                f"'{recipient}' resolves to {routed.fqn}, whose declared transport "
+                f"names the hub identity '{routed.bot}' — and the hub has no such "
+                f"account.\n"
                 "  Nothing was posted. A message mentioning an account that does not "
                 "exist reaches nobody while reporting success.\n"
-                "  The estate declares per-agent transports in the directory's "
-                "`transports.comms` block; this agent has none, so the name was "
-                "derived from the FQN (project → channel, agent → bot). Either the "
-                "hub identity is missing or the directory must declare the override.")
+                "  The bot comes from the directory's `transports.comms` block for "
+                "this agent, and nothing is derived from the FQN — derivation was "
+                "removed on 2026-09-25 because it named accounts that do not exist. "
+                "So either the hub account is missing, or the directory declares the "
+                "wrong bot for this agent.")
         recipient, channel = routed.bot, channel or routed.channel
     else:
+        # **A human has no FQN; a bot is not an address.**
+        #
+        # The directory could not resolve this name, so there is no FQN to
+        # address. Two very different cases hide behind that:
+        #
+        # - a **human**. Humans are not agents and never will be, so there is
+        #   nothing to resolve and the hub display name IS the address. The
+        #   message carries a `from:` and no `to:`, truthfully.
+        # - a **bot**. A bot is a SEAT's mailbox, not an agent, so addressing
+        #   one asks comms to deliver to a machine rather than to anybody. It
+        #   is refused: the agent on that seat is addressed by its FQN, and if
+        #   the directory does not know it, that is the fact to fix.
+        _, is_human = hub.in_channel(recipient)
+        if not is_human:
+            raise UnknownRecipient(
+                f"'{recipient}' is not an agent the directory can resolve, and it is "
+                f"not a human.\n"
+                "  Nothing was posted. A message is from an agent to an agent; a bot "
+                "is a SEAT's mailbox, not an address, so delivering to one would "
+                "deliver to a machine rather than to anybody.\n"
+                "  Address the agent by its FQN (estate.project.agent). If the "
+                "directory does not know it, it has no announced slot yet — that is "
+                "the thing to fix, not the address to work around.")
         recipient = _resolve_recipient(settings, hub, recipient)
         channel = channel or settings.channel
 
@@ -2492,11 +2520,6 @@ def _state_of(m: "Mention") -> str:
     `retired` is the fact that nobody ever saw it. Reading them the other way
     round is exactly the conflation that made the 1.0.0 store ambiguous.
     """
-    # **The store's own word, when there is one.** Deriving it from the
-    # booleans collapsed nine states into two: `retrieved`, `expired` and
-    # `abandoned` all set `delivered`, so a message given up on after three
-    # attempts read as delivered, and a HELD message read as queued -- hiding
-    # exactly the distinctions UC-04 and UC-05 turn on. Measured 2026-09-26.
     if not m.authorised:
         return "refused"
     # `retired` still wins: it is the FACT that nobody saw it, where `expired`
@@ -2504,6 +2527,11 @@ def _state_of(m: "Mention") -> str:
     # is the conflation that made the 1.0.0 store ambiguous.
     if m.retired:
         return "retired"
+    # **The store's own word, when there is one.** Deriving it from the booleans
+    # below collapsed nine states into two: `retrieved`, `expired` and
+    # `abandoned` all set `delivered`, so a message given up on after three
+    # attempts read as delivered and a HELD message read as queued -- hiding
+    # exactly the distinctions UC-04 and UC-05 turn on. Measured 2026-09-26.
     if getattr(m, "state", ""):
         return m.state
     if m.delivered:

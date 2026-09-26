@@ -286,7 +286,7 @@ def test_the_body_is_never_rewritten(seat):
 
     transport = FakeTransport()
     body = "ask @blocks-android about it, and mail a@b.com — see @**x**"
-    operations.send(body, to="agent-eco-arch", subject="the ask",
+    operations.send(body, to="bakehouse.agent-eco.arch", subject="the ask",
                     transport_factory=lambda c: transport, from_fqn="bakehouse.agent-eco.agent-comms")
     # The prefix is ADDRESSING -- the mention and the envelope marker. What
     # follows it is the sender's text, byte for byte, with nothing scanned,
@@ -299,20 +299,25 @@ def test_the_body_is_never_rewritten(seat):
     # `--from` is required on every message and has no default, so the sender
     # FQN is whatever the caller stated -- never read, never guessed.
     assert envelope_sender(sent) == "bakehouse.agent-eco.agent-comms"
-    assert envelope_from_body(sent) == "", "a bare seat name addresses no agent"
+    assert envelope_from_body(sent) == "bakehouse.agent-eco.arch", \
+        "both ends of the envelope are FQNs"
 
 
-def test_send_to_addresses_by_plain_seat_name(seat):
-    """`--to agent-skeleton`, not `--to @**agent-skeleton**`."""
+def test_send_addresses_an_FQN_and_mentions_the_SEATS_bot(seat):
+    """`--to <FQN>`: the agent is the address, and the mention is the seat's bot.
+
+    The topic names the FQN because that is what `--to` named, and the mention
+    names the BOT because that is the mailbox the message has to reach. Those
+    are two different layers and the message carries both."""
     from agent_comms import operations
     from tests.conftest import FakeTransport
 
     transport = FakeTransport()
-    operations.send("please look", to="agent-skeleton", subject="the ask",
+    operations.send("please look", to="bakehouse.agent-eco.agent-skeleton", subject="the ask",
                     transport_factory=lambda c: transport, from_fqn="bakehouse.agent-eco.agent-comms")
     assert transport.sent[-1]["content"].startswith("@**agent-skeleton** ")
-    assert transport.sent[-1]["topic"] == "agent-skeleton: the ask", (
-        "the topic must name the RECIPIENT — arch naming itself is what failed on blocks"
+    assert transport.sent[-1]["topic"] == "bakehouse.agent-eco.agent-skeleton: the ask", (
+        "the topic names the RECIPIENT — arch naming itself is what failed on blocks"
     )
 
 
@@ -321,7 +326,7 @@ def test_zulip_syntax_in_to_is_accepted_and_normalised(seat):
     from tests.conftest import FakeTransport
 
     transport = FakeTransport()
-    operations.send("hi", to="@**agent-skeleton**", subject="s",
+    operations.send("hi", to="@**bakehouse.agent-eco.agent-skeleton**", subject="s",
                     transport_factory=lambda c: transport, from_fqn="bakehouse.agent-eco.agent-comms")
     assert transport.sent[-1]["content"].startswith("@**agent-skeleton** ")
 
@@ -332,7 +337,7 @@ def test_the_recipient_is_matched_case_insensitively(seat):
     from tests.conftest import FakeTransport
 
     transport = FakeTransport()
-    operations.send("hi", to="Agent-Skeleton", subject="s",
+    operations.send("hi", to="Bakehouse.Agent-Eco.Agent-Skeleton", subject="s",
                     transport_factory=lambda c: transport, from_fqn="bakehouse.agent-eco.agent-comms")
     assert transport.sent[-1]["content"].startswith("@**agent-skeleton** ")
 
@@ -382,27 +387,52 @@ def test_a_seat_outside_this_channel_is_refused(seat):
     nobody, which is indistinguishable from success — so it is refused.
     """
     from agent_comms import operations
-    from agent_comms.operations import UnknownRecipient
+    from agent_comms.errors import ChannelNotReachable
     from tests.conftest import FakeTransport
 
     transport = FakeTransport()
-    with pytest.raises(UnknownRecipient, match="exists on the hub but is not in channel"):
-        operations.send("hi", to="blocks-android", subject="cross-project",
+    # **The refusal moved layer, and improved.** It used to come from the
+    # hub-name lookup as "exists on the hub but is not in channel". Addressing
+    # is by FQN now, so the recipient resolves, its declared transport names the
+    # `blocks` channel, and the CHANNEL gate refuses -- naming the channel and
+    # what this seat can reach instead. Existence and reachability were also
+    # separated on 2026-09-26: this bot exists, and that is not the problem.
+    with pytest.raises(ChannelNotReachable, match="not subscribed to 'blocks'"):
+        operations.send("hi", to="bakehouse.blocks.blocks-android", subject="cross-project",
                         transport_factory=lambda c: transport, from_fqn="bakehouse.agent-eco.agent-comms")
     assert transport.sent == []
 
 
-def test_addressing_ourselves_is_refused(seat):
-    """A seat ignores its own posts, so this is the one mention that cannot land."""
+def test_addressing_an_agent_on_our_own_seat_is_DELIVERY_not_a_refusal(seat):
+    """**The premise inverted on 2026-09-25.** This used to assert that a seat
+    addressing itself was refused, because a seat ignores its own posts.
+
+    Same-seat addressing is now a supported case: an agent may address a sibling
+    on its own seat, the message goes out through their shared bot and comes
+    back, and the envelope says which agent it is for. So addressing an agent on
+    this seat POSTS.
+
+    What is still refused is addressing the seat's BOT by name -- a bot is a
+    seat's mailbox, not an agent, so there is nobody to deliver to."""
     from agent_comms import operations
     from agent_comms.operations import UnknownRecipient
     from tests.conftest import FakeTransport
 
     transport = FakeTransport()
-    with pytest.raises(UnknownRecipient, match="is this seat"):
-        operations.send("hi", to="agent-comms", subject="myself",
-                        transport_factory=lambda c: transport, from_fqn="bakehouse.agent-eco.agent-comms")
-    assert transport.sent == []
+    operations.send("hi", to="bakehouse.agent-eco.agent-comms", subject="myself",
+                    transport_factory=lambda c: transport,
+                    from_fqn="bakehouse.agent-eco.agent-comms")
+    assert transport.sent, "an agent on this seat is a real recipient"
+    from agent_comms.operations import envelope_from_body, envelope_sender
+    body = transport.sent[-1]["content"]
+    assert envelope_sender(body) == "bakehouse.agent-eco.agent-comms"
+    assert envelope_from_body(body) == "bakehouse.agent-eco.agent-comms"
+
+    # The bot name is not an address.
+    with pytest.raises(UnknownRecipient, match="not an agent the directory can resolve"):
+        operations.send("hi", to="agent-eco-agent-comms", subject="myself",
+                        transport_factory=lambda c: FakeTransport(),
+                        from_fqn="bakehouse.agent-eco.agent-comms")
 
 
 def test_an_explicit_topic_still_requires_a_recipient(seat):
@@ -411,7 +441,7 @@ def test_an_explicit_topic_still_requires_a_recipient(seat):
     from tests.conftest import FakeTransport
 
     transport = FakeTransport()
-    operations.send("carrying on", to="agent-skeleton",
+    operations.send("carrying on", to="bakehouse.agent-eco.agent-skeleton",
                     topic="agent-skeleton: an older thread",
                     transport_factory=lambda c: transport, from_fqn="bakehouse.agent-eco.agent-comms")
     assert transport.sent[-1]["topic"] == "agent-skeleton: an older thread"
@@ -424,7 +454,7 @@ def test_to_without_subject_is_refused_rather_than_guessed(seat):
     from tests.conftest import FakeTransport
 
     with pytest.raises(Unaddressed, match="needs a --subject"):
-        operations.send("body", to="agent-skeleton",
+        operations.send("body", to="bakehouse.agent-eco.agent-skeleton",
                         transport_factory=lambda c: FakeTransport(), from_fqn="bakehouse.agent-eco.agent-comms")
 
 
@@ -458,7 +488,7 @@ def test_unreachable_body_mention_warns_but_still_posts(seat):
     """The ArcPlatform finding: `@**orchestrator**` rendered, returned `sent`,
     reached nobody. The check existed and this path never ran it."""
     transport = FakeTransport()  # realm has blocks-android; channel does not
-    posted = operations.send("notes for @**blocks-android** here", to="agent-skeleton",
+    posted = operations.send("notes for @**blocks-android** here", to="bakehouse.agent-eco.agent-skeleton",
                              subject="release", transport_factory=lambda c: transport, from_fqn="bakehouse.agent-eco.agent-comms")
     assert transport.sent, "the message must still be posted — warn, do not refuse"
     assert len(posted.warnings) == 1
@@ -474,7 +504,7 @@ def test_unreachable_body_mention_warns_but_still_posts(seat):
 def test_reachable_body_mention_is_silent(seat):
     """§9's other half: a guard that fires on the normal path is noise."""
     transport = FakeTransport()
-    posted = operations.send("ping @**agent-skeleton** about it", to="agent-skeleton",
+    posted = operations.send("ping @**agent-skeleton** about it", to="bakehouse.agent-eco.agent-skeleton",
                              subject="s", transport_factory=lambda c: transport, from_fqn="bakehouse.agent-eco.agent-comms")
     assert posted.warnings == []
 
@@ -482,7 +512,7 @@ def test_reachable_body_mention_is_silent(seat):
 def test_bare_at_name_in_prose_is_still_prose(seat):
     """The guesswork `send` refuses to do. Only `@**...**` is an address."""
     transport = FakeTransport()
-    posted = operations.send("ask @blocks-android or email a@b.com", to="agent-skeleton",
+    posted = operations.send("ask @blocks-android or email a@b.com", to="bakehouse.agent-eco.agent-skeleton",
                              subject="s", transport_factory=lambda c: transport, from_fqn="bakehouse.agent-eco.agent-comms")
     assert posted.warnings == []
 
@@ -505,7 +535,7 @@ def test_each_unreachable_name_is_named_once(seat):
     """Repeating one name three times is one problem, not three warnings."""
     transport = FakeTransport()
     posted = operations.send("@**blocks-android** @**blocks-android** @**blocks-service**",
-                             to="agent-skeleton", subject="s",
+                             to="bakehouse.agent-eco.agent-skeleton", subject="s",
                              transport_factory=lambda c: transport, from_fqn="bakehouse.agent-eco.agent-comms")
     assert len(posted.warnings) == 2
 
@@ -669,7 +699,7 @@ def test_every_message_states_the_sending_agent(seat):
     from tests.conftest import FakeTransport
 
     with pytest.raises(SenderUnknown) as caught:
-        operations.send("body", to="agent-eco-arch", subject="s",
+        operations.send("body", to="bakehouse.agent-eco.arch", subject="s",
                         transport_factory=lambda c: FakeTransport())
     assert "--from" in str(caught.value)
 

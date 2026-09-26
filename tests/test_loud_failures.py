@@ -257,6 +257,12 @@ def test_doctor_reports_every_check_not_just_the_first(running_daemon, monkeypat
                      # channel this bot is not subscribed to is silent non-delivery
                      # waiting to happen, and doctor is where it is found out.
                      "reachable channels",
+                     # "agents reach this seat" added 2026-09-25 (ansible-platform's
+                     # ask 3): the MIRROR of the check above. That one catches "we
+                     # cannot reach where mail is addressed"; this catches an agent
+                     # assigned here whose transport names another seat's bot, which
+                     # is silent at the sender and visible only here.
+                     "agents reach this seat",
                      "event queue", "deliverable", "directory", "seat build", "daemon",
                      "wake trigger"]
     assert report.ok
@@ -1098,7 +1104,7 @@ def test_a_send_refuses_a_channel_whose_replies_we_could_not_read(seat, monkeypa
     monkeypatch.setattr(operations, "_resolve_recipient", lambda s, h, n: n)
 
     with pytest.raises(ChannelNotReachable) as caught:
-        operations.send("hello", to="orch-arch", subject="x", channel="orchestrator",
+        operations.send("hello", to="bakehouse.orchestrator.arch", subject="x", channel="orchestrator",
                         transport_factory=lambda c: FakeTransport(), from_fqn="bakehouse.agent-eco.agent-comms")
 
     said = str(caught.value)
@@ -1114,7 +1120,7 @@ def test_a_send_to_a_held_channel_is_not_refused(seat, monkeypatch):
     monkeypatch.setattr(Hub, "subscribed_channels",
                         lambda self: frozenset({"agent-eco", "orchestrator"}))
     monkeypatch.setattr(operations, "_resolve_recipient", lambda s, h, n: n)
-    posted = operations.send("hello", to="orch-arch", subject="x", channel="orchestrator",
+    posted = operations.send("hello", to="bakehouse.orchestrator.arch", subject="x", channel="orchestrator",
                              transport_factory=lambda c: FakeTransport(), from_fqn="bakehouse.agent-eco.agent-comms")
     assert posted.response
 
@@ -1519,6 +1525,9 @@ def test_a_derived_bot_the_hub_does_have_is_posted(seat, monkeypatch):
 
     monkeypatch.setattr(Hub, "subscribed_channels", lambda self: frozenset({"agent-eco"}))
     monkeypatch.setattr(Hub, "addressable_names", lambda self: ["test-claude"])
+    # Existence is `in_realm` since 2026-09-26, separated from reachability so a
+    # cross-project bot outside our channel is not called nonexistent.
+    monkeypatch.setattr(Hub, "in_realm", lambda self, n: n == "test-claude")
     monkeypatch.setattr(operations, "_route", lambda s, n, **k: operations.Routed(
         fqn="bakehouse.agent-eco.test-claude", channel="agent-eco",
         bot="test-claude", delivery="inject"))
