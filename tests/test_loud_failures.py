@@ -415,7 +415,7 @@ def test_reply_goes_to_the_mentions_own_topic(seat):
             "timestamp": 1, "stream_id": 7}},
     ]}])
     operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
-    operations.reply(301, "answered", transport_factory=lambda c: transport)
+    operations.reply(301, "answered", transport_factory=lambda c: transport, from_fqn="bakehouse.agent-eco.agent-comms")
     assert transport.sent[-1]["topic"] == "agent-comms: a question"
     assert operations.inbox() == []
 
@@ -1099,7 +1099,7 @@ def test_a_send_refuses_a_channel_whose_replies_we_could_not_read(seat, monkeypa
 
     with pytest.raises(ChannelNotReachable) as caught:
         operations.send("hello", to="orch-arch", subject="x", channel="orchestrator",
-                        transport_factory=lambda c: FakeTransport())
+                        transport_factory=lambda c: FakeTransport(), from_fqn="bakehouse.agent-eco.agent-comms")
 
     said = str(caught.value)
     assert "not subscribed to 'orchestrator'" in said
@@ -1115,7 +1115,7 @@ def test_a_send_to_a_held_channel_is_not_refused(seat, monkeypatch):
                         lambda self: frozenset({"agent-eco", "orchestrator"}))
     monkeypatch.setattr(operations, "_resolve_recipient", lambda s, h, n: n)
     posted = operations.send("hello", to="orch-arch", subject="x", channel="orchestrator",
-                             transport_factory=lambda c: FakeTransport())
+                             transport_factory=lambda c: FakeTransport(), from_fqn="bakehouse.agent-eco.agent-comms")
     assert posted.response
 
 
@@ -1407,7 +1407,7 @@ def test_resolve_prints_the_path_and_sends_nothing(seat, monkeypatch):
     monkeypatch.setattr(R, "directory_address", lambda: "http://d")
     monkeypatch.setattr(operations, "send", lambda *a, **k: sent.append(a))
 
-    out = "\n".join(operations.resolve_name("arch"))
+    out = "\n".join(operations.resolve_name("arch", from_fqn="bakehouse.agent-eco.agent-comms"))
     assert "bakehouse.agent-eco.arch" in out
     # `resolve` tells the truth about what WOULD happen. Since 2026-09-25 that
     # is a refusal for an agent with no declared transport — so it must say so
@@ -1422,7 +1422,7 @@ def test_resolve_says_why_when_it_would_not_send(seat, monkeypatch):
     import agent_comms.resolve as R
 
     monkeypatch.setattr(R, "directory_address", lambda: "")
-    out = "\n".join(operations.resolve_name("nobody"))
+    out = "\n".join(operations.resolve_name("nobody", from_fqn="bakehouse.agent-eco.agent-comms"))
     assert "would send  NO" in out and "unknown" in out
 
 
@@ -1505,7 +1505,7 @@ def test_a_derived_bot_the_hub_does_not_have_is_refused_not_posted(seat, monkeyp
 
     with pytest.raises(UnknownRecipient) as caught:
         operations.send("x", to="bakehouse.agent-eco.test-claude-new001", subject="s",
-                        transport_factory=lambda c: FakeTransport())
+                        transport_factory=lambda c: FakeTransport(), from_fqn="bakehouse.agent-eco.agent-comms")
 
     said = str(caught.value)
     assert "test-claude-new001" in said and "no such account" in said
@@ -1526,7 +1526,7 @@ def test_a_derived_bot_the_hub_does_have_is_posted(seat, monkeypatch):
     monkeypatch.setattr(Hub, "send", lambda self, c, t, b: posted.append((c, t)) or {"id": 1})
 
     operations.send("x", to="bakehouse.agent-eco.test-claude", subject="s",
-                    transport_factory=lambda c: FakeTransport())
+                    transport_factory=lambda c: FakeTransport(), from_fqn="bakehouse.agent-eco.agent-comms")
     assert posted and posted[0][0] == "agent-eco"
 
 

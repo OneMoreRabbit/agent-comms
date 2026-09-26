@@ -315,11 +315,12 @@ def preflight(
     # a check that fires every time and detects nothing (constitution §9).
     # The need asks for the RESOLVED transport, and resolution is where it is.
     from .resolve import Resolver
-    me = own_fqn(settings)
     resolver = Resolver(local_agents=assigned)
     resolved, unreadable = {}, []
     for fqn in sorted(assigned):
-        answer = resolver.resolve(fqn, caller=me)
+        # Each of our own agents asks about itself: a self-lookup needs no
+        # stated sender, and there is no seat identity to offer.
+        answer = resolver.resolve(fqn, caller=fqn)
         if answer.success:
             resolved[fqn] = {"transports": answer.transports}
         else:
@@ -610,43 +611,28 @@ class SenderUnknown(CommsError):
     exit_code = 1
 
 
-def own_fqn(settings: Settings, explicit: str = "") -> str:
-    """The FQN this seat sends AS. Read, or stated by the caller -- never built.
+def sending_agent(explicit: str) -> str:
+    """The FQN of the agent sending a message. STATED, never supplied.
 
-    Until 2026-09-26 this was `f"bakehouse.{project}.{seat}"` in seven places:
-    an FQN assembled from a seat name, with the estate hardcoded. **A seat has
-    no FQN** -- the model is channel↔seat, bot↔seat, FQN↔agent -- so there was
-    nothing for that template to be right about. It only looked right because
-    `agent-eco/test-claude` happens to serve an agent called
-    `bakehouse.agent-eco.test-claude`.
+    **One rule for every message: `--from` is required and has no default.**
+    A message is from an agent to an agent; the seat is only the delivery
+    mechanism, mapped to a bot on the hub. comms runs on the seat, so it cannot
+    know which of the seat's agents invoked it — and a seat has no FQN of its
+    own to fall back on.
 
-    Order: what the caller stated, then the one agent this seat serves. With
-    several agents and nothing stated, it REFUSES -- the sending agent is a
-    fact this seat does not hold.
+    Earlier versions read "the one agent this seat serves" when there was only
+    one. That is correct exactly while a seat serves one agent and silently
+    wrong the moment it serves two, which is the shape the estate is moving to.
+    One rule that always applies beats one that usually does.
     """
-    if explicit.strip():
-        return explicit.strip()
-    if settings.identity.fqn:
-        return settings.identity.fqn
-
-    # **Two different unknowns, and only one is a refusal.**
-    #
-    # A seat that has never synced holds no agent set at all, so it cannot
-    # state a sender -- and refusing there would stop a fresh container from
-    # sending its first message, which is the least-exercised path in the
-    # estate. It sends without a `from:`, exactly as every pre-envelope seat
-    # does, and `doctor` reports the unread identity.
-    #
-    # A seat WITH a set and several agents in it is different: the fact exists
-    # and comms simply cannot pick. Choosing one would invent an identity, so
-    # that one refuses and asks.
-    if not settings.identity.declared.known:
-        return ""
-    raise SenderUnknown(
-        "this seat serves more than one agent, so comms cannot tell which one "
-        "is sending. Name it: --from <estate.project.agent>. "
-        f"(assignments say: {settings.identity.declared.source})"
-    )
+    fqn = (explicit or "").strip()
+    if not fqn:
+        raise SenderUnknown(
+            "every message states the agent it is from: --from "
+            "<estate.project.agent>. A message is from an agent to an agent, "
+            "and comms cannot tell which agent on this seat is asking."
+        )
+    return fqn
 
 
 def why_refused(mention, directory: Directory, state_dir,
@@ -1023,7 +1009,7 @@ def send(
     # the same name in the same second. Found by running UC-02, not by reading
     # the code — a suite that cannot fail on an unwired component is not
     # evidence about wiring.
-    routed = _route(settings, recipient)
+    routed = _route(settings, recipient, caller=sending_agent(from_fqn or ""))
     if routed is not None:
         # **The derived bot must be an account the hub actually has.**
         # R15 derives `bot` from the FQN's agent segment, which assumes one hub
@@ -1058,7 +1044,7 @@ def send(
     response = hub.send(channel, topic,
                         addressed(recipient, content,
                                   to_fqn=routed.fqn if routed is not None else "",
-                                  from_fqn=own_fqn(settings, from_fqn or "")))
+                                  from_fqn=sending_agent(from_fqn or "")))
     return Posted(response=response, warnings=warnings)
 
 
@@ -1072,7 +1058,7 @@ class Routed:
     delivery: str
 
 
-def _route(settings: Settings, name: str, **kw):
+def _route(settings: Settings, name: str, caller: str = "", **kw):
     """Ask the directory where a name goes. `None` means 'not an estate name'.
 
     Three things happen here that used not to happen at all:
@@ -1095,9 +1081,11 @@ def _route(settings: Settings, name: str, **kw):
     from .delivery import NotDeliverable, permitted_to_send, plan, transport_for
     from .resolve import Resolver
 
-    me = own_fqn(settings)
+    # The caller is the SENDING AGENT, stated by --from. The directory decides
+    # permissions per agent, so telling it the wrong caller gets the wrong
+    # answer -- and there is no seat-level identity to offer instead.
     answer = Resolver(local_agents=config_sync.agent_set(settings.state_dir)).resolve(
-        name, caller=me)
+        name, caller=caller)
 
     if not answer.success:
         if answer.status == "not-permitted":
@@ -1221,9 +1209,8 @@ def _directory_hint(name: str, **kw) -> str:
     try:
         from .resolve import Resolver
         settings = load_settings(**kw)
-        me = own_fqn(settings)
         answer = Resolver(
-            local_agents=config_sync.agent_set(settings.state_dir)).resolve(name, caller=me)
+            local_agents=config_sync.agent_set(settings.state_dir)).resolve(name, caller=name)
     except Exception:                                    # noqa: BLE001 — a hint
         return ""
     if answer.near_misses:
@@ -1351,7 +1338,7 @@ def reply(
     result = hub.send(channel, target.topic,
                       addressed(target.sender, content,
                                 to_fqn=getattr(target, "sender_fqn", "") or "",
-                                from_fqn=own_fqn(settings, from_fqn or "")))
+                                from_fqn=sending_agent(from_fqn or "")))
     store.mark_read(message_id)
     return Posted(response=result, warnings=warnings)
 
@@ -2583,7 +2570,7 @@ def trace(message_id: int, **kw) -> list[str]:
     return lines
 
 
-def resolve_name(name: str, **kw) -> list[str]:
+def resolve_name(name: str, from_fqn: str = "", **kw) -> list[str]:
     """`comms resolve <name>` — what would this address resolve to, and WHY.
 
     **The command that ends arguments.** It prints the resolution path, the
@@ -2596,7 +2583,10 @@ def resolve_name(name: str, **kw) -> list[str]:
     from .resolve import Resolver
 
     settings = load_settings(**kw)
-    me = own_fqn(settings)
+    # **`resolve` states its agent too.** It prints a permission verdict, and
+    # the directory decides permissions PER CALLER -- so asking as the wrong
+    # agent prints the wrong verdict, confidently. Same rule as a send.
+    me = sending_agent(from_fqn or "")
     answer = Resolver(local_agents=config_sync.agent_set(settings.state_dir)).resolve(
         name, caller=me)
 

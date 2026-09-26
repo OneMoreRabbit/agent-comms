@@ -126,9 +126,10 @@ def show(message_id: int) -> None:
 @main.command()
 @click.argument("message_id", type=int)
 @click.argument("content")
-def reply(message_id: int, content: str) -> None:
+@click.option("--from", "from_fqn", required=True, help="The FQN of the AGENT sending this — estate.project.agent. Required: a message is from an agent to an agent, and the seat is only the delivery mechanism, so comms cannot supply it.")
+def reply(message_id: int, content: str, from_fqn: str) -> None:
     """Reply in the mention's own topic."""
-    posted = operations.reply(message_id, content)
+    posted = operations.reply(message_id, content, from_fqn=from_fqn)
     _say_sent(posted, "replied")
 
 
@@ -151,8 +152,10 @@ def _say_sent(posted, word: str = "sent") -> None:
 @click.option("--subject", default=None, help="Subject; the topic becomes '<to>: <subject>'.")
 @click.option("--topic", default=None,
               help="Continue an existing topic instead of starting one. Still needs --to.")
+@click.option("--from", "from_fqn", required=True, help="The FQN of the AGENT sending this — estate.project.agent. Required: a message is from an agent to an agent, and the seat is only the delivery mechanism, so comms cannot supply it.")
 @click.argument("content")
-def send(to: str, subject: str | None, topic: str | None, content: str) -> None:
+def send(to: str, subject: str | None, topic: str | None, from_fqn: str,
+         content: str) -> None:
     """Post to this seat's project channel, addressed to a named seat.
 
     You name the seat; this client spells the address:
@@ -170,7 +173,8 @@ def send(to: str, subject: str | None, topic: str | None, content: str) -> None:
     The name in --to is checked against the hub first, and a seat that does not
     exist or is not in this channel is refused rather than posted to.
     """
-    posted = operations.send(content, to=to, subject=subject, topic=topic)
+    posted = operations.send(content, to=to, subject=subject, topic=topic,
+                             from_fqn=from_fqn)
     _say_sent(posted)
 
 
@@ -396,9 +400,10 @@ def trace(message_id: int) -> None:
 
 @main.command("resolve")
 @click.argument("name")
-def resolve_cmd(name: str) -> None:
+@click.option("--from", "from_fqn", required=True, help="The FQN of the AGENT asking — estate.project.agent. Required: the permission verdict depends on who is asking, so asking as the wrong agent prints the wrong answer.")
+def resolve_cmd(name: str, from_fqn: str) -> None:
     """What would this address resolve to, and why. Sends nothing."""
-    for line in operations.resolve_name(name):
+    for line in operations.resolve_name(name, from_fqn=from_fqn):
         click.echo(line)
 
 
