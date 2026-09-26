@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS messages (
     hub_id      TEXT    UNIQUE,
     sender      TEXT    NOT NULL,
     agent       TEXT    NOT NULL DEFAULT '',
+    sender_fqn  TEXT    NOT NULL DEFAULT '',
     subject     TEXT    NOT NULL DEFAULT '',
     body        TEXT    NOT NULL,
     received_at TEXT    NOT NULL,
@@ -147,6 +148,18 @@ class Queue:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._open() as db:
             db.executescript(SCHEMA)
+            # **A column added to SCHEMA does not reach an existing database.**
+            # `CREATE TABLE IF NOT EXISTS` is a no-op once the table is there,
+            # so a new column exists on a fresh seat and is absent on every
+            # deployed one -- and the code reading it would see a shape that
+            # only some seats have. Measured: `sender_fqn` was added to SCHEMA
+            # and every seat with an existing comms.db carried on without it,
+            # so a reply's `to:` came back empty on exactly the seats that had
+            # been running longest.
+            held = {r[1] for r in db.execute("PRAGMA table_info(messages)")}
+            for column, ddl in (("sender_fqn", "TEXT NOT NULL DEFAULT ''"),):
+                if column not in held:
+                    db.execute(f"ALTER TABLE messages ADD COLUMN {column} {ddl}")
 
     def _open(self) -> sqlite3.Connection:
         """A FRESH connection, per operation. **Never a long-lived one.**
@@ -181,7 +194,8 @@ class Queue:
     # -- writing ------------------------------------------------------------
 
     def receive(self, *, hub_id: str, sender: str, body: str, agent: str = "",
-                subject: str = "", permalink: str = "", received_at: str | None = None) -> int:
+                sender_fqn: str = "", subject: str = "", permalink: str = "",
+                received_at: str | None = None) -> int:
         """Store one message. Idempotent on `hub_id`.
 
         `seq` is monotonic and local. It is a fact about the order WE saw things
@@ -190,9 +204,10 @@ class Queue:
         now = received_at or _now()
         cur = self.db.execute(
             "INSERT OR IGNORE INTO messages"
-            " (seq, hub_id, sender, agent, subject, body, received_at, state, permalink)"
-            " VALUES ((SELECT COALESCE(MAX(seq),0)+1 FROM messages),?,?,?,?,?,?,?,?)",
-            (hub_id, sender, agent, subject, body, now, RECEIVED, permalink))
+            " (seq, hub_id, sender, agent, sender_fqn, subject, body, received_at,"
+            "  state, permalink)"
+            " VALUES ((SELECT COALESCE(MAX(seq),0)+1 FROM messages),?,?,?,?,?,?,?,?,?)",
+            (hub_id, sender, agent, sender_fqn, subject, body, now, RECEIVED, permalink))
         if cur.rowcount == 0:
             return int(self.db.execute(
                 "SELECT id FROM messages WHERE hub_id=?", (hub_id,)).fetchone()["id"])
@@ -437,6 +452,11 @@ class MessageStore(Queue):
             content=row["body"], timestamp=int(row["received_at_epoch"] or 0),
             permalink=row["permalink"], read=bool(row["read_at"]),
             agent=row["agent"] or "",
+            # **Persisted, because a reply needs it.** Computed on arrival and
+            # not stored, it was lost the moment anything read from the store:
+            # a reply's `to:` is the FQN the original sender declared, and it
+            # came back empty. Measured on the seats 2026-09-26.
+            sender_fqn=(row["sender_fqn"] if "sender_fqn" in row.keys() else "") or "",
             reason=row["reason"] or "mentioned",
             delivered=state in (DELIVERED, RETRIEVED, REFUSED, EXPIRED, ABANDONED),
             attempts=int(row["attempts"]),
@@ -452,6 +472,7 @@ class MessageStore(Queue):
         mid = self.receive(hub_id=str(mention.id), sender=mention.sender,
                            body=mention.content, subject=mention.topic,
                            agent=getattr(mention, "agent", "") or "",
+                           sender_fqn=getattr(mention, "sender_fqn", "") or "",
                            permalink=mention.permalink,
                            received_at=datetime.fromtimestamp(
                                mention.timestamp, tz=timezone.utc).isoformat(timespec="seconds"))

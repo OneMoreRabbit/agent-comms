@@ -488,3 +488,54 @@ def test_the_reason_line_names_which_agent_it_was_for():
     # And the near-miss: an unnamed line reads the same whoever it was for,
     # which is the property gate 9 forbids.
     assert reason != "addressed to an agent on this seat"
+
+
+def test_the_senders_fqn_survives_the_store(tmp_path):
+    """A reply's `to:` is the FQN the original sender declared, so losing it in
+    the store loses the address.
+
+    Measured on the seats 2026-09-26: `sender_fqn` was computed on arrival and
+    never persisted, so anything reading from the store got an empty value and
+    a reply went out with `from` and no `to`."""
+    from agent_comms.queue import MessageStore
+    from agent_comms.store import Mention
+    q = MessageStore(tmp_path / "comms.db")
+    q.append(Mention(id=7001, sender="test-codex", channel="seat-testing", topic="t",
+                     content="x", timestamp=1758800000, permalink="",
+                     sender_fqn="bakehouse.agent-eco.test-codex"))
+    assert q.all()[-1].sender_fqn == "bakehouse.agent-eco.test-codex"
+
+
+def test_a_column_added_to_SCHEMA_reaches_an_EXISTING_database(tmp_path):
+    """`CREATE TABLE IF NOT EXISTS` is a no-op once the table is there, so a
+    column added to SCHEMA exists on a fresh seat and is absent on every
+    deployed one. The near-miss is a database created BEFORE the column: it
+    must gain it, or the same code sees two different shapes depending on how
+    long the seat has been running."""
+    import sqlite3
+    from agent_comms.queue import MessageStore
+
+    path = tmp_path / "old.db"
+    # A store as it existed before the column was added.
+    db = sqlite3.connect(path)
+    db.executescript("""
+        CREATE TABLE messages (
+            id INTEGER PRIMARY KEY, seq INTEGER NOT NULL, hub_id TEXT UNIQUE,
+            sender TEXT NOT NULL, agent TEXT NOT NULL DEFAULT '',
+            subject TEXT NOT NULL DEFAULT '', body TEXT NOT NULL,
+            received_at TEXT NOT NULL, state TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0, permalink TEXT NOT NULL DEFAULT '',
+            channel TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT 'mentioned',
+            read_at TEXT, retired_reason TEXT NOT NULL DEFAULT '',
+            received_at_epoch INTEGER NOT NULL DEFAULT 0);
+    """)
+    db.commit()
+    before = {r[1] for r in db.execute("PRAGMA table_info(messages)")}
+    db.close()
+    assert "sender_fqn" not in before
+
+    MessageStore(path)          # opening it must migrate
+    db = sqlite3.connect(path)
+    after = {r[1] for r in db.execute("PRAGMA table_info(messages)")}
+    db.close()
+    assert "sender_fqn" in after, "an existing database must gain the column"
