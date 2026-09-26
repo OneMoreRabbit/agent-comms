@@ -2492,10 +2492,20 @@ def _state_of(m: "Mention") -> str:
     `retired` is the fact that nobody ever saw it. Reading them the other way
     round is exactly the conflation that made the 1.0.0 store ambiguous.
     """
+    # **The store's own word, when there is one.** Deriving it from the
+    # booleans collapsed nine states into two: `retrieved`, `expired` and
+    # `abandoned` all set `delivered`, so a message given up on after three
+    # attempts read as delivered, and a HELD message read as queued -- hiding
+    # exactly the distinctions UC-04 and UC-05 turn on. Measured 2026-09-26.
     if not m.authorised:
         return "refused"
+    # `retired` still wins: it is the FACT that nobody saw it, where `expired`
+    # is only the mechanism that got it there. Reading them the other way round
+    # is the conflation that made the 1.0.0 store ambiguous.
     if m.retired:
         return "retired"
+    if getattr(m, "state", ""):
+        return m.state
     if m.delivered:
         return "delivered"
     return "queued"

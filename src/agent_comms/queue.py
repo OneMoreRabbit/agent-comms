@@ -458,6 +458,7 @@ class MessageStore(Queue):
             # came back empty. Measured on the seats 2026-09-26.
             sender_fqn=(row["sender_fqn"] if "sender_fqn" in row.keys() else "") or "",
             reason=row["reason"] or "mentioned",
+            state=state,
             delivered=state in (DELIVERED, RETRIEVED, REFUSED, EXPIRED, ABANDONED),
             attempts=int(row["attempts"]),
             authorised=state != REFUSED,

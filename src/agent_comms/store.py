@@ -51,6 +51,15 @@ class Mention:
     #: name, which is a migration, not a design: it is marked as such at every
     #: point it is used.
     sender_fqn: str = ""
+    #: The store's OWN state word, when the record came from the SQLite store.
+    #: Empty for a 1.0-shaped record that never had one.
+    #:
+    #: It exists because the display word used to be DERIVED from the booleans
+    #: below, which collapsed nine states into two: `retrieved`, `expired` and
+    #: **`abandoned`** all set `delivered`, so `comms trace` showed "delivered"
+    #: for a message that had been given up on after three attempts. A right
+    #: answer and a wrong answer must not read alike (write-time gate 9).
+    state: str = ""
     #: Why this message was stored — mention, topic, or direct message. Shown in
     #: the inbox so a seat can tell an explicit summons from a topic it owns.
     reason: str = "mentioned"

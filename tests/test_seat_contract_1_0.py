@@ -722,3 +722,41 @@ def test_trace_says_when_something_is_not_recorded(seat):
     assert "stored and never delivered" in out
     assert "events.log" in out, "must point at where the rest of the history lives"
     assert "no message" in "\n".join(operations.trace(999))
+
+
+def test_abandoned_and_retrieved_do_not_read_as_delivered(tmp_path):
+    """Write-time gate 9, and it hid two cases' verdicts.
+
+    The display word was DERIVED from the 1.0-shaped booleans, where
+    `delivered` is true for DELIVERED, RETRIEVED, REFUSED, EXPIRED **and
+    ABANDONED**. So nine honest states collapsed into two words: a message given
+    up on after three attempts read as `delivered`, and a HELD message read as
+    `queued` -- hiding exactly what UC-04 fact 2 and UC-05 fact 1 turn on.
+
+    Measured 2026-09-26: `comms trace` on a real held message said `queued` on
+    arrival and `delivered` after retrieval, while the store said HELD then
+    RETRIEVED. The store was right both times."""
+    from agent_comms.operations import _state_of
+    from agent_comms.queue import MessageStore, ABANDONED, HELD, RETRIEVED
+    from agent_comms.store import Mention
+
+    q = MessageStore(tmp_path / "comms.db", max_attempts=1)
+    q.append(Mention(id=1, sender="s", channel="c", topic="t", content="x",
+                     timestamp=1758800000, permalink="",
+                     agent="bakehouse.agent-eco.fixture-hold"), held=True)
+    held = q.all()[-1]
+    assert held.state == HELD
+    assert _state_of(held) == "held", "a held message must not read as queued"
+
+    q.mark_read(1)
+    got = q.all()[-1]
+    assert got.state == RETRIEVED
+    assert _state_of(got) == "retrieved", "retrieved is not delivered"
+
+    q.append(Mention(id=2, sender="s", channel="c", topic="t", content="y",
+                     timestamp=1758800000, permalink=""))
+    q.attempt_by_hub_id(2, "no-session")
+    gone = [m for m in q.all() if m.id == 2][-1]
+    assert gone.state == ABANDONED
+    assert _state_of(gone) == "abandoned", \
+        "a message given up on must never read as delivered"
