@@ -1107,7 +1107,6 @@ def _route(settings: Settings, name: str, caller: str = "", **kw):
     class.
     """
     from .delivery import NotDeliverable, permitted_to_send, plan, transport_for
-    from .directory import entry_matches_fqn
     from .resolve import Resolver
 
     # The caller is the SENDING AGENT, stated by --from. The directory decides
@@ -1135,31 +1134,23 @@ def _route(settings: Settings, name: str, caller: str = "", **kw):
     if not allowed:
         raise UnknownRecipient(f"'{name}' will not be sent to: {why}")
 
-    # **The recipient's own blocked list, at the SENDER.**
+    # **A permission verdict is READ, never computed here.**
     #
-    # The resolution answer carries `permissions.comms.blocked` for the agent
-    # being addressed, so the sender can see that it is refused before posting
-    # anything. It used not to look: `comms resolve` said "would send YES" for
-    # an agent whose blocked list named the caller, the message went to the hub,
-    # and the RECEIVER refused it. The message still reached the channel.
+    # 733e717 added a matcher on this path: it took the recipient's
+    # `permissions.comms.blocked` out of the resolution answer and matched the
+    # caller's FQN against the entries, scoping short entries by parsing the
+    # project out of the FQN. That is pattern-matching an identifier to reach a
+    # permission decision, and the operator has ruled against it repeatedly.
+    # Reverted 2026-09-26.
     #
-    # Found by the discovery acceptance leg (2026-09-26): the directory excluded
-    # this exact recipient from the caller's addressable set while comms said it
-    # would send. The directory was right. Refusing here makes "nothing posts"
-    # true of a blocked send, and makes the sender's own answer match the
-    # directory's.
+    # The decision is the directory's and it already makes it: its own
+    # `/v0/addressable?from=<caller>` EXCLUDES a recipient whose blocked list
+    # names that caller. `POST /v0/resolve` for the same pair answers
+    # `resolved` — so two directory surfaces disagree, and the fix is there,
+    # not a matcher here. Raised with a measurement rather than worked around.
     #
-    # This does NOT replace the receiving-end check. A sender on an older build
-    # still posts, and the receiver still refuses — enforcement stays where it
-    # cannot be skipped.
-    blocked = ((answer.permissions or {}).get("comms") or {}).get("blocked") or []
-    if caller and any(entry_matches_fqn(str(b), caller) for b in blocked):
-        raise UnknownRecipient(
-            f"'{name}' does not accept messages from {caller}: it is on that agent's "
-            f"blocked list, which the estate authors at the directory "
-            f"(permissions.comms.blocked).\n"
-            "  Nothing was posted. The recipient would have refused it on arrival, so "
-            "posting would put a message in the channel that nobody may read.")
+    # `not-permitted` is the verdict comms consumes, and it is handled above
+    # where the answer is read. Nothing else is inferred.
 
     p = plan(answer)
     try:
