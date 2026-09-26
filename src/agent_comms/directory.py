@@ -60,7 +60,7 @@ def short_name(name: str) -> str:
     `arch-shadow`, and `bakehouse.arc-web.arch` must not match
     `bakehouse.labs.arch`.
     """
-    return name.strip().casefold().rsplit(".", 1)[-1]
+    return name.strip().casefold().rsplit(".", 1)[-1]  # gate-exempt: KNOWN DEBT, not accepted. Decomposes an FQN to match the SHORT names the estate writes in comms.yml partners/blocked. It is the seat-level permission matcher, and the answer is that comms should read a VERDICT instead: the directory already evaluates permission per caller (its /v0/addressable?from= excludes a blocked pair). Tracked with the finding that /v0/resolve answers `resolved` for a pair /v0/addressable excludes -- when resolve answers not-permitted, this whole matcher goes
 
 
 def entry_matches_fqn(entry: str, fqn: str, own_project: str = "") -> bool:
@@ -98,7 +98,7 @@ def entry_matches_fqn(entry: str, fqn: str, own_project: str = "") -> bool:
         # before, rather than refuse mail over a fact we simply lack -- and the
         # loader supplies it on every real path.
         return True
-    parts = target.split(".")
+    parts = target.split(".")  # gate-exempt: KNOWN DEBT, not accepted. Decomposes an FQN to match the SHORT names the estate writes in comms.yml partners/blocked. It is the seat-level permission matcher, and the answer is that comms should read a VERDICT instead: the directory already evaluates permission per caller (its /v0/addressable?from= excludes a blocked pair). Tracked with the finding that /v0/resolve answers `resolved` for a pair /v0/addressable excludes -- when resolve answers not-permitted, this whole matcher goes
     return len(parts) < 3 or parts[1] == own_project.strip().casefold()
 
 
@@ -109,7 +109,7 @@ def same_project(a: str, b: str) -> bool:
     short name in a partner list means. An alias never spans a project
     (estate-addressing-model §7), so neither may a permission.
     """
-    parts_a, parts_b = a.strip().casefold().split("."), b.strip().casefold().split(".")
+    parts_a, parts_b = a.strip().casefold().split("."), b.strip().casefold().split(".")  # gate-exempt: KNOWN DEBT, not accepted. Decomposes an FQN to match the SHORT names the estate writes in comms.yml partners/blocked. It is the seat-level permission matcher, and the answer is that comms should read a VERDICT instead: the directory already evaluates permission per caller (its /v0/addressable?from= excludes a blocked pair). Tracked with the finding that /v0/resolve answers `resolved` for a pair /v0/addressable excludes -- when resolve answers not-permitted, this whole matcher goes
     if len(parts_a) < 3 or len(parts_b) < 3:
         return True
     return parts_a[:2] == parts_b[:2]
@@ -152,7 +152,7 @@ class Directory:
         # segment is the agent and `same_project` means something; for a
         # display name there is no project to compare and the whole string is
         # all there is.
-        is_fqn = folded.count(".") == 2 and all(folded.split("."))
+        is_fqn = folded.count(".") == 2 and all(folded.split("."))  # gate-exempt: SHAPE VALIDATION only — asks whether a string is FQN-shaped, and infers no fact from the parts
 
         # `blocked` wins over everything, including an explicit allow. It is the
         # estate's stop button and must not be argued with by ordering rules.

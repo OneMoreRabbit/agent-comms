@@ -837,7 +837,7 @@ def addressed_agent(topic: str, serves: Collection[str] = (), body: str = "") ->
     prefix = (topic or "").split(":", 1)[0].strip()
     if not prefix or any(c.isspace() for c in prefix):
         return ""
-    parts = prefix.split(".")
+    parts = prefix.split(".")  # gate-exempt: SHAPE VALIDATION only — is this topic prefix FQN-shaped; the value itself is then matched WHOLE against the served set
     if len(parts) != 3 or not all(parts):
         return ""
     return prefix if prefix in set(serves) else ""
@@ -1267,8 +1267,8 @@ def _directory_hint(name: str, **kw) -> str:
         # that explains something the reader did not do is a hint they stop
         # reading.
         tail = name.strip().casefold()
-        projects = {m.split(".")[1] for m in answer.near_misses
-                    if m.count(".") >= 2 and m.rsplit(".", 1)[-1].casefold() == tail}
+        projects = {m.split(".")[1] for m in answer.near_misses  # gate-exempt: a HINT in a refusal message, not a decision. It groups near-misses by project so a person reading 'did you mean' sees them ordered; nothing branches on it
+                    if m.count(".") >= 2 and m.rsplit(".", 1)[-1].casefold() == tail}  # gate-exempt: a HINT in a refusal message, not a decision. It groups near-misses by project so a person reading 'did you mean' sees them ordered; nothing branches on it
         if len(projects) > 1:
             hint += ("\n  (A bare role like this is never authored as an alias — it "
                      "exists in several projects, so which one is meant depends on "

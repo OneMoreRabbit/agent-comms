@@ -204,3 +204,32 @@ def test_gate_1a_no_fqn_channel_or_bot_is_CONSTRUCTED():
             line = text.splitlines()[lineno - 1]
             hits.append((path, lineno, line))
     _report(hits, "1a (an identity assembled from parts -- read it from the directory)")
+
+
+# -- gate 1b: an identity is not TAKEN APART either ---------------------------
+
+#: Splitting an identifier to get at one of its parts. `split`/`rsplit` on a
+#: name, then indexing — `fqn.split(".")[1]` to reach the project,
+#: `name.rsplit(".", 1)[-1]` to reach the agent.
+_DECOMPOSE = re.compile(r"\.(?:r?split|partition|rpartition)\s*\(\s*['\"][.\-/]['\"]")
+
+
+def test_gate_1b_no_addressing_value_is_TAKEN_APART():
+    """Gate 1a catches an identity ASSEMBLED from parts. This catches one PULLED
+    APART, which is the same fault from the other end and slipped past 1a.
+
+    **Measured 2026-09-26.** A permission check took the recipient's blocked
+    list, matched the caller's FQN against short entries, and scoped them by
+    `answer.canonical_id.split(".")[1]` to reach the project. Gate 1a passed it
+    clean: nothing was constructed. The operator caught it, having ruled against
+    exactly this more than once, and the code was reverted -- the directory
+    already publishes the verdict, so nothing needed deriving at all.
+
+    A decomposition is sometimes right: validating that a string has the FQN
+    SHAPE reads its structure without inferring a fact from it. Those carry
+    `gate-exempt:` with the reason, so the difference is stated rather than
+    assumed. What is never right is taking a part out in order to decide
+    something -- that is a verdict computed from a name.
+    """
+    hits = [(p, n, l) for p, n, l in _live(SRC) if _DECOMPOSE.search(l)]
+    _report(hits, "1b (an addressing value taken apart — read the verdict instead)")

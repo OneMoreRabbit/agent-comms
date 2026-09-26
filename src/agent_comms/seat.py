@@ -238,7 +238,7 @@ def _major(contract: str) -> int | None:
     major 1, and `"2.0-draft"` must read as 2 — that is the spelling a seat
     reports while a contract is published but not yet tagged.
     """
-    head = contract.strip().split(".", 1)[0]
+    head = contract.strip().split(".", 1)[0]  # gate-exempt: a CONTRACT VERSION, not an addressing value. Reading a version's major is not deriving an identity
     digits = ""
     for ch in head:
         if not ch.isdigit():
