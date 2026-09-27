@@ -1096,7 +1096,7 @@ def send(
             # from `resolve` and a dead end from `send`: two surfaces, one
             # directory, different amounts of help at the moment it is needed.
             # Measured on UC-02 step 4 (`--to arch`).
-            hint = _directory_hint(recipient)
+            hint = _directory_hint(recipient, caller=sending_agent(from_fqn or ""))
             raise UnknownRecipient(
                 f"'{recipient}' is not an agent the directory can resolve, and it is "
                 f"not a human.\n"
@@ -1107,7 +1107,8 @@ def send(
                 "directory does not know it, it has no announced slot yet — that is "
                 "the thing to fix, not the address to work around."
                 + (f"\n  {hint}" if hint else ""))
-        recipient = _resolve_recipient(settings, hub, recipient)
+        recipient = _resolve_recipient(settings, hub, recipient,
+                                       caller=sending_agent(from_fqn or ""))
         channel = channel or settings.channel
 
     require_reachable(hub, channel)
@@ -1235,7 +1236,7 @@ def require_reachable(hub: Hub, channel: str) -> None:
     )
 
 
-def _resolve_recipient(settings: Settings, hub: Hub, name: str) -> str:
+def _resolve_recipient(settings: Settings, hub: Hub, name: str, caller: str = "") -> str:
     """Return the recipient as Zulip spells it, or refuse and say why.
 
     Matched case-insensitively so a seat need not know the hub's capitalisation,
@@ -1280,7 +1281,7 @@ def _resolve_recipient(settings: Settings, hub: Hub, name: str) -> str:
     # cause is worse than a bare refusal, because it is actionable in the wrong
     # direction. Ask the directory, and if it has something to say, say that
     # instead.
-    hint = _directory_hint(name)
+    hint = _directory_hint(name, caller=caller)
     if hint:
         raise UnknownRecipient(hint + f"\n  Seats reachable from here: {others}.")
     raise UnknownRecipient(
@@ -1289,18 +1290,27 @@ def _resolve_recipient(settings: Settings, hub: Hub, name: str) -> str:
     )
 
 
-def _directory_hint(name: str, **kw) -> str:
+def _directory_hint(name: str, caller: str = "", **kw) -> str:
     """What the directory says about a name `send` could not place, or "".
 
     This is the same answer `comms resolve` gives, brought to the place a
     person actually hits the problem. Best-effort: a directory that cannot be
     reached costs the hint, never the refusal.
+
+    **`caller` is the SENDING AGENT, and it is not optional in effect.**
+    Near-misses are caller-relative — the caller's own project comes first
+    (UC-08 fact 2) — so the directory answers a nonsense caller with an empty
+    set. This function used to pass `caller=name`, the TARGET, which is never a
+    real caller: `comms resolve --from <me> arch` listed five candidates and
+    `comms send --to arch` got none, from the same directory, in the same
+    second. Measured on test-claude 2026-09-27.
     """
     try:
         from .resolve import Resolver
         settings = load_settings(**kw)
         answer = Resolver(
-            local_agents=config_sync.agent_set(settings.state_dir)).resolve(name, caller=name)
+            local_agents=config_sync.agent_set(settings.state_dir)).resolve(
+                name, caller=caller or name)
     except Exception:                                    # noqa: BLE001 — a hint
         return ""
     if answer.near_misses:

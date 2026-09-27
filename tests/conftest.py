@@ -216,6 +216,11 @@ def seat(tmp_path, monkeypatch):
         "bakehouse.orchestrator.arch": ("orchestrator", "orch-arch"),
     }
 
+    #: Callers the fixture treats as real besides the KNOWN agents: this seat's
+    #: own agents, which the directory knows even when the fake's KNOWN map is
+    #: only the remote set.
+    LOCAL_CALLERS = {"bakehouse.agent-eco.agent-comms"}
+
     def _directory(address, payload, timeout):
         target = payload.get("target", "")
         folded = {k.casefold(): v for k, v in KNOWN.items()}
@@ -229,8 +234,18 @@ def seat(tmp_path, monkeypatch):
         # The real directory answers a bare role with the FQNs that end in it
         # -- that is where `did you mean` comes from, and a fixture without it
         # cannot tell a refusal that helps from one that does not.
+        #
+        # **And it answers them only to a caller it knows.** Near-misses are
+        # caller-relative (the caller's own project first, UC-08 fact 2), so a
+        # nonsense caller gets an empty set. A fake that ignores `caller`
+        # cannot fail on code that passes the wrong one -- and it did not:
+        # `_directory_hint` passed the TARGET as the caller, the unit test
+        # passed, and the live seat printed no near-misses. Measured
+        # 2026-09-27; catalogue 0.59.
+        caller = (payload.get("caller") or "").strip()
         tail = target.strip().casefold()
-        near = sorted(k for k in KNOWN if k.rsplit(".", 1)[-1].casefold() == tail)
+        near = (sorted(k for k in KNOWN if k.rsplit(".", 1)[-1].casefold() == tail)
+                if caller.casefold() in folded or caller in LOCAL_CALLERS else [])
         return 200, {"kind": "resolution-result", "contract": "0.2", "success": False,
                      "status": "unknown", "requested": target,
                      "near_misses": near,
