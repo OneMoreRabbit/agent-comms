@@ -226,8 +226,14 @@ def seat(tmp_path, monkeypatch):
                          "canonical_id": target, "delivery": "inject",
                          "route_revision": 1,
                          "transports": {"comms": {"channel": channel, "bot": bot}}}
+        # The real directory answers a bare role with the FQNs that end in it
+        # -- that is where `did you mean` comes from, and a fixture without it
+        # cannot tell a refusal that helps from one that does not.
+        tail = target.strip().casefold()
+        near = sorted(k for k in KNOWN if k.rsplit(".", 1)[-1].casefold() == tail)
         return 200, {"kind": "resolution-result", "contract": "0.2", "success": False,
                      "status": "unknown", "requested": target,
+                     "near_misses": near,
                      "message": f"no agent or alias named {target!r} is known"}
 
     monkeypatch.setattr("agent_comms.resolve._post", _directory)

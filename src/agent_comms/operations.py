@@ -39,7 +39,7 @@ from .errors import (
 )
 from .hub import Hub, Registration, Transport, build_transport
 from .seat import SeatUnavailable, speaks_contract
-from .seat import _client_version
+from .seat import _client_version, build_id
 from .seat import state as seat_state_now
 from .wake import Held, WakeError, wake
 from .store import DaemonState, Mention, Store
@@ -462,12 +462,26 @@ def preflight(
     # measured by hand on 2026-09-10.
     side = Store(settings.state_dir)
     running_build = side.daemon_build()
-    if daemon_is_running(side) and running_build and running_build != _client_version():
+    mine = build_id()
+    if daemon_is_running(side) and running_build and running_build != mine:
+        # **The same version number is not the same build.** Until 2026-09-27
+        # both sides were bare `__version__`, so a daemon still running code
+        # from before a reinstall of the same version compared equal and the
+        # check reported "daemon and CLI both 2.1.1" -- green because it could
+        # not go red (catalogue 0.58). `build_id()` carries a hash of the code
+        # on disk, so this fires on the case that actually happens during
+        # development: reinstall without a version bump.
+        same_version = running_build.split("+")[0] == mine.split("+")[0]
+        extra = (
+            " Both call themselves "
+            f"{mine.split('+')[0]}, and the code differs — a reinstall of the same "
+            "version number, which a version comparison cannot see."
+            if same_version else "")
         report.add(
             "daemon build", False,
-            f"the RUNNING daemon is {running_build}; this CLI is {_client_version()}. "
+            f"the RUNNING daemon is {running_build}; this CLI is {mine}. "
             "They are out of step, which is a real state during an upgrade and not a "
-            "guess — the daemon is a process and the CLI is whatever is on disk now. "
+            f"guess — the daemon is a process and the CLI is whatever is on disk now.{extra} "
             "Restart it to bring them together: comms daemon --restart. Until then "
             "the two halves may disagree about where messages are stored.")
     elif running_build:
@@ -1075,6 +1089,14 @@ def send(
         #   the directory does not know it, that is the fact to fix.
         _, is_human = hub.in_channel(recipient)
         if not is_human:
+            # **The near-misses belong here too.** This gate was added in front
+            # of `_resolve_recipient`, and `_directory_hint` — the "did you
+            # mean" that `comms resolve` prints — lives behind it. So from
+            # 2026-09-25 to 2026-09-27 the same name got an actionable answer
+            # from `resolve` and a dead end from `send`: two surfaces, one
+            # directory, different amounts of help at the moment it is needed.
+            # Measured on UC-02 step 4 (`--to arch`).
+            hint = _directory_hint(recipient)
             raise UnknownRecipient(
                 f"'{recipient}' is not an agent the directory can resolve, and it is "
                 f"not a human.\n"
@@ -1083,7 +1105,8 @@ def send(
                 "deliver to a machine rather than to anybody.\n"
                 "  Address the agent by its FQN (estate.project.agent). If the "
                 "directory does not know it, it has no announced slot yet — that is "
-                "the thing to fix, not the address to work around.")
+                "the thing to fix, not the address to work around."
+                + (f"\n  {hint}" if hint else ""))
         recipient = _resolve_recipient(settings, hub, recipient)
         channel = channel or settings.channel
 
@@ -2143,7 +2166,7 @@ def run_daemon(
     # so without this a freshly started daemon carries the *previous* daemon's
     # last tick and reads as wedged for its first minute — a false alarm on the
     # one signal that has to stay trustworthy.
-    store.record_build(_client_version())
+    store.record_build(build_id())
     store.save_position(registration.queue_id, registration.last_event_id)
 
     stored, iterations, backoff = 0, 0, 1
@@ -2782,6 +2805,15 @@ def requeue(message_id: int, reason: str, **kw) -> str:
     store._log(row["id"], row["state"], QUEUED, f"requeued by hand: {reason}",
                rule="operator")
     store.record("info", f"requeued {message_id} by hand: {reason}")
-    return (f"requeued {message_id} from {row['state']} — {reason}\n"
+    # **Say the word `trace` says.** `row['state']` is the raw column, and a
+    # hand retirement is stored as EXPIRED with a reason beside it -- so this
+    # line announced "from expired" about a message the operator had retired
+    # by hand thirty seconds earlier, contradicting the `trace` two lines
+    # above it. `_state_of` already holds the rule (retired is the FACT,
+    # expired only the mechanism that got it there); printing the column
+    # instead of asking is how the two surfaces came apart.
+    # Measured on UC-07 step 5, 2026-09-27.
+    was = "retired" if (row["retired_reason"] or "").strip() else row["state"]
+    return (f"requeued {message_id} from {was} — {reason}\n"
             "Attempts reset. The age bound still applies: if it is past the bound "
             "it will retire again on the next pass rather than deliver.")

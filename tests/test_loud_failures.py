@@ -1374,14 +1374,14 @@ def test_doctor_names_a_daemon_running_a_different_build(seat, monkeypatch):
 
 def test_doctor_is_quiet_when_the_builds_agree(seat, monkeypatch):
     """It must not fire on the ordinary case, or it stops being read (§9)."""
-    from agent_comms import __version__
     from agent_comms.hub import Hub
-    from agent_comms.seat import SeatState
+    from agent_comms.seat import SeatState, build_id
     from agent_comms.store import Store
 
     s = Store(seat / ".comms")
     s.ensure()
-    s.record_build(__version__)
+    # Stamp what a daemon actually stamps: version PLUS a hash of its code.
+    s.record_build(build_id())
     monkeypatch.setattr(Store, "daemon_state",
                         lambda self: __import__("agent_comms.store", fromlist=["x"]).DaemonState(
                             running=True, pid=1, last_tick=None))
@@ -1392,6 +1392,17 @@ def test_doctor_is_quiet_when_the_builds_agree(seat, monkeypatch):
     report = operations.preflight(transport_factory=lambda c: FakeTransport())
 
     assert next(c for c in report.checks if c[0] == "daemon build")[1] is True
+
+    # **The near-miss on the named boundary** (gate 6): the version agrees and
+    # the code does not. This is the case a version comparison cannot see, and
+    # the case that actually happens -- `pipx install --force` over the same
+    # version, measured on a test seat 2026-09-26.
+    version, _, _hash = build_id().partition("+")
+    s.record_build(f"{version}+0000000000000000")
+    report = operations.preflight(transport_factory=lambda c: FakeTransport())
+    check = next(c for c in report.checks if c[0] == "daemon build")
+    assert check[1] is False, "a same-version stale daemon read as in step"
+    assert "reinstall of the same version number" in check[2], check[2]
 
 
 # -- R17: the rest of the §6 surface -----------------------------------------
@@ -1476,6 +1487,15 @@ def test_requeue_is_the_one_backwards_move_and_needs_a_person(seat):
     assert "requeued 302" in said and "age bound still applies" in said
     assert [r["id"] for r in operations.recent(last=9, state="queued")] == [302]
     assert any("requeued by hand" in r["cause"] for r in store.history(store._find(302)["id"]))
+
+    # **It must name the state `trace` names.** A hand retirement is STORED as
+    # `expired` with a reason beside it, so printing the raw column announced
+    # "requeued 302 from expired" about a message a person had just retired by
+    # hand -- the same conflation `_state_of` exists to prevent, on a surface
+    # that had not been asked. Measured on UC-07 step 5, 2026-09-27.
+    assert "from retired" in said, said
+    assert "from expired" not in said, (
+        "requeue reported the mechanism where trace reports the fact")
 
 
 def test_retire_and_requeue_refuse_an_unknown_id(seat):

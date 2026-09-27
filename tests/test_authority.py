@@ -835,3 +835,40 @@ def test_a_blocked_recipient_is_refused_at_the_SENDER(seat, monkeypatch):
     assert entry_matches_fqn("agent-comms", me), \
         "a short blocked entry matches the caller's FQN — the gate's own matcher"
     assert not entry_matches_fqn("agent-skeleton", me)
+
+
+def test_send_refusing_a_bare_role_carries_the_directorys_near_misses(seat):
+    """`send` and `resolve` must be equally actionable about the same name.
+
+    `arch` is a bare role: it ends several FQNs in different projects, so it is
+    never authored as an alias and both surfaces refuse it. What differed was
+    the help. `_directory_hint` — the `did you mean` line — sits behind
+    `_resolve_recipient`, and the agent-or-human gate added in front of it
+    refuses first, so from 2026-09-25 `comms resolve arch` listed the
+    candidates and `comms send --to arch` printed a dead end. Measured on
+    UC-02 step 4, 2026-09-27.
+
+    The near-miss control is the second half: a name that is simply not an
+    agent must NOT sprout a `did you mean`, or the line means nothing.
+    """
+    from agent_comms import operations
+    from agent_comms.operations import UnknownRecipient
+    from tests.conftest import FakeTransport
+
+    with pytest.raises(UnknownRecipient) as caught:
+        operations.send("hi", to="arch", subject="uc02",
+                        transport_factory=lambda c: FakeTransport(),
+                        from_fqn="bakehouse.agent-eco.agent-comms")
+    said = str(caught.value)
+    assert "not an agent the directory can resolve" in said, said
+    assert "Did you mean" in said, "the send refusal dropped the directory's near-misses"
+    assert "bakehouse.agent-eco.arch" in said, said
+    assert "bakehouse.orchestrator.arch" in said, "only one project's arch was offered"
+
+    # The control: a name with no near-misses gets the refusal and no hint.
+    with pytest.raises(UnknownRecipient) as caught:
+        operations.send("hi", to="zzz-no-such-thing", subject="uc02",
+                        transport_factory=lambda c: FakeTransport(),
+                        from_fqn="bakehouse.agent-eco.agent-comms")
+    assert "Did you mean" not in str(caught.value), (
+        "a 'did you mean' with nothing to mean is noise that trains readers to skip it")
