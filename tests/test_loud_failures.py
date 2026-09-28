@@ -1759,4 +1759,27 @@ def test_resolve_says_NO_when_the_directory_answers_not_permitted(seat, monkeypa
     assert "the directory refuses this sender" not in typo, (
         "a name that does not exist was reported as a permission refusal")
 
+    # **The case the well-formed fixture could not catch (2026-09-28).**
+    # This test's fixtures are correct by construction, so it proves comms
+    # consumes a GOOD not-permitted body — and stays green while the live
+    # estate is broken. It was: estate-directory shipped the refusal without
+    # `kind`/`contract` (this client's shape gate), comms rejected it as "not a
+    # resolution", degraded to cache and answered `unknown`, and the discovery
+    # count case reached 0 for the WRONG reason.
+    #
+    # A refusal that does not reach the parser must not read as a refusal.
+    def envelopeless(address, payload, timeout):
+        body = {"status": "not-permitted", "success": False, "requested": TARGET,
+                **ROUTE, "message": "blocked"}
+        return 200, body                      # no `kind`, no `contract`
+
+    monkeypatch.setattr(R, "_post", envelopeless)
+    malformed = "\n".join(operations.resolve_name(TARGET, from_fqn=me))
+    assert "would send  NO" in malformed, "comms must fail closed on a shape it cannot read"
+    assert "the directory refuses this sender" not in malformed, (
+        "an unparseable body was reported as a permission refusal — the count case "
+        "would read 0 while the estate is degraded")
+    assert "degraded" in malformed or "cache" in malformed, (
+        "comms degraded without saying so: " + malformed)
+
     assert not sent, "resolve must answer without sending anything"
