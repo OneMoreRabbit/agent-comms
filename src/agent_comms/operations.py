@@ -43,7 +43,7 @@ from .seat import _client_version, build_id
 from .seat import state as seat_state_now
 from .wake import Held, WakeError, wake
 from .store import DaemonState, Mention, Store
-from .queue import MessageStore
+from .queue import ForwardOnly, MessageStore
 
 
 def message_store(state_dir) -> MessageStore:
@@ -1706,7 +1706,24 @@ def retry_undelivered(
         # **The bound is applied HERE, in the same transaction as the attempt.**
         # This used to call a shim that added 1 to the counter and enforced
         # nothing, so `max_attempts` governed no live path at all.
-        attempts = store.attempt_by_hub_id(mention.id, result.summary())
+        try:
+            attempts = store.attempt_by_hub_id(mention.id, result.summary())
+        except ForwardOnly as refused:
+            # **Another pass got there first, and that is not this pass's
+            # problem.** Two passes overlap whenever `comms daemon --once` runs
+            # beside the running daemon -- a normal thing to do, and documented
+            # as such. The loser selected this message as undelivered, the
+            # winner delivered it, and the store then correctly refuses to move
+            # a `delivered` message to `abandoned`.
+            #
+            # The guard is right; stopping is not. Measured on test-claude
+            # 2026-09-28: this exception left the pass, left the daemon loop,
+            # and killed the detached daemon, after which the seat read "NOT
+            # RECEIVING -- messages sent to this seat are being lost, not
+            # queued". A refused write must never cost a seat its mail.
+            store.record("info", f"retry: message {mention.id} was already "
+                                 f"settled by another pass — {refused}")
+            continue
         if not result.success:
             if not result.retryable:
                 # broken, or our own usage error. Leave it stored and stop: both
@@ -2318,8 +2335,22 @@ def run_daemon(
             # backstop: both ask "what did the fast path miss?".
             try:
                 retry_undelivered(transport_factory=transport_factory, **kw)
-            except CommsError as exc:
-                store.record("warn", f"retry pass failed: {exc}")
+            except Exception as exc:                 # noqa: BLE001 — see below
+                # **Nothing a pass can raise is worth the daemon.** This caught
+                # `CommsError` only, and `ForwardOnly` — the store's own
+                # integrity guard — is a plain Exception, so it escaped here and
+                # ended the process. A daemon that exits stops the seat
+                # receiving *silently*: `comms status` then says "NOT RECEIVING
+                # — messages sent to this seat are being lost, not queued",
+                # which is the worst outcome this component has.
+                #
+                # So the net is deliberately wide, and loud to compensate: the
+                # exception TYPE is recorded, because a bare message makes a new
+                # fault look like a known one. Narrowing this to the exceptions
+                # we have already seen is how it was wrong the first time.
+                store.record("warn", f"retry pass failed: "
+                                     f"{type(exc).__name__}: {exc} — the pass stopped, "
+                                     "the daemon did not")
             before = store.last_message_id()
             found = _catch_up(hub, store, handle_event, "backstop")
             if found:

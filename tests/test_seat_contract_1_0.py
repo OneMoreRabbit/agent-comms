@@ -760,3 +760,92 @@ def test_abandoned_and_retrieved_do_not_read_as_delivered(tmp_path):
     assert gone.state == ABANDONED
     assert _state_of(gone) == "abandoned", \
         "a message given up on must never read as delivered"
+
+
+def test_a_message_settled_by_another_pass_does_not_stop_this_one(seat, monkeypatch):
+    """Two passes overlap, and the loser must carry on.
+
+    `comms daemon --once` beside the running daemon is a normal thing to do and
+    is documented as such. When it happens, the losing pass has already selected
+    a message as undelivered that the winner then delivers, and the store
+    correctly refuses to move a `delivered` message to `abandoned`
+    (`ForwardOnly`). The guard is right; stopping is not.
+
+    Measured on test-claude 2026-09-28: that exception left the pass, left the
+    daemon loop and killed the detached daemon, after which `comms status` read
+    "NOT RECEIVING - messages sent to this seat are being lost, not queued".
+
+    The control is the second message: if the refusal aborts the pass, it never
+    lands.
+    """
+    from agent_comms import operations
+    from agent_comms.queue import ForwardOnly
+    from agent_comms.store import Mention
+    from tests.conftest import FakeTransport
+
+    store = operations.message_store(seat / ".comms")
+    for mid in (700, 701):
+        store.append(Mention(id=mid, sender="agent-eco-arch", channel="agent-eco",
+                             topic="t", content="x", timestamp=NOW, permalink="",
+                             reason="mentioned"))
+    fake_seat(monkeypatch, {"success": True, "status": "delivered",
+                            "message": "typed into the claude session"}, code=0)
+
+    # The first message is the one another pass already settled.
+    real = operations.MessageStore.attempt_by_hub_id
+
+    def racing(self, hub_id, detail):
+        if hub_id == 700:
+            raise ForwardOnly(f"message {hub_id} is `delivered` and cannot become "
+                              "`abandoned`")
+        return real(self, hub_id, detail)
+
+    monkeypatch.setattr(operations.MessageStore, "attempt_by_hub_id", racing)
+
+    landed = operations.retry_undelivered(transport_factory=lambda c: FakeTransport())
+
+    assert landed == 1, "the pass stopped at the message another pass had settled"
+    assert 701 not in [m.id for m in store.undelivered()], "701 never got its turn"
+    # 700 is still here because this fixture refuses its attempt without anything
+    # having delivered it. In the real race the winning pass delivered it, which
+    # is exactly why the store refused to move it.
+    assert [m.id for m in store.undelivered()] == [700]
+
+
+def test_the_daemon_survives_anything_a_retry_pass_can_raise(seat, monkeypatch):
+    """A daemon that exits stops the seat receiving SILENTLY, which is the worst
+    outcome this component has — worse than any single pass failing.
+
+    The loop caught `CommsError` only, and `ForwardOnly` is a plain Exception,
+    so it escaped and ended the process. The net is wide on purpose and loud to
+    compensate: the recorded warning names the exception TYPE, or a new fault
+    reads like a known one.
+    """
+    from agent_comms import operations
+    from agent_comms.queue import ForwardOnly
+    from tests.conftest import FakeTransport
+
+    store = operations.message_store(seat / ".comms")
+
+    def explode(**kw):
+        raise ForwardOnly("message 2 is `delivered` and cannot become `abandoned`")
+
+    monkeypatch.setattr(operations, "retry_undelivered", explode)
+    # The retry pass runs on the backstop timer, so bring it forward or one
+    # iteration never reaches the code under test.
+    monkeypatch.setattr(operations, "BACKSTOP_SECS", 0)
+    fake_seat(monkeypatch, {"success": True, "status": "delivered", "message": "ok"},
+              code=0)
+
+    # It must return normally rather than propagate.
+    operations.run_daemon(transport_factory=lambda c: FakeTransport(), max_iterations=1)
+
+    said = [r["detail"] for r in store.events()] if hasattr(store, "events") else []
+    text = " ".join(said) or _events_text(seat)
+    assert "ForwardOnly" in text, f"the warning did not name the exception type: {text}"
+    assert "the daemon did not" in text, text
+
+
+def _events_text(seat) -> str:
+    path = seat / ".comms" / "events.log"
+    return path.read_text(encoding="utf-8") if path.exists() else ""
