@@ -2775,7 +2775,18 @@ def resolve_name(name: str, from_fqn: str = "", **kw) -> list[str]:
     if answer.near_misses:
         out.append(f"  did you mean  {', '.join(answer.near_misses[:5])}")
     if not answer.success:
-        out.append("  would send  NO — nothing would be delivered")
+        # **A refusal and a typo are two situations, so they get two
+        # sentences.** Both used to end "NO — nothing would be delivered",
+        # which is true of each and tells the reader nothing about which one
+        # they are in: one is fixed by correcting the name, the other by
+        # asking the estate to change a permission, and the last line sent
+        # both readers the same way. One generic sentence serving two
+        # situations is what UC-08 exists to kill; ruled 2026-09-28 (arch
+        # 3548). The cause is on the `because` line either way — this makes
+        # the verdict line carry it too.
+        out.append("  would send  NO — the directory refuses this sender"
+                   if answer.status == "not-permitted" else
+                   "  would send  NO — nothing would be delivered")
         return out
 
     out += [f"  canonical  {answer.canonical_id}",

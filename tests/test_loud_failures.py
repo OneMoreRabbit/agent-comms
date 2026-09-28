@@ -1726,6 +1726,8 @@ def test_resolve_says_NO_when_the_directory_answers_not_permitted(seat, monkeypa
 
     assert "would send  NO" in refused, refused
     assert "not-permitted" in refused, refused
+    # A refusal and a typo are two situations and get two sentences (arch 3548).
+    assert "the directory refuses this sender" in refused, refused
     # Gate 10: the refusal names the rule that fired, in the directory's words.
     assert "permissions.comms.blocked" in refused, (
         "the directory's reason did not reach the person who asked")
@@ -1733,5 +1735,21 @@ def test_resolve_says_NO_when_the_directory_answers_not_permitted(seat, monkeypa
     # The near-miss: identical route, permitted.
     assert "would send  YES" in allowed, allowed
     assert "seat-testing" in allowed, "the control did not get as far as a transport"
+
+    # **The near-miss on the OTHER boundary: a refusal is not a typo.** An
+    # unknown name must keep its own last line, or the distinction ruled on
+    # 2026-09-28 (arch 3548) is a string nobody can tell apart from the one it
+    # replaced. The reader of a typo fixes the name; the reader of a refusal
+    # asks the estate to change a permission.
+    def unknown(address, payload, timeout):
+        return 200, {"kind": "resolution-result", "contract": "0.2",
+                     "success": False, "status": "unknown", "requested": TARGET,
+                     "message": "no agent or alias named that is known"}
+
+    monkeypatch.setattr(R, "_post", unknown)
+    typo = "\n".join(operations.resolve_name(TARGET, from_fqn=me))
+    assert "would send  NO" in typo, typo
+    assert "the directory refuses this sender" not in typo, (
+        "a name that does not exist was reported as a permission refusal")
 
     assert not sent, "resolve must answer without sending anything"
