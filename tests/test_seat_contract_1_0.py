@@ -849,3 +849,44 @@ def test_the_daemon_survives_anything_a_retry_pass_can_raise(seat, monkeypatch):
 def _events_text(seat) -> str:
     path = seat / ".comms" / "events.log"
     return path.read_text(encoding="utf-8") if path.exists() else ""
+
+
+def test_the_delivery_line_carries_a_millisecond_stamp(seat, monkeypatch):
+    """**And that this line RUNS at all.**
+
+    agent-seat asked how long after a session appeared a lost probe was typed.
+    `events.log` is second-granularity, so the existing logs could not answer:
+    the suspected cause is an async redraw landing on the same keystroke, and
+    that interval is sub-second.
+
+    The stamp was added, and `datetime` was not imported in this module — a
+    `NameError` on the SUCCESS path, which is every delivery. The suite stayed
+    green because nothing asserted on the delivered line, only on the states
+    around it. This asserts the line, so the next edit to it cannot be
+    unexercised.
+    """
+    import re
+
+    from agent_comms import operations
+    from agent_comms.store import Mention
+    from tests.conftest import FakeTransport
+
+    store = operations.message_store(seat / ".comms")
+    store.append(Mention(id=910, sender="agent-eco-arch", channel="agent-eco",
+                         topic="t", content="x", timestamp=NOW, permalink="",
+                         reason="mentioned"))
+    fake_seat(monkeypatch, {"success": True, "status": "delivered",
+                            "message": "typed into the claude session at a:0.0"}, code=0)
+
+    # `wake_agent` is the path that writes the delivery line — the notify hook
+    # the daemon calls, not the retry pass (which logs its own summary).
+    from dataclasses import asdict
+    mention = next(m for m in store.undelivered() if m.id == 910)
+    operations.wake_agent(asdict(mention), transport_factory=lambda c: FakeTransport())
+
+    log = (seat / ".comms" / "events.log").read_text(encoding="utf-8")
+    delivered = [l for l in log.splitlines() if "wake: delivered" in l]
+    assert delivered, f"no delivery line was written at all:\n{log}"
+    # ISO-8601 to milliseconds, e.g. [at 2026-09-28T19:35:18.245+00:00]
+    assert re.search(r"\[at \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}", delivered[-1]), (
+        f"no millisecond stamp on the delivery line: {delivered[-1]}")

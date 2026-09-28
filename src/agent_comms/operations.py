@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import atexit
 import json
+from datetime import datetime, timezone
 import re
 import signal
 import os
@@ -1663,7 +1664,15 @@ def wake_agent(
     if result.success:
         store.mark_delivered(mid) if mid is not None else None
         store.set_sleeping(False)
-        store.record("info", f"wake: {result.summary()}")
+        # **Millisecond stamp on the delivery line.** `events.log` is
+        # second-granularity, which was enough until agent-seat asked how long
+        # after a session appeared a lost probe was typed — a question the
+        # existing logs could not answer at all. The suspected cause is an
+        # async redraw of the input line landing on the same keystroke, so the
+        # interval that matters is sub-second and a whole-second stamp cannot
+        # show it. Added on arch's word, 2026-09-28 (hub 3647).
+        store.record("info", f"wake: {result.summary()} "
+                             f"[at {datetime.now(tz=timezone.utc).isoformat(timespec='milliseconds')}]")
         return _woken(result)
 
     store.record("warn", f"wake: {result.summary()}")
