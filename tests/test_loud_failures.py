@@ -1659,3 +1659,79 @@ def test_a_check_with_nothing_to_verify_says_so_by_name():
     assert len(adds) >= 4, (
         f"only {len(adds)} branches name this check; a branch that omits it makes "
         "an absent check read as a passing one")
+
+
+def test_resolve_says_NO_when_the_directory_answers_not_permitted(seat, monkeypatch):
+    """**agent-comms' half of the resolve-permissions fix.**
+
+    The estate's ruling (arch 3441/3444, need
+    `agenteco-needs-resolve-answers-permissions-v0_1`) is that `POST /v0/resolve`
+    answers `not-permitted` for a blocked pair, as `GET /v0/addressable?from=`
+    already does. Comms consumes the VERDICT and never evaluates the permission
+    itself: the blocked list comes back as short names, and matching a caller
+    FQN against a bare token is identity taken apart to reach a decision --
+    built and reverted twice, and failed at build time by gates 1 and 1b.
+
+    Nothing is being fixed in comms here. This pins that the consuming side is
+    already right so it cannot regress before the directory change lands, and
+    it is the test that turns the discovery count case from 1 to 0 on the day
+    it does.
+
+    **The control is a near-miss on the named boundary (gate 6): the two
+    answers differ ONLY in status.** Same FQN, same canonical id, same
+    delivery, same transport, same revision. If comms decided on the route it
+    was handed -- as it must not -- both would read YES. It reads NO then YES,
+    so the STATUS is what decided and nothing else.
+
+    Two earlier versions of this test passed for the wrong reason and are worth
+    recording. The first returned a refusal carrying **no transport**, so the
+    verdict rested on the missing route: the status could be ignored entirely
+    and the test stayed green. The second kept that fixture and tried to break
+    the code by mutation instead -- and comms refuses a malformed answer at
+    three separate layers, so every single-point mutation left it green too. A
+    refusal fixture with nothing to route to cannot tell "refused" from
+    "unroutable" (catalogue 0.58).
+    """
+    import agent_comms.resolve as R
+
+    TARGET = "bakehouse.agent-eco.fixture-blocked"
+    ROUTE = {"canonical_id": TARGET, "delivery": "inject", "route_revision": 7,
+             "transports": {"comms": {"channel": "seat-testing", "bot": "test-claude"}}}
+
+    def answering(status: str):
+        """The same routable agent, refused or permitted -- status is the only
+        difference on the wire, as it is from the real directory."""
+        def directory(address, payload, timeout):
+            body = {"kind": "resolution-result", "contract": "0.2",
+                    "requested": TARGET, **ROUTE}
+            if status == "not-permitted":
+                body |= {"success": False, "status": "not-permitted",
+                         "message": (f"{payload.get('caller')} is on {TARGET}'s blocked "
+                                     "list (permissions.comms.blocked)")}
+            else:
+                body |= {"success": True, "status": "resolved"}
+            return 200, body
+        return directory
+
+    sent = []
+    monkeypatch.setattr(R, "directory_address", lambda: "http://d")
+    monkeypatch.setattr(operations, "send", lambda *a, **k: sent.append(a))
+    me = "bakehouse.agent-eco.agent-comms"
+
+    monkeypatch.setattr(R, "_post", answering("not-permitted"))
+    refused = "\n".join(operations.resolve_name(TARGET, from_fqn=me))
+
+    monkeypatch.setattr(R, "_post", answering("resolved"))
+    allowed = "\n".join(operations.resolve_name(TARGET, from_fqn=me))
+
+    assert "would send  NO" in refused, refused
+    assert "not-permitted" in refused, refused
+    # Gate 10: the refusal names the rule that fired, in the directory's words.
+    assert "permissions.comms.blocked" in refused, (
+        "the directory's reason did not reach the person who asked")
+
+    # The near-miss: identical route, permitted.
+    assert "would send  YES" in allowed, allowed
+    assert "seat-testing" in allowed, "the control did not get as far as a transport"
+
+    assert not sent, "resolve must answer without sending anything"
