@@ -2279,6 +2279,7 @@ def run_daemon(
     transport_factory: Callable[[Credential], Transport] = build_transport,
     max_iterations: int | None = None,
     on_mention: Callable[[Mention], None] | None = None,
+    _reconnects: int = 0,
     **kw,
 ) -> int:
     """Hold the outbound connection and record what arrives.
@@ -2465,6 +2466,52 @@ def run_daemon(
                 store.record("info", f"config: {got.line()}")
             elif got.reason:
                 store.record("warn", f"config: {got.reason}; running from file")
+
+            # **A seat that had no channel must JOIN when one is assigned.**
+            #
+            # The daemon reads its channel once, at startup, from its own
+            # assignment rows. A seat installed before the estate assigned it
+            # anything correctly has none and idles -- but it then idled
+            # FOREVER, because nothing re-read the channel when assignments
+            # arrived. Measured on test-claude 2026-09-28 (UC-12's
+            # zero-assignment control, on fresh drives): generation 48 brought
+            # four agents and a channel, and the daemon kept polling with
+            # `channel ''`, so every inbound message failed its permission
+            # check with "this bot is not subscribed to channel ''".
+            #
+            # "Idles on refresh until the estate assigns, then joins" is the
+            # ruled behaviour (ansible-platform's retire-comms-yml need); the
+            # idling half shipped and the joining half did not.
+            fresh = load_settings(**kw)
+            if (fresh.channel or "").strip() != (settings.channel or "").strip():
+                store.record(
+                    "info",
+                    f"channel changed from {settings.channel or '(none)'!r} to "
+                    f"{fresh.channel or '(none)'!r} — reconnecting. A seat with no "
+                    "assignments has no channel to join; this is the join.")
+                # Bounded: a channel that keeps changing is a fault to report,
+                # not something to chase round a loop. Three reconnects is more
+                # than a first assignment needs and fewer than a flap costs.
+                # **Reconnect in place. Do NOT re-enter `run_daemon`.**
+                # This first recursed, and the recursive call tried to take the
+                # daemon lock the outer one already held: `DaemonAlreadyRunning`,
+                # which would have ended the daemon on the very transition it
+                # exists to handle. Caught by this case's own test before it
+                # reached a seat.
+                _reconnects += 1
+                if _reconnects > 3:
+                    store.record(
+                        "warn",
+                        f"channel changed {_reconnects} times this run (now "
+                        f"{fresh.channel or '(none)'!r}). Not reconnecting again — "
+                        "a channel that will not settle is a directory fault, and "
+                        "chasing it would hide that behind a busy daemon.")
+                else:
+                    settings = fresh
+                    hub = Hub(transport_factory(credential), settings, credential)
+                    hub.verify_subscription()
+                    registration = _register(hub, store)
+                    gap_recovery = True   # read history forward into the new channel
 
         if time.monotonic() - last_backstop >= BACKSTOP_SECS:
             last_backstop = time.monotonic()

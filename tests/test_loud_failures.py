@@ -1805,3 +1805,57 @@ def test_resolve_says_NO_when_the_directory_answers_not_permitted(seat, monkeypa
         "comms degraded without saying so: " + malformed)
 
     assert not sent, "resolve must answer without sending anything"
+
+
+def test_a_seat_with_no_channel_JOINS_when_one_is_assigned(seat, monkeypatch):
+    """**Idling shipped; joining did not.**
+
+    A seat installed before the estate assigns it anything has no channel —
+    correct, and ruled (ansible-platform's retire-comms-yml need): no agents
+    means no mail is possible and there is nothing to join. The daemon reads
+    its channel once, at startup, from its own assignment rows.
+
+    It then idled FOREVER. Measured on test-claude 2026-09-28, on fresh drives,
+    by UC-12's zero-assignment control: generation 48 brought four agents and a
+    channel, nothing re-read it, and every inbound message failed its
+    permission check with "this bot is not subscribed to channel ''" — while
+    `comms status`, which loads settings fresh, cheerfully printed the right
+    channel. The two halves of the seat disagreed and only the daemon mattered.
+    """
+    import json
+
+    from agent_comms import operations
+    from tests.conftest import FakeTransport
+
+    routes = seat / ".comms" / "routes.json"
+    routes.write_text(json.dumps({"routes": []}))          # nothing assigned yet
+
+    joined: list[str] = []
+
+    real = operations.Hub
+
+    class Watching(real):
+        def __init__(self, transport, settings, credential):
+            joined.append(settings.channel)
+            super().__init__(transport, settings, credential)
+
+    monkeypatch.setattr(operations, "Hub", Watching)
+
+    # The assignment lands between one config refresh and the next.
+    def assigned(*a, **k):
+        routes.write_text(json.dumps({"routes": [
+            {"agent": "bakehouse.agent-eco.agent-comms",
+             "transports": {"comms": {"channel": "agent-eco",
+                                      "bot": "agent-eco-agent-comms"}}}]}))
+        from agent_comms.config_sync import Fetched
+        return Fetched(generation=2, fetched_at="now", agents=1, source="directory")
+
+    monkeypatch.setattr(operations.config_sync, "fetch", assigned)
+    monkeypatch.setattr(operations, "CONFIG_REFRESH_SECS", 0)
+
+    operations.run_daemon(transport_factory=lambda c: FakeTransport(), max_iterations=1)
+
+    assert joined, "no hub was built at all"
+    assert joined[0] == "", "a seat with no assignments must start with no channel"
+    assert "agent-eco" in joined, (
+        f"the daemon never joined the channel it was assigned: {joined}")
