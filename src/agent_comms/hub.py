@@ -75,6 +75,22 @@ class Hub:
         mint time, so a failure here means the bootstrap did not complete — and
         it must be visible immediately, not discovered a week later.
         """
+        # **No channel is not an unverified subscription — it is a seat with
+        # nothing assigned yet.**
+        #
+        # A seat on its first install has no assignments, so the directory has
+        # named no channel and there is nothing to be subscribed TO. Until
+        # 2026-09-28 the channel fell back to the project name, so this check
+        # always had something to test; with that construction removed, an
+        # unassigned seat reached here with an empty channel and was told
+        # `bot '' is not subscribed to channel ''` — refusing to start over a
+        # state that is correct and temporary.
+        #
+        # A seat with no agents can receive no mail, so idling is the right
+        # behaviour, and `doctor` says so rather than this being silent
+        # (ansible-platform's retire-comms-yml need, operator ruling).
+        if not (self._settings.channel or "").strip():
+            return
         result = self._t.call_endpoint(url="users/me/subscriptions", method="GET")
         if result.get("result") != "success":
             raise NotSubscribed(

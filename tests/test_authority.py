@@ -659,50 +659,59 @@ def test_a_refusal_names_the_rule_that_fired_and_where_it_lives(tmp_path, monkey
     file where nothing is wrong.
 
     Measured on the swept seats 2026-09-25: a message correctly refused by an
-    agent's directory-authored blocked list was reported as 'not a permitted
-    partner' -- the SEAT-level sentence -- while comms.yml listed that sender
-    in `partners` with an empty `blocked`."""
+    agent's directory-authored blocked list was reported as "not a permitted
+    partner" — the SEAT-level sentence — while `comms.yml` listed that sender
+    in `partners` with an empty `blocked`.
+
+    **Rewritten 2026-09-28, when the second layer was deleted.** comms 2.x
+    reads no `comms.yml`; policy is per agent at the directory. There is now
+    one layer, so a refusal can only name the rule that fired — and the three
+    reasons a sender is refused have to stay distinguishable, because they are
+    fixed in three different ways: ask the estate to unblock you, ask to be
+    added to a partners list, or get subscribed to the channel.
+    """
     from agent_comms.operations import why_refused
-    from agent_comms.directory import Directory
     from agent_comms.store import Mention
     import agent_comms.config_sync as CS
 
-    another1 = "bakehouse.agent-eco.test-claude-another1"
+    agent = "bakehouse.agent-eco.test-claude-another1"
     codex = "bakehouse.agent-eco.test-codex"
-    monkeypatch.setattr(CS, "agent_set", lambda _d: {
-        another1: {"permissions": {"comms": {
-            "blocked": ["bakehouse.agent-eco.test-codex"]}}}})
-    # comms.yml PERMITS this sender -- the per-agent rule is what refused it.
-    d = Directory(project=False, partners=("test-codex",), source="~/.comms/comms.yml",
-                  own_project="agent-eco")
 
-    m = Mention(id=1, sender="test-codex", channel="seat-testing", topic="t",
-                content="x", timestamp=1, permalink="",
-                agent=another1, sender_fqn=codex)
-    why = why_refused(m, d, tmp_path)
-    assert another1 in why and "blocked list" in why
-    assert "directory" in why
-    assert "comms.yml is not where this was decided" in why, \
-        "it must say the seat file is NOT the cause, or the reader edits it"
+    def perms(comms):
+        return lambda _d: {agent: {"permissions": {"comms": comms}}}
 
-    # A sender with no per-agent rule against it falls to the seat-level
-    # sentence, which names comms.yml because that IS where it was decided.
-    m2 = Mention(id=2, sender="stranger", channel="seat-testing", topic="t",
-                 content="x", timestamp=1, permalink="",
-                 agent=another1, sender_fqn="bakehouse.agent-eco.stranger")
-    why2 = why_refused(m2, d, tmp_path)
-    assert "not a permitted partner" in why2 and "blocked list" not in why2
+    def mention(sender_fqn, sender="test-codex"):
+        return Mention(id=1, sender=sender, channel="seat-testing", topic="t",
+                       content="x", timestamp=1, permalink="",
+                       agent=agent, sender_fqn=sender_fqn)
 
-    # **The sender-facing bounce must not contradict itself.** Measured on the
-    # swept seats: a refusal read "'test-codex' is not a permitted partner …
-    # Permitted: test-codex, agent-comms, agent-skeleton" -- naming the sender
-    # in the same breath as permitted and not permitted, because the per-agent
-    # rule refused it and the seat-level sentence explained it.
-    listed = d.describe()
-    assert not ("test-codex" in listed and "test-codex" in why and
-                "not a permitted partner" in why), \
-        "a per-agent refusal must not be explained with the seat-level sentence"
+    # 1. Blocked by this agent's own list.
+    monkeypatch.setattr(CS, "agent_set", perms({"blocked": [codex]}))
+    why = why_refused(mention(codex), tmp_path)
+    assert agent in why and "blocked list" in why
+    assert "permissions.comms.blocked" in why, "it must name the authored key"
+    assert "partners" not in why, "a block is not a missing partners entry"
 
+    # 2. Not on this agent's partners list — a different fix, so a different
+    #    sentence, and it must SHOW the list rather than assert one exists.
+    monkeypatch.setattr(CS, "agent_set", perms({"partners": ["bakehouse.agent-eco.dprox"]}))
+    why2 = why_refused(mention(codex), tmp_path)
+    assert "partners" in why2 and "bakehouse.agent-eco.dprox" in why2
+    assert "blocked list" not in why2
+
+    # 3. The directory states nothing, so the channel decided.
+    monkeypatch.setattr(CS, "agent_set", perms({}))
+    why3 = why_refused(mention(codex), tmp_path, in_project=False)
+    assert "channel is what decides" in why3
+    assert "no partners list" in why3, (
+        "it must say the directory is silent, not imply a list refused them")
+    # It must not read as either of the other two: the fix is different.
+    assert "is on" not in why3, "a silent directory was reported as a block"
+
+    # **No sentence may send the reader to a file this build does not read.**
+    for text in (why, why2, why3):
+        assert "comms.yml" not in text, (
+            "a refusal pointed at the retired seat file: " + text)
 
 def test_every_message_states_the_sending_agent(seat):
     """ONE RULE: `--from` is required on every message and has no default.

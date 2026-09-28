@@ -439,9 +439,26 @@ def preflight(
     # means permissions are a default rather than a declaration, and nobody
     # should have to read source to find that out.
     try:
-        directory = load_directory(settings.state_dir, settings.identity.project)
-        report.add("directory", True, directory.summary())
-        report.warnings.extend(directory.warnings)
+        # **Policy is per agent, from the directory. There is no seat file.**
+        # comms 2.x carries no `comms.yml` (ansible-platform's retire need,
+        # operator ruling 2026-09-28), so this reports which of this seat's
+        # agents the directory actually speaks for. An agent it says nothing
+        # about runs on the channel default -- which is a real configuration,
+        # not a fault, but it must be VISIBLE rather than assumed.
+        stated, defaulted = [], []
+        for fqn in sorted(assigned or {}):
+            (stated if agent_partners(fqn, settings.state_dir) is not None
+             else defaulted).append(fqn)
+        if stated or defaulted:
+            report.add("directory", True, "; ".join(filter(None, [
+                f"{len(stated)} agent(s) with a partners list from the directory"
+                if stated else "",
+                (f"{len(defaulted)} on the channel default (no partners stated): "
+                 + ", ".join(defaulted)) if defaulted else "",
+            ])))
+        else:
+            report.add("directory", True,
+                       "no agents assigned yet, so there is no policy to state")
         refused = [m for m in Store(settings.state_dir).all() if not m.authorised]
         if refused:
             # The stored flag records the rule in force when the message arrived,
@@ -751,27 +768,19 @@ def sending_agent(explicit: str) -> str:
     return fqn
 
 
-def why_refused(mention, directory: Directory, state_dir,
-                in_project: bool = False) -> str:
+def why_refused(mention, state_dir, in_project: bool = False) -> str:
     """Which rule refused this sender, and WHERE THAT RULE LIVES.
 
-    There are two layers and they are held in different places by different
-    parties. A refusal that names the wrong one sends a person to a file where
-    nothing is wrong:
+    **All policy is per agent and authored at the directory.** comms 2.x reads
+    no `~/.comms/comms.yml`, so there is no second layer to confuse this with
+    — which is what the old version of this function existed to get right.
 
-    - the **agent's own** `permissions.comms.blocked`, authored at the
-      directory and cached here, which applies to one agent on this seat;
-    - the **seat's** `partners`/`blocked` in `~/.comms/comms.yml`, written by
-      the orchestrator, which applies to everything the seat serves.
-
-    Measured 2026-09-25 on the swept seats: a message correctly refused by the
-    first was reported as *"not a permitted partner"* -- the second's sentence
-    -- while `comms.yml` listed that very sender in `partners` and had an empty
-    `blocked`. The decision was right and the explanation pointed at a file
-    that said the opposite.
-
-    The per-agent rule is checked first because that is the order the decision
-    itself uses; saying otherwise would be a second opinion, not a report.
+    Measured 2026-09-25, before the file went: a message correctly refused by
+    an agent's own blocked list was reported as *"not a permitted partner"* —
+    the seat file's sentence — while that file listed the sender in `partners`
+    with an empty `blocked`. The decision was right and the explanation sent
+    the reader to a file that said the opposite. With one layer there is one
+    sentence, and it can only name the rule that fired.
     """
     agent = getattr(mention, "agent", "") or ""
     sender_fqn = getattr(mention, "sender_fqn", "") or ""
@@ -779,9 +788,59 @@ def why_refused(mention, directory: Directory, state_dir,
         return (f"{sender_fqn} is on {agent}'s blocked list, which the estate "
                 f"authors at the directory (permissions.comms.blocked) and this "
                 f"seat caches in ~/.comms/routes.json. It applies to that agent "
-                f"alone, not to this seat -- ~/.comms/comms.yml is not where "
-                f"this was decided")
-    return directory.refusal(mention.sender, in_project=in_project)
+                f"alone, not to this seat")
+    allowed = agent_partners(agent, state_dir) if agent else None
+    if allowed is not None:
+        named = ", ".join(allowed) or "nobody"
+        return (f"{sender_fqn or mention.sender} is not on {agent}'s partners "
+                f"list, which the estate authors at the directory "
+                f"(permissions.comms.partners) and this seat caches in "
+                f"~/.comms/routes.json. That list names: {named}")
+    if not in_project:
+        return (f"{mention.sender} is not in this seat's channel, and the "
+                f"directory states no partners list for "
+                f"{agent or 'the addressed agent'}, so the channel is what "
+                f"decides. Author the list at the directory to say otherwise")
+    return (f"{mention.sender} was refused, and no rule this seat can read says "
+            f"why — which is itself the fault to report")
+
+
+def may_write_to(hub: Hub, agent: str, sender: str, sender_fqn: str, state_dir) -> bool:
+    """May this sender write to this agent? **The directory decides; no file.**
+
+    comms 2.x carries no `comms.yml` (ansible-platform's retire-comms-yml need,
+    operator ruling 2026-09-28). Policy is per AGENT and authored at the
+    directory, because a seat is a delivery mechanism and not a party to a
+    conversation — it has no FQN, so it cannot be the subject of a rule about
+    who may talk to whom.
+
+    The order, and each step is read rather than computed:
+
+    1. **Humans are never governed.** A human has no FQN and the hub display
+       name is the address; policy is between agents.
+    2. **The agent's own `blocked`** — FQN to FQN, exactly.
+    3. **The agent's own `partners`** — if the directory states one, it
+       decides, and nothing widens it.
+    4. **Otherwise the channel.** The directory has said nothing about this
+       agent, so the default is what a seat with no policy has always had:
+       anyone subscribed to this seat's channel, no cross-project. That is
+       reported by `doctor` per agent, so running on the default is visible
+       rather than assumed.
+
+    Measured before this replaced the file: a seat with no `comms.yml` already
+    behaved as step 4 (`project: true`, no partners), so removing the file
+    widens nothing that was not already the estate's no-file default — and for
+    any agent the directory speaks for, step 3 is narrower than the file was.
+    """
+    in_project, is_human = hub.in_channel(sender)
+    if is_human:
+        return True
+    if agent and sender_fqn and blocks_sender(agent, sender_fqn, state_dir):
+        return False
+    admitted = permits_sender(agent, sender_fqn, state_dir)
+    if admitted is not None:
+        return admitted
+    return in_project
 
 
 def is_permitted(directory: Directory, hub: Hub, sender: str,
@@ -1338,12 +1397,13 @@ def _resolve_recipient(settings: Settings, hub: Hub, name: str, caller: str = ""
         # Reachable is not permitted. The hub says a message *can* arrive; the
         # directory says whether the estate allows it. Same rule as inbound, so
         # a link cannot be one-way by accident.
-        directory = load_directory(settings.state_dir, settings.identity.project)
-        if not is_permitted(directory, hub, match):
-            in_project, _ = hub.in_channel(match)
+        in_project, is_human = hub.in_channel(match)
+        if not (is_human or in_project):
             raise UnknownRecipient(
-                f"not permitted: {directory.refusal(match, in_project=in_project)}"
-            )
+                f"'{match}' is on the hub but not in this seat's channel, so a "
+                "message to it would render and reach nobody. Policy for an agent "
+                "is authored at the directory per agent; this path is the legacy "
+                "seat-name one and checks only reachability.")
         return match
 
     others = ", ".join(n for n in reachable if n.casefold() not in ours) or "nobody"
@@ -1838,7 +1898,6 @@ def _refuse_sender(
     settings: Settings,
     store: Store,
     mention: Mention,
-    directory: Directory,
     hub: Hub,
     bounced: set[str],
     transport_factory: Callable[[Credential], Transport],
@@ -1856,7 +1915,7 @@ def _refuse_sender(
     store.record(
         "warn",
         f"refused message {mention.id} from {mention.sender!r}: "
-        f"{why_refused(mention, directory, settings.state_dir)}",
+        f"{why_refused(mention, settings.state_dir)}",
     )
     key = mention.sender.strip().casefold()
     if key in bounced:
@@ -1874,7 +1933,7 @@ def _refuse_sender(
         mention.topic or f"{settings.identity.seat}: not a permitted sender",
         f"@**{mention.sender}** **your message was not delivered to "
         f"{settings.identity.seat}.** "
-        f"{why_refused(mention, directory, settings.state_dir, in_project=in_project)}"
+        f"{why_refused(mention, settings.state_dir, in_project=in_project)}"
         f"\n\nIt is stored on the seat and visible to the operator, but it did not reach "
         f"the agent. Cite: {mention.permalink}\n\n"
         "Further messages from you to this seat are refused without a reply until the "
@@ -2247,10 +2306,10 @@ def run_daemon(
         store.record("warn", notice)
     hub.verify_subscription()
 
-    directory = load_directory(settings.state_dir, settings.identity.project)
-    for notice in directory.warnings:
-        store.record("warn", notice)
-    store.record("info", f"comms directory: {directory.summary()}")
+    store.record("info", "comms policy: per agent, from the directory "
+                         "(permissions.comms.partners / blocked). This build reads "
+                         "no ~/.comms/comms.yml — a seat is not a party to a "
+                         "conversation, so it is not the subject of one of these rules.")
 
     # Said once per daemon, at the top of the log, because it governs everything
     # the daemon does afterwards: with no trigger it will store every mention and
@@ -2341,20 +2400,11 @@ def run_daemon(
                     body=(event.get("message") or {}).get("content") or "")
                 sender_fqn = envelope_sender(
                     (event.get("message") or {}).get("content") or "")
-                if blocks_sender(addressed, sender_fqn, settings.state_dir):
-                    return False
-                # **The directory's own allow-list for this agent, if it has
-                # one.** `None` means the directory says nothing and the seat
-                # file governs, exactly as before. A list means the directory
-                # is speaking, and it decides -- the file is not consulted to
-                # widen it.
-                admitted = permits_sender(addressed, sender_fqn, settings.state_dir)
-                if admitted is not None:
-                    return admitted
                 try:
-                    return is_permitted(
-                        directory, hub, name,
-                        envelope_sender((event.get("message") or {}).get("content") or ""))
+                    # **One decision, from the directory.** No seat file is
+                    # consulted: comms 2.x carries none.
+                    return may_write_to(hub, addressed, name, sender_fqn,
+                                        settings.state_dir)
                 except Exception as exc:  # noqa: BLE001 - any hub failure
                     undetermined = True
                     store.record(
@@ -2387,7 +2437,7 @@ def run_daemon(
                 # directory is recoverable.
                 if undetermined:
                     return  # held, already logged; no bounce for a non-answer
-                _refuse_sender(settings, store, mention, directory, hub,
+                _refuse_sender(settings, store, mention, hub,
                                bounced, transport_factory)
                 return
             _notify(settings, store, mention)

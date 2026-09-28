@@ -1173,7 +1173,9 @@ def test_doctor_passes_when_every_routed_channel_is_held(seat, monkeypatch):
 
     (seat / ".comms").mkdir(parents=True, exist_ok=True)
     (seat / ".comms" / "routes.json").write_text(json.dumps({"routes": [
-        {"transports": {"comms": {"channel": "agent-eco"}}}]}))
+        {"agent": "bakehouse.agent-eco.agent-comms",
+         "transports": {"comms": {"channel": "agent-eco",
+                                  "bot": "agent-eco-agent-comms"}}}]}))
 
     monkeypatch.setattr(Hub, "subscribed_channels", lambda self: frozenset({"agent-eco"}))
     monkeypatch.setattr("agent_comms.operations.seat_state_now",
@@ -1195,7 +1197,9 @@ def test_doctor_names_grant_without_subscription_as_drift(seat, monkeypatch):
 
     (seat / ".comms").mkdir(parents=True, exist_ok=True)
     (seat / ".comms" / "routes.json").write_text(json.dumps({"routes": [
-        {"transports": {"comms": {"channel": "orchestrator"}}}]}))
+        {"agent": "bakehouse.agent-eco.agent-comms",
+         "transports": {"comms": {"channel": "orchestrator",
+                                  "bot": "agent-eco-agent-comms"}}}]}))
     monkeypatch.setattr(Hub, "subscribed_channels", lambda self: frozenset({"agent-eco"}))
     monkeypatch.setattr("agent_comms.operations.seat_state_now",
                         lambda: __import__("agent_comms.seat", fromlist=["x"]).SeatState(
@@ -1203,10 +1207,24 @@ def test_doctor_names_grant_without_subscription_as_drift(seat, monkeypatch):
                             version="1.0.2", contract="1.0"))
     report = operations.preflight(transport_factory=lambda c: FakeTransport())
 
-    check = next(c for c in report.checks if c[0] == "reachable channels")
+    # **Since 2026-09-28 this is caught one gate EARLIER, and that is better.**
+    #
+    # The seat's own channel used to fall back to the project name, so a seat
+    # routed to `orchestrator` still passed `subscription` on `agent-eco` and
+    # the drift showed up later as a note. With that construction removed, the
+    # seat's channel is the one the directory states — `orchestrator` — and
+    # the bot is not subscribed to it, so comms refuses to start rather than
+    # starting and receiving nothing.
+    #
+    # Same fault, named sooner and harder. `preflight` stops at the first
+    # failure, which is why `reachable channels` is not in the report at all.
+    names = [c[0] for c in report.checks]
+    assert "reachable channels" not in names, names
+    check = next(c for c in report.checks if c[0] == "subscription")
     assert check[1] is False
-    assert "GRANT WITHOUT SUBSCRIPTION" in check[2]
-    assert "replay provisioning" in check[2]
+    assert "orchestrator" in check[2] and "agent-eco" in check[2], (
+        "it must name the channel it wanted AND what the bot actually holds")
+    assert "agent-eco-agent-comms" in check[2], "and which bot"
 
 
 def test_subscription_without_grant_is_a_note_not_a_warning(seat, monkeypatch):
@@ -1223,7 +1241,9 @@ def test_subscription_without_grant_is_a_note_not_a_warning(seat, monkeypatch):
 
     (seat / ".comms").mkdir(parents=True, exist_ok=True)
     (seat / ".comms" / "routes.json").write_text(json.dumps({"routes": [
-        {"transports": {"comms": {"channel": "agent-eco"}}}]}))
+        {"agent": "bakehouse.agent-eco.agent-comms",
+         "transports": {"comms": {"channel": "agent-eco",
+                                  "bot": "agent-eco-agent-comms"}}}]}))
     monkeypatch.setattr(Hub, "subscribed_channels",
                         lambda self: frozenset({"agent-eco", "seat-testing"}))
     monkeypatch.setattr("agent_comms.operations.seat_state_now",
@@ -1576,9 +1596,11 @@ def test_an_agent_declaring_another_seats_bot_is_named_as_wrong():
     from agent_comms.operations import agents_reaching
     wrong, undeclared = agents_reaching({
         "bakehouse.agent-eco.test-claude-new001":
-            {"transports": {"comms": {"bot": "test-claude", "channel": "seat-testing"}}},
+            {"agent": "bakehouse.agent-eco.test-claude",
+             "transports": {"comms": {"bot": "test-claude", "channel": "seat-testing"}}},
         "bakehouse.agent-eco.stray":
-            {"transports": {"comms": {"bot": "some-other-seat", "channel": "seat-testing"}}},
+            {"agent": "bakehouse.agent-eco.other",
+             "transports": {"comms": {"bot": "some-other-seat", "channel": "seat-testing"}}},
     }, ("test-claude", "agent-eco-test-claude"))
     assert wrong == ["bakehouse.agent-eco.stray \u2192 bot 'some-other-seat'"]
     assert undeclared == []

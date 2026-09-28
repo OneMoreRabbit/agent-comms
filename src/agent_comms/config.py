@@ -143,13 +143,16 @@ class Identity(BaseModel):
 
     @property
     def bot_name(self) -> str:
-        """This seat's bot, as the directory states it.
+        """This seat's bot, as the directory states it — or empty.
 
-        Falls back to `<project>-<seat>` ONLY on a seat that has never synced,
-        because a fresh seat must still be able to find its credential and say
-        what it is. The fallback is reported by `doctor`, never silent.
+        **Empty is an answer.** A seat on its first install has no assignments,
+        so the directory has not said what its bot is, and constructing one
+        would name an account that may not exist: until 2026-09-28 this
+        returned `<project>-<seat>`, which on the test seats is wrong (the bot
+        is `test-claude`, not `agent-eco-test-claude`). Callers that need a bot
+        must handle absence; the credential is found by looking, not spelling.
         """
-        return self.declared.bot or f"{self.project}-{self.seat}"  # gate-exempt: the PRE-SYNC fallback only. A seat that has never read the directory must still name itself and find its credential or a fresh container cannot start. Declared.source records that it was not read, and doctor reports it.
+        return self.declared.bot
 
     @property
     def credential_candidates(self) -> list[Path]:
@@ -161,9 +164,26 @@ class Identity(BaseModel):
         guessed spellings; the guesses stay only for a seat with no cache yet.
         """
         secrets = Path.home() / ".secrets"
-        first = [secrets / f"zuliprc-{self.declared.bot}"] if self.declared.bot else []
-        return first + [secrets / f"zuliprc-{self.seat}",
-                        secrets / f"zuliprc-{self.project}-{self.seat}"]  # gate-exempt: the PRE-SYNC fallback only. A seat that has never read the directory must still name itself and find its credential or a fresh container cannot start. Declared.source records that it was not read, and doctor reports it.
+        preferred = [secrets / f"zuliprc-{self.declared.bot}"] if self.declared.bot else []
+        # **DISCOVER the credential; never spell one that is not there.**
+        #
+        # `zuliprc-<declared bot>` comes first when the directory has named a
+        # bot, because that is the estate's rule. But the rule is not always
+        # what the deployer did: this seat's bot is `agent-eco-agent-comms`
+        # and its file is `zuliprc-agent-comms`. So whatever else is present
+        # follows, in a stable order.
+        #
+        # This replaced two CONSTRUCTED fallbacks, `zuliprc-<seat>` and
+        # `zuliprc-<project>-<seat>`, which could both be wrong at once — a
+        # file named anything else defeated both and the seat could not start.
+        # A seat on its first install has no declared bot at all, and must
+        # still reach the hub.
+        try:
+            found = sorted(secrets.glob("zuliprc-*"))
+        except OSError:
+            found = []
+        seen = {p.name for p in preferred}
+        return preferred + [p for p in found if p.name not in seen]
 
     @property
     def credential_path(self) -> Path:
@@ -348,8 +368,14 @@ def load_settings(state_dir: Path | None = None, seat_manifest: Path | None = No
         # PROJECT NAME is no longer a fallback: it was wrong on both test seats
         # (project `agent-eco`, channel `seat-testing`) and worked only because
         # both channels happened to be subscribed.
+        # **No channel is a real state on a new seat, not something to fill
+        # in.** This ended `or project`, which joined a channel named after the
+        # project on any seat that had not synced. A seat with zero assignments
+        # has no agents, so no mail is possible and there is nothing to join —
+        # it idles on refresh until the estate assigns, then joins what the
+        # directory names (ansible-platform's retire-comms-yml need).
         channel=(os.environ.get("AGENT_COMMS_CHANNEL") or declared.channel
-                 or file_cfg.get("channel") or project),
+                 or file_cfg.get("channel") or ""),
         lifespan_secs=int(file_cfg.get("lifespan_secs", DEFAULT_LIFESPAN_SECS)),
         state_dir=state_dir,
         notify_command=os.environ.get("AGENT_COMMS_NOTIFY") or file_cfg.get("notify_command"),

@@ -107,6 +107,30 @@ def fetch(project: str, seat: str, state_dir: Path, timeout: float = 10.0) -> Fe
         # Fail closed. An answer we cannot read must never replace a set we can.
         return _from_file(target, "the directory answered something that is not an assignment set")
 
+    # **An EMPTY answer must not silently replace a populated set.**
+    #
+    # Zero assignments is correct on a seat that has never been assigned — it
+    # has no agents, so no mail is possible and there is nothing to join. On a
+    # seat that served five agents a minute ago it is almost certainly a fault,
+    # and accepting it costs that seat its bot and its channel: it goes quiet,
+    # which is the failure this whole client is built to make impossible.
+    #
+    # The shape above already fails closed on a body we cannot READ. This is
+    # the same rule for a body we can read and should not believe: keep what we
+    # have, and say so loudly rather than degrading in silence. A seat whose
+    # agents really were all unassigned reports this once and clears on the
+    # next answer that agrees.
+    if not (body.get("assignments") or []):
+        held = load(target.parent)
+        if held.get("routes"):
+            return _from_file(
+                target,
+                f"the directory answered with NO assignments while this seat holds "
+                f"{len(held['routes'])}. Keeping the held set: accepting an empty "
+                f"answer would take this seat's bot and channel with it and leave it "
+                f"silent. If the estate really did unassign every agent here, the "
+                f"next answer that agrees will clear this.")
+
     fetched_at = datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
     record = {"contract": body.get("contract", ""),
               "generation": body.get("generation", 0),
