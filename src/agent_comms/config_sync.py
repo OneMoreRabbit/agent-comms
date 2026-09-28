@@ -138,8 +138,11 @@ def _complete(assignments: list) -> list:
     failed lookup is not a statement that a value is absent, and treating it as
     one would quietly widen a permission the moment the directory hiccuped.
     """
+    # `agent` is the key the estate-directory contract names, and the only one
+    # read. `or a.get("id")` stood here until 2026-09-28: a guess at a second
+    # shape, which succeeds silently when it is wrong.
     missing = [a for a in assignments
-               if a.get("agent") or a.get("id")
+               if a.get("agent")
                if "transports" not in a or "permissions" not in a]
     if not missing:
         return [dict(a) for a in assignments]
@@ -149,7 +152,7 @@ def _complete(assignments: list) -> list:
     out = []
     for record in assignments:
         record = dict(record)
-        fqn = record.get("agent") or record.get("id")
+        fqn = record.get("agent")
         if fqn and ("transports" not in record or "permissions" not in record):
             try:
                 answer = resolver.resolve(fqn, caller=fqn)
@@ -202,10 +205,28 @@ def agent_set(state_dir: Path) -> dict[str, dict]:
     """
     out: dict[str, dict] = {}
     for record in load(state_dir).get("routes") or []:
-        fqn = record.get("agent") or record.get("id")
-        if fqn:
-            out[fqn] = {"id": fqn, "delivery": record.get("delivery", ""),
-                        "label": record.get("label", ""),
-                        "transports": record.get("transports") or {},
-                        "permissions": record.get("permissions") or {}}
+        # **`agent` is the key. There is no second candidate, and no guess.**
+        #
+        # This read `record.get("agent") or record.get("id")` until 2026-09-28:
+        # a fallback chain over key names, which is deciding for yourself where
+        # an identifier lives rather than reading the one place that records
+        # it. The estate-directory contract names `agent` in every assignment
+        # row; `id` was a guess at some other shape, and a guess that silently
+        # succeeds is worse than one that fails, because it produces an answer
+        # nobody checks.
+        #
+        # A row without `agent` is a contract break, not a row to skip
+        # quietly: it is kept here under the empty key so `doctor` can report
+        # it, because a route dropped in silence reads exactly like a route
+        # that was never assigned.
+        fqn = record.get("agent")
+        if not fqn:
+            out.setdefault("", {"id": "", "unreadable": True,
+                                "delivery": "", "label": "",
+                                "transports": {}, "permissions": {}})
+            continue
+        out[fqn] = {"id": fqn, "delivery": record.get("delivery", ""),
+                    "label": record.get("label", ""),
+                    "transports": record.get("transports") or {},
+                    "permissions": record.get("permissions") or {}}
     return out

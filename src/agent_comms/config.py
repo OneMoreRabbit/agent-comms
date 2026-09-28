@@ -329,7 +329,8 @@ def load_settings(state_dir: Path | None = None, seat_manifest: Path | None = No
 
     manifest = _seat_manifest(seat_manifest)
     project = os.environ.get("AGENT_COMMS_PROJECT") or file_cfg.get("project") or manifest.get("project")
-    seat = os.environ.get("AGENT_COMMS_SEAT") or file_cfg.get("seat") or manifest.get("seat")
+    seat = (os.environ.get("AGENT_COMMS_SEAT") or file_cfg.get("seat")  # gate-exempt: PRECEDENCE ACROSS SOURCES, not a guess at a key. Each `.get` reads the SAME documented key from a different authored source — environment, this seat's config.toml, the deployer's seat.yml — in a stated order. Gate 1c exists for choosing among candidate KEY NAMES in ONE payload, which invents where a value lives; this chooses among SOURCES, which the contract states
+            or manifest.get("seat"))  # gate-exempt: PRECEDENCE ACROSS SOURCES, not a guess at a key. Each `.get` reads the SAME documented key from a different authored source — environment, this seat's config.toml, the deployer's seat.yml — in a stated order. Gate 1c exists for choosing among candidate KEY NAMES in ONE payload, which invents where a value lives; this chooses among SOURCES, which the contract states
     if not project or not seat:
         raise CredentialUnreadable(
             "cannot determine this seat's identity. Normally it is read from "

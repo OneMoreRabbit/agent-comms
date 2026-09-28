@@ -24,6 +24,15 @@ import pathlib
 import re
 
 SRC = pathlib.Path(__file__).resolve().parent.parent / "src" / "agent_comms"
+
+#: **Gates 1, 1a, 1b and 1c scan the TESTS too, not only `src/`.**
+#: A fixture that builds an identifier teaches the same habit and then blesses
+#: the code that copies it: on 2026-09-28 the per-agent blocked fixtures here
+#: carried short names, which is what kept a last-segment fallback alive in the
+#: client. The rule is the estate's, not this package's, so it applies wherever
+#: this repo names an agent.
+TESTS = pathlib.Path(__file__).resolve().parent
+ADDRESSING_SCOPE = (SRC, TESTS)
 TESTS = pathlib.Path(__file__).resolve().parent
 #: A line carrying this marker is exempt, and must say why on the same line.
 EXEMPT = "gate-exempt:"
@@ -233,3 +242,40 @@ def test_gate_1b_no_addressing_value_is_TAKEN_APART():
     """
     hits = [(p, n, l) for p, n, l in _live(SRC) if _DECOMPOSE.search(l)]
     _report(hits, "1b (an addressing value taken apart — read the verdict instead)")
+
+
+# -- gate 1c: an identifier is not GUESSED AT among candidate keys ------------
+
+#: Reaching for an identifier by trying one key and falling back to another:
+#: `row.get("agent") or row.get("fqn")`. Gate 1a catches an identity built from
+#: parts and 1b catches one pulled apart; this is the third way to invent one —
+#: deciding for yourself where it lives.
+_IDENT_KEYS = r"(?:agent|fqn|canonical_id|bot|channel|seat|target|caller)"
+_GUESSED_KEY = re.compile(
+    rf"\.get\(\s*['\"]{_IDENT_KEYS}['\"].*?\)\s*or\s*\w+\.get\(")
+
+
+def test_gate_1c_an_identifier_is_not_GUESSED_AT_among_candidate_keys():
+    """**Measured 2026-09-28, and the operator had ruled against it already.**
+
+    A diagnostic read a seat's cached agent set with
+    `d.get("assignments") or d.get("agents")`, then took each agent's name with
+    `a.get("agent") or a.get("fqn")`. Both guesses were wrong, it reported
+    `agents: 0` for a seat serving five, and the wrong answer was very nearly
+    reported to the estate as a measurement.
+
+    Gate 1a saw nothing built and 1b saw nothing split, because the fault is
+    neither: it is deciding for yourself WHERE an identifier lives instead of
+    reading it from the one place that records it. The supported accessor —
+    `config_sync.agent_set()` — answered correctly on the first call.
+
+    **A fallback chain over key names is a guess wearing an `or`.** If two
+    shapes are genuinely possible, that is a contract question, not something
+    to paper over at the call site: pick the documented key and let a missing
+    one fail loudly.
+    """
+    hits = []
+    for root in ADDRESSING_SCOPE:
+        hits += [(p, n, l) for p, n, l in _live(root) if _GUESSED_KEY.search(l)]
+    _report(hits, "1c (an identifier guessed at among candidate keys — "
+                  "read it from the one place that records it)")
