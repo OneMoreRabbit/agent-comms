@@ -376,6 +376,39 @@ def preflight(
                    f"nothing to verify — {why}. Stated rather than omitted: an absent "
                    f"check reads the same as a passing one.")
 
+    # **A policy entry this client cannot honour must be VISIBLE.**
+    #
+    # The per-agent blocked list is matched FQN to FQN exactly, with no
+    # last-segment fallback since 2026-09-28. That is the right comparison and
+    # it has one failure mode: an entry written in the old short form now
+    # matches nobody. The rule the estate meant to apply is silently inert, and
+    # silence here fails OPEN -- the sender is delivered.
+    #
+    # Every other refusal in this client is loud. This one cannot be, because
+    # nothing is refused; so the seat reports the entry instead, and names the
+    # agent it was authored against.
+    strays: list[str] = []
+    for fqn, record in (assigned or {}).items():
+        for entry in ((record.get("permissions") or {}).get("comms") or {}).get("blocked") or []:
+            text = str(entry).strip()
+            # An FQN is estate.project.agent -- three non-empty segments. Shape
+            # only: nothing is inferred from the parts.  # gate-exempt: SHAPE VALIDATION only — asks whether a string is FQN-shaped and infers no fact from the parts
+            if not (text.count(".") == 2 and all(text.split("."))):  # gate-exempt: SHAPE VALIDATION only — asks whether a string is FQN-shaped and infers no fact from the parts
+                strays.append(f"{text!r} on {fqn}")
+    if strays:
+        report.add(
+            "policy entries", False,
+            "blocked-list entries that are not FQNs and therefore match nobody: "
+            + "; ".join(strays)
+            + ". The estate authors these at the directory "
+            "(permissions.comms.blocked) and they are compared FQN to FQN, "
+            "exactly. A short name is not narrowed to a guess — it is reported "
+            "here, because an unenforceable block fails OPEN and would "
+            "otherwise be invisible. Re-author it as estate.project.agent.")
+    elif assigned:
+        report.add("policy entries", True,
+                   "every blocked-list entry this seat caches is an FQN")
+
     try:
         registration = hub.register_queue()
     except CommsError as exc:
@@ -587,9 +620,16 @@ def blocks_sender(agent: str, sender_fqn: str, state_dir) -> bool:
     no spelling rule that is both tight enough and wide enough, which is the
     signal that the comparison was on the wrong thing.
 
-    A blocked entry is matched as an FQN, or -- because the estate writes
-    short names in these lists today -- as the LAST SEGMENT of one, which is
-    unambiguous once both sides are FQNs.
+    **FQN to FQN, exactly. No last-segment fallback, since 2026-09-28.**
+    Until then a short entry was also matched against the last segment of the
+    sender's FQN, because the estate wrote short names in these lists. The
+    estate now writes FQNs (directory generation 42, measured), so the
+    comparison is string equality between two FQNs and nothing is taken apart.
+
+    An entry that is not an FQN therefore matches nothing and is reported by
+    `doctor` rather than guessed at: a rule the estate meant to apply and
+    spelled in a form this client cannot honour must be visible, not silently
+    inert.
 
     An unmarked sender states no FQN, so no per-agent block can name it: the
     seat-level rules in `comms.yml` decide alone. That is a gap in what the
@@ -599,7 +639,6 @@ def blocks_sender(agent: str, sender_fqn: str, state_dir) -> bool:
     if not agent or not sender_fqn:
         return False
     from . import config_sync
-    from .directory import short_name
     try:
         record = config_sync.agent_set(state_dir).get(agent) or {}
     except Exception:  # noqa: BLE001 - an unreadable cache must not block mail
@@ -608,12 +647,7 @@ def blocks_sender(agent: str, sender_fqn: str, state_dir) -> bool:
     theirs = sender_fqn.strip().casefold()
     if not theirs:
         return False
-    last = short_name(theirs)
-    for entry in blocked:
-        mine = str(entry).strip().casefold()
-        if mine == theirs or (mine == last and "." not in mine):
-            return True
-    return False
+    return any(str(entry).strip().casefold() == theirs for entry in blocked)
 
 
 #: **FOR RETIREMENT after the estate has migrated.** A sender that states no

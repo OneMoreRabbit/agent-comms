@@ -571,11 +571,33 @@ def test_a_per_agent_block_from_the_directory_is_enforced(tmp_path, monkeypatch)
     another1 = "bakehouse.agent-eco.test-claude-another1"
     new001 = "bakehouse.agent-eco.test-claude-new001"
     monkeypatch.setattr(CS, "agent_set", lambda _d: {
-        another1: {"permissions": {"comms": {"blocked": ["test-codex", "probe-two"]}}},
+        # **FQNs, as the estate now writes them** (directory generation 42,
+        # 2026-09-28). These fixtures carried short names and were the thing
+        # keeping the last-segment fallback alive: the tolerance existed for
+        # the estate's old spelling, and the tests had quietly adopted it.
+        another1: {"permissions": {"comms": {
+            "blocked": ["bakehouse.agent-eco.test-codex",
+                        "bakehouse.agent-eco.probe-two"]}}},
         new001: {"permissions": {"comms": {}}}})
 
     codex = "bakehouse.agent-eco.test-codex"
     assert blocks_sender(another1, codex, tmp_path) is True
+
+    # **The near-miss that proves the guessing is gone (2026-09-28).** A SHORT
+    # entry must not match an FQN sender. Until today it did: the entry was
+    # compared against the last segment of the sender's FQN, so `test-codex`
+    # matched `bakehouse.agent-eco.test-codex` -- an identifier taken apart to
+    # reach a permission decision. The estate now writes FQNs (directory
+    # generation 42), so the comparison is equality between two FQNs.
+    #
+    # This is the ONE case where losing a match means MORE mail is delivered,
+    # not less, so it earns a test rather than a comment: a short entry now
+    # blocks nobody, and the seat must say so rather than appear to enforce a
+    # rule it cannot read (`doctor`, `policy entries`).
+    monkeypatch.setattr(CS, "agent_set", lambda _d: {
+        another1: {"permissions": {"comms": {"blocked": ["test-codex"]}}}})
+    assert blocks_sender(another1, codex, tmp_path) is False, (
+        "a short name still matched an FQN sender — the last-segment fallback is back")
     # Per AGENT: the sibling does not inherit the block.
     assert blocks_sender(new001, codex, tmp_path) is False
     assert blocks_sender(another1, "bakehouse.agent-eco.agent-skeleton", tmp_path) is False
@@ -648,7 +670,8 @@ def test_a_refusal_names_the_rule_that_fired_and_where_it_lives(tmp_path, monkey
     another1 = "bakehouse.agent-eco.test-claude-another1"
     codex = "bakehouse.agent-eco.test-codex"
     monkeypatch.setattr(CS, "agent_set", lambda _d: {
-        another1: {"permissions": {"comms": {"blocked": ["test-codex"]}}}})
+        another1: {"permissions": {"comms": {
+            "blocked": ["bakehouse.agent-eco.test-codex"]}}}})
     # comms.yml PERMITS this sender -- the per-agent rule is what refused it.
     d = Directory(project=False, partners=("test-codex",), source="~/.comms/comms.yml",
                   own_project="agent-eco")
@@ -872,3 +895,44 @@ def test_send_refusing_a_bare_role_carries_the_directorys_near_misses(seat):
                         from_fqn="bakehouse.agent-eco.agent-comms")
     assert "Did you mean" not in str(caught.value), (
         "a 'did you mean' with nothing to mean is noise that trains readers to skip it")
+
+
+def test_doctor_reports_a_blocked_entry_that_matches_nobody(seat, monkeypatch):
+    """**An unenforceable block fails OPEN, so it must be visible.**
+
+    Since 2026-09-28 the per-agent blocked list is compared FQN to FQN with no
+    last-segment fallback: a short name is not narrowed to a guess. That is the
+    right comparison and it has one failure mode — an entry still written in the
+    old form now matches nobody, the rule the estate authored is inert, and the
+    sender is DELIVERED.
+
+    Every other refusal in this client is loud. This one cannot be, because
+    nothing is refused. So `doctor` reports the entry and names the agent it
+    was authored against, and that is the only place it can be seen.
+    """
+    from agent_comms import operations
+    import agent_comms.config_sync as CS
+    from agent_comms.hub import Hub
+    from tests.conftest import FakeTransport
+
+    AGENT = "bakehouse.agent-eco.agent-comms"
+    monkeypatch.setattr(Hub, "subscribed_channels", lambda self: frozenset({"agent-eco"}))
+
+    def assigned(blocked):
+        return lambda _d: {AGENT: {"permissions": {"comms": {"blocked": blocked}}}}
+
+    # A short entry: inert, and reported.
+    monkeypatch.setattr(CS, "agent_set", assigned(["test-codex"]))
+    report = operations.preflight(transport_factory=lambda c: FakeTransport())
+    check = next(c for c in report.checks if c[0] == "policy entries")
+    assert check[1] is False, "a short entry matched nobody and doctor said nothing"
+    assert "test-codex" in check[2], check[2]
+    assert AGENT in check[2], "the report did not name the agent it was authored against"
+
+    # The control: the same list as FQNs is enforceable, and passes quietly.
+    monkeypatch.setattr(CS, "agent_set", assigned(["bakehouse.agent-eco.test-codex"]))
+    report = operations.preflight(transport_factory=lambda c: FakeTransport())
+    check = next(c for c in report.checks if c[0] == "policy entries")
+    assert check[1] is True, check[2]
+    assert "test-codex" not in check[2], (
+        "a passing check should not list entries — noise trains readers to skip it")

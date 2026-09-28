@@ -263,6 +263,13 @@ def test_doctor_reports_every_check_not_just_the_first(running_daemon, monkeypat
                      # assigned here whose transport names another seat's bot, which
                      # is silent at the sender and visible only here.
                      "agents reach this seat",
+                     # "policy entries" added 2026-09-28, when the per-agent blocked
+                     # list became FQN-exact and the last-segment fallback was
+                     # removed. An entry still written in the old short form now
+                     # matches NOBODY: the rule is inert and it fails OPEN, so
+                     # nothing is refused and nothing is loud. This is the only
+                     # place it can be seen.
+                     "policy entries",
                      "event queue", "deliverable", "directory", "seat build", "daemon",
                      "wake trigger"]
     assert report.ok
