@@ -594,6 +594,53 @@ def _permalink(site: str, event_msg: dict) -> str:
     return f"{site}/#narrow/channel/{stream_id}-{slug}/topic/{quoted}/near/{event_msg['id']}"
 
 
+def agent_partners(agent: str, state_dir) -> tuple[str, ...] | None:
+    """The ADDRESSED AGENT's own allow-list from the directory, or None.
+
+    **`None` and `()` mean different things and the difference is the whole
+    point.** `None` is *the directory says nothing about who may write to this
+    agent* — the seat file still governs. `()` would be *the directory says
+    nobody may*, which no caller should silently turn into "everybody".
+
+    Until 2026-09-28 comms read the directory's `blocked` and took `partners`
+    only from `comms.yml`, so an allow-list authored at the directory was
+    ignored while the file's copy decided. Two stores for one fact, and comms
+    obeying the one the estate had stopped authoring. Measured on test-claude:
+    `bakehouse.agent-eco.test-claude` carried three FQN partners at the
+    directory and nothing read them.
+    """
+    if not agent:
+        return None
+    from . import config_sync
+    try:
+        record = config_sync.agent_set(state_dir).get(agent) or {}
+    except Exception:  # noqa: BLE001 - an unreadable cache must not decide
+        return None
+    comms = (record.get("permissions") or {}).get("comms") or {}
+    if "partners" not in comms:
+        return None
+    return tuple(str(e).strip() for e in (comms.get("partners") or ()))
+
+
+def permits_sender(agent: str, sender_fqn: str, state_dir) -> bool | None:
+    """Does the addressed agent's own allow-list admit this sender?
+
+    `True` admitted, `False` refused, **`None` the directory has no opinion**
+    — and only `None` falls through to the seat file. Compared FQN to FQN,
+    exactly: an entry that is not an FQN matches nobody and is reported by
+    `doctor`, never narrowed to a guess.
+    """
+    allowed = agent_partners(agent, state_dir)
+    if allowed is None:
+        return None
+    theirs = (sender_fqn or "").strip().casefold()
+    if not theirs:
+        # An unmarked sender states no FQN, so a per-agent allow-list cannot
+        # name it. That is the seat file's case, not a silent admission here.
+        return None
+    return any(e.strip().casefold() == theirs for e in allowed)
+
+
 def blocks_sender(agent: str, sender_fqn: str, state_dir) -> bool:
     """Does the ADDRESSED AGENT's own directory policy refuse this sender?
 
@@ -2292,10 +2339,18 @@ def run_daemon(
                     (event.get("message") or {}).get("subject") or "",
                     config_sync.agent_set(settings.state_dir),
                     body=(event.get("message") or {}).get("content") or "")
-                if blocks_sender(addressed,
-                                 envelope_sender((event.get("message") or {}).get("content") or ""),
-                                 settings.state_dir):
+                sender_fqn = envelope_sender(
+                    (event.get("message") or {}).get("content") or "")
+                if blocks_sender(addressed, sender_fqn, settings.state_dir):
                     return False
+                # **The directory's own allow-list for this agent, if it has
+                # one.** `None` means the directory says nothing and the seat
+                # file governs, exactly as before. A list means the directory
+                # is speaking, and it decides -- the file is not consulted to
+                # widen it.
+                admitted = permits_sender(addressed, sender_fqn, settings.state_dir)
+                if admitted is not None:
+                    return admitted
                 try:
                     return is_permitted(
                         directory, hub, name,

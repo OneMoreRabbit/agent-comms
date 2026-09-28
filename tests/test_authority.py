@@ -936,3 +936,60 @@ def test_doctor_reports_a_blocked_entry_that_matches_nobody(seat, monkeypatch):
     assert check[1] is True, check[2]
     assert "test-codex" not in check[2], (
         "a passing check should not list entries — noise trains readers to skip it")
+
+
+def test_the_directorys_partners_list_decides_and_an_absent_one_does_not(seat, tmp_path,
+                                                                         monkeypatch):
+    """**comms read the directory's `blocked` and ignored its `partners`.**
+
+    Measured on test-claude 2026-09-28: `bakehouse.agent-eco.test-claude`
+    carried three FQN partners at the directory (generation 42) and nothing in
+    this client read them — the allow-list came from `comms.yml` alone. Two
+    stores for one fact, with comms obeying the one the estate had stopped
+    authoring.
+
+    The three cases are different and only one of them defers to the file:
+
+    - a list that names the sender -> admitted
+    - a list that does not -> refused, and the seat file is NOT consulted to
+      widen it
+    - **no list at all -> `None`**, the directory has no opinion, the seat file
+      governs exactly as before
+
+    That last one is why this is safe to land before every agent has a list:
+    the four fixture agents carry `comms: {}` today, and they must keep
+    receiving mail.
+    """
+    from agent_comms.operations import agent_partners, permits_sender
+    import agent_comms.config_sync as CS
+
+    AGENT = "bakehouse.agent-eco.test-claude"
+    CODEX = "bakehouse.agent-eco.test-codex"
+    OTHER = "bakehouse.agent-eco.dprox"
+
+    def rows(comms):
+        return lambda _d: {AGENT: {"permissions": {"comms": comms}}}
+
+    # A list that names them.
+    monkeypatch.setattr(CS, "agent_set", rows({"partners": [CODEX, OTHER]}))
+    assert permits_sender(AGENT, CODEX, tmp_path) is True
+
+    # A list that does not. Refused HERE — the seat file must not widen it.
+    monkeypatch.setattr(CS, "agent_set", rows({"partners": [OTHER]}))
+    assert permits_sender(AGENT, CODEX, tmp_path) is False
+
+    # **No list at all is not an empty list.** The directory has no opinion,
+    # so the answer is None and the caller falls through to the seat file.
+    monkeypatch.setattr(CS, "agent_set", rows({}))
+    assert agent_partners(AGENT, tmp_path) is None
+    assert permits_sender(AGENT, CODEX, tmp_path) is None
+
+    # And an EMPTY list is an opinion: nobody. Never silently "everybody".
+    monkeypatch.setattr(CS, "agent_set", rows({"partners": []}))
+    assert agent_partners(AGENT, tmp_path) == ()
+    assert permits_sender(AGENT, CODEX, tmp_path) is False
+
+    # FQN to FQN, exactly: a short entry names nobody.
+    monkeypatch.setattr(CS, "agent_set", rows({"partners": ["test-codex"]}))
+    assert permits_sender(AGENT, CODEX, tmp_path) is False, (
+        "a short name admitted an FQN sender — that is the guessing that was removed")
