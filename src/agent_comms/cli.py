@@ -148,7 +148,9 @@ def _say_sent(posted, word: str = "sent") -> None:
 
 @main.command()
 @click.option("--to", required=True,
-              help="The seat this message is for, by plain name (agent-skeleton).")
+              help="The FQN of the AGENT this message is for — "
+                   "estate.project.agent. A bare name is not an address: the "
+                   "directory answers `unknown` for it and the send is refused.")
 @click.option("--subject", default=None, help="Subject; the topic becomes '<to>: <subject>'.")
 @click.option("--topic", default=None,
               help="Continue an existing topic instead of starting one. Still needs --to.")
@@ -156,22 +158,27 @@ def _say_sent(posted, word: str = "sent") -> None:
 @click.argument("content")
 def send(to: str, subject: str | None, topic: str | None, from_fqn: str,
          content: str) -> None:
-    """Post to this seat's project channel, addressed to a named seat.
+    """Post to this seat's channel, addressed from one AGENT to another.
 
-    You name the seat; this client spells the address:
+    Both ends are FQNs. A message is from an agent to an agent; the seat is the
+    delivery mechanism and has no FQN of its own, so neither end can be defaulted:
 
-        comms send --to agent-skeleton --subject 'the ask' 'body text'
+        comms send --from estate.project.sender --to estate.project.recipient \
+                   --subject 'the ask' 'body text'
 
-    gives the topic `agent-skeleton: the ask` and a real `@**agent-skeleton**`
-    mention — both routes a recipient matches on, so it does not matter which.
+    gives the topic `estate.project.recipient: the ask` and a real mention of the
+    recipient's seat bot — both routes a recipient matches on, so it does not
+    matter which.
 
-    The body is never rewritten: a seat name typed in prose is prose, and
-    addressing travels in the flag, not the text. It IS now read for one thing —
-    an explicit `@**name**` is checked for reachability, and you get a warning on
-    stderr if that name cannot see this channel. The message still posts.
+    **A bare name is not an address.** `--to agent-skeleton` resolves to
+    `unknown` at the directory and the send is refused rather than posted. The
+    directory is read, never pattern-matched: nothing here builds an identifier
+    out of parts or guesses among candidates.
 
-    The name in --to is checked against the hub first, and a seat that does not
-    exist or is not in this channel is refused rather than posted to.
+    The body is never rewritten: a name typed in prose is prose, and addressing
+    travels in the flag, not the text. It IS read for one thing — an explicit
+    `@**name**` is checked for reachability, and you get a warning on stderr if
+    that name cannot see this channel. The message still posts.
     """
     posted = operations.send(content, to=to, subject=subject, topic=topic,
                              from_fqn=from_fqn)

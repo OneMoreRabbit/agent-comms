@@ -1202,13 +1202,14 @@ def send(
     transport_factory: Callable[[Credential], Transport] = build_transport,
     **kw,
 ) -> dict:
-    """Post to this seat's project channel, addressed to a named seat.
+    """Post to this seat's channel, addressed from one AGENT to another.
 
-    **The protocol is one line: the sender names the seat, this client spells the
-    address.** `--to` is required and carries a plain seat name; the topic
-    becomes `<recipient>: <subject>` and the body is prefixed with a real
-    `@**<recipient>**` mention, so both of the two routes a recipient matches on
-    are covered without the sender knowing which.
+    **The protocol is one line: both ends are FQNs, and the directory resolves
+    them.** `--to` is required and carries the recipient AGENT's FQN — a bare
+    name resolves to `unknown` and is refused. The topic becomes
+    `<recipient>: <subject>` and the body is prefixed with a real mention of the
+    recipient's seat bot, so both of the two routes a recipient matches on are
+    covered without the sender knowing which.
 
     **The body is never rewritten.** An earlier version scanned message text for
     `@name` and converted it, which is guesswork about prose — it has to decide
@@ -1232,9 +1233,10 @@ def send(
 
     if not to or not to.strip():
         raise Unaddressed(
-            "nothing to address this to. Every message names its recipient: "
-            "--to <seat> --subject '<what it is about>'. The body is not scanned "
-            "for addressing, so a seat named only in the text reaches nobody."
+            "nothing to address this to. Every message names its recipient by "
+            "FQN: --to <estate.project.agent> --subject '<what it is about>'. "
+            "The body is not scanned for addressing, so a name that appears only "
+            "in the text reaches nobody."
         )
 
     recipient = to.lstrip("@").strip("*").strip()
