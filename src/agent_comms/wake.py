@@ -68,6 +68,44 @@ def compose_turn(mention: dict) -> str:
     )
 
 
+class Held(Exception):
+    """This agent's declared delivery mode says do not inject.
+
+    `hold` means accepted and stored, never put in front of the agent -- the
+    agent asks for it. Distinct from an undeliverable message: nothing is
+    wrong, nothing should be retried, and the message is not lost.
+    """
+
+
+def holds(agent: str, state_dir=None) -> bool:
+    """Does this agent's DECLARED delivery mode forbid injecting?
+
+    Read from the seat's own assignment set, which carries `delivery` per
+    agent. The sender has its own gate -- `permitted_to_send` refuses `none`
+    before anything is posted -- but `hold` is a RECEIVING decision: the
+    message is accepted and stored here, and only the far end knows not to put
+    it in a session.
+
+    Until 2026-09-25 the receive path read no delivery mode at all, so `hold`
+    was honoured nowhere. It looked honoured on test-claude only because the
+    held agent had no session for an unrelated reason -- a check passing for
+    the wrong reason (UC-04).
+
+    Unknown agent, unknown mode, or no assignment set: inject, which is the
+    1.0 behaviour. A mode we cannot read must not silently withhold mail.
+    """
+    if not agent:
+        return False
+    from . import config_sync
+    from .config import load_settings
+    try:
+        where = state_dir if state_dir is not None else load_settings().state_dir
+        record = config_sync.agent_set(where).get(agent) or {}
+    except Exception:  # noqa: BLE001 - never withhold mail because a read failed
+        return False
+    return (record.get("delivery") or "").strip().casefold() == "hold"
+
+
 def wake(mention: dict, **_ignored) -> Delivery:
     """Compose the turn and hand it to the seat. Returns what the seat said.
 
@@ -80,7 +118,22 @@ def wake(mention: dict, **_ignored) -> Delivery:
     flag-day across the daemon, and the parameters are genuinely unused rather
     than quietly honoured.
     """
+    agent = mention.get("agent") or None
+    if holds(agent or ""):
+        # `hold`: accepted, stored, never injected. The agent asks for it.
+        raise Held(f"{agent} is delivery: hold — stored, not injected")
+
     try:
-        return seat_app.deliver(compose_turn(mention))
+        # **Dispatch on the envelope FQN, and nothing else.** A seat can serve
+        # several agents behind one bot, so "it arrived at the seat" is not
+        # "it arrived at the agent": without this the seat delivers to its
+        # DEFAULT agent and reports `delivered`, which is a silent delivery to
+        # the wrong recipient. Measured on test-claude 2026-09-25 — a message
+        # addressed to `test-claude-another1` landed in new001's session and
+        # another1's had nothing.
+        #
+        # Empty means the message was addressed to the seat, and no `--agent`
+        # is passed: the seat's declared default answers, as it did at 1.0.
+        return seat_app.deliver(compose_turn(mention), agent=agent)
     except (SeatUnavailable, SeatContractUnsupported) as exc:
         raise WakeError(str(exc)) from exc

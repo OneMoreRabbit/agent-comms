@@ -289,7 +289,7 @@ def test_a_permanently_failing_message_stops_being_retried(seat, monkeypatch):
     fake_seat(monkeypatch, {"success": False, "status": "failed",
                             "message": "body is 70000 bytes; the limit is 65536"}, code=10)
 
-    for _ in range(operations.MAX_DELIVERY_ATTEMPTS + 2):
+    for _ in range(5):  # past the single bound of 3
         operations.retry_undelivered()
 
     assert store.undelivered() == [], "it must leave the queue rather than block it"
@@ -722,3 +722,171 @@ def test_trace_says_when_something_is_not_recorded(seat):
     assert "stored and never delivered" in out
     assert "events.log" in out, "must point at where the rest of the history lives"
     assert "no message" in "\n".join(operations.trace(999))
+
+
+def test_abandoned_and_retrieved_do_not_read_as_delivered(tmp_path):
+    """Write-time gate 9, and it hid two cases' verdicts.
+
+    The display word was DERIVED from the 1.0-shaped booleans, where
+    `delivered` is true for DELIVERED, RETRIEVED, REFUSED, EXPIRED **and
+    ABANDONED**. So nine honest states collapsed into two words: a message given
+    up on after three attempts read as `delivered`, and a HELD message read as
+    `queued` -- hiding exactly what UC-04 fact 2 and UC-05 fact 1 turn on.
+
+    Measured 2026-09-26: `comms trace` on a real held message said `queued` on
+    arrival and `delivered` after retrieval, while the store said HELD then
+    RETRIEVED. The store was right both times."""
+    from agent_comms.operations import _state_of
+    from agent_comms.queue import MessageStore, ABANDONED, HELD, RETRIEVED
+    from agent_comms.store import Mention
+
+    q = MessageStore(tmp_path / "comms.db", max_attempts=1)
+    q.append(Mention(id=1, sender="s", channel="c", topic="t", content="x",
+                     timestamp=1758800000, permalink="",
+                     agent="bakehouse.agent-eco.fixture-hold"), held=True)
+    held = q.all()[-1]
+    assert held.state == HELD
+    assert _state_of(held) == "held", "a held message must not read as queued"
+
+    q.mark_read(1)
+    got = q.all()[-1]
+    assert got.state == RETRIEVED
+    assert _state_of(got) == "retrieved", "retrieved is not delivered"
+
+    q.append(Mention(id=2, sender="s", channel="c", topic="t", content="y",
+                     timestamp=1758800000, permalink=""))
+    q.attempt_by_hub_id(2, "no-session")
+    gone = [m for m in q.all() if m.id == 2][-1]
+    assert gone.state == ABANDONED
+    assert _state_of(gone) == "abandoned", \
+        "a message given up on must never read as delivered"
+
+
+def test_a_message_settled_by_another_pass_does_not_stop_this_one(seat, monkeypatch):
+    """Two passes overlap, and the loser must carry on.
+
+    `comms daemon --once` beside the running daemon is a normal thing to do and
+    is documented as such. When it happens, the losing pass has already selected
+    a message as undelivered that the winner then delivers, and the store
+    correctly refuses to move a `delivered` message to `abandoned`
+    (`ForwardOnly`). The guard is right; stopping is not.
+
+    Measured on test-claude 2026-09-28: that exception left the pass, left the
+    daemon loop and killed the detached daemon, after which `comms status` read
+    "NOT RECEIVING - messages sent to this seat are being lost, not queued".
+
+    The control is the second message: if the refusal aborts the pass, it never
+    lands.
+    """
+    from agent_comms import operations
+    from agent_comms.queue import ForwardOnly
+    from agent_comms.store import Mention
+    from tests.conftest import FakeTransport
+
+    store = operations.message_store(seat / ".comms")
+    for mid in (700, 701):
+        store.append(Mention(id=mid, sender="agent-eco-arch", channel="agent-eco",
+                             topic="t", content="x", timestamp=NOW, permalink="",
+                             reason="mentioned"))
+    fake_seat(monkeypatch, {"success": True, "status": "delivered",
+                            "message": "typed into the claude session"}, code=0)
+
+    # The first message is the one another pass already settled.
+    real = operations.MessageStore.attempt_by_hub_id
+
+    def racing(self, hub_id, detail):
+        if hub_id == 700:
+            raise ForwardOnly(f"message {hub_id} is `delivered` and cannot become "
+                              "`abandoned`")
+        return real(self, hub_id, detail)
+
+    monkeypatch.setattr(operations.MessageStore, "attempt_by_hub_id", racing)
+
+    landed = operations.retry_undelivered(transport_factory=lambda c: FakeTransport())
+
+    assert landed == 1, "the pass stopped at the message another pass had settled"
+    assert 701 not in [m.id for m in store.undelivered()], "701 never got its turn"
+    # 700 is still here because this fixture refuses its attempt without anything
+    # having delivered it. In the real race the winning pass delivered it, which
+    # is exactly why the store refused to move it.
+    assert [m.id for m in store.undelivered()] == [700]
+
+
+def test_the_daemon_survives_anything_a_retry_pass_can_raise(seat, monkeypatch):
+    """A daemon that exits stops the seat receiving SILENTLY, which is the worst
+    outcome this component has — worse than any single pass failing.
+
+    The loop caught `CommsError` only, and `ForwardOnly` is a plain Exception,
+    so it escaped and ended the process. The net is wide on purpose and loud to
+    compensate: the recorded warning names the exception TYPE, or a new fault
+    reads like a known one.
+    """
+    from agent_comms import operations
+    from agent_comms.queue import ForwardOnly
+    from tests.conftest import FakeTransport
+
+    store = operations.message_store(seat / ".comms")
+
+    def explode(**kw):
+        raise ForwardOnly("message 2 is `delivered` and cannot become `abandoned`")
+
+    monkeypatch.setattr(operations, "retry_undelivered", explode)
+    # The retry pass runs on the backstop timer, so bring it forward or one
+    # iteration never reaches the code under test.
+    monkeypatch.setattr(operations, "BACKSTOP_SECS", 0)
+    fake_seat(monkeypatch, {"success": True, "status": "delivered", "message": "ok"},
+              code=0)
+
+    # It must return normally rather than propagate.
+    operations.run_daemon(transport_factory=lambda c: FakeTransport(), max_iterations=1)
+
+    said = [r["detail"] for r in store.events()] if hasattr(store, "events") else []
+    text = " ".join(said) or _events_text(seat)
+    assert "ForwardOnly" in text, f"the warning did not name the exception type: {text}"
+    assert "the daemon did not" in text, text
+
+
+def _events_text(seat) -> str:
+    path = seat / ".comms" / "events.log"
+    return path.read_text(encoding="utf-8") if path.exists() else ""
+
+
+def test_the_delivery_line_carries_a_millisecond_stamp(seat, monkeypatch):
+    """**And that this line RUNS at all.**
+
+    agent-seat asked how long after a session appeared a lost probe was typed.
+    `events.log` is second-granularity, so the existing logs could not answer:
+    the suspected cause is an async redraw landing on the same keystroke, and
+    that interval is sub-second.
+
+    The stamp was added, and `datetime` was not imported in this module — a
+    `NameError` on the SUCCESS path, which is every delivery. The suite stayed
+    green because nothing asserted on the delivered line, only on the states
+    around it. This asserts the line, so the next edit to it cannot be
+    unexercised.
+    """
+    import re
+
+    from agent_comms import operations
+    from agent_comms.store import Mention
+    from tests.conftest import FakeTransport
+
+    store = operations.message_store(seat / ".comms")
+    store.append(Mention(id=910, sender="agent-eco-arch", channel="agent-eco",
+                         topic="t", content="x", timestamp=NOW, permalink="",
+                         reason="mentioned"))
+    fake_seat(monkeypatch, {"success": True, "status": "delivered",
+                            "message": "typed into the claude session at a:0.0"}, code=0)
+
+    # `wake_agent` is the path that writes the delivery line — the notify hook
+    # the daemon calls, not the retry pass (which logs its own summary).
+    from dataclasses import asdict
+    mention = next(m for m in store.undelivered() if m.id == 910)
+    operations.wake_agent(asdict(mention), transport_factory=lambda c: FakeTransport())
+
+    log = (seat / ".comms" / "events.log").read_text(encoding="utf-8")
+    delivered = [l for l in log.splitlines() if "wake: delivered" in l]
+    assert delivered, f"no delivery line was written at all:\n{log}"
+    # ISO-8601 to milliseconds, e.g. [at 2026-09-28T19:35:18.245+00:00]
+    assert re.search(r"\[at \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}", delivered[-1]), (
+        f"no millisecond stamp on the delivery line: {delivered[-1]}")

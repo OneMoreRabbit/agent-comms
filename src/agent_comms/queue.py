@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS messages (
     hub_id      TEXT    UNIQUE,
     sender      TEXT    NOT NULL,
     agent       TEXT    NOT NULL DEFAULT '',
+    sender_fqn  TEXT    NOT NULL DEFAULT '',
     subject     TEXT    NOT NULL DEFAULT '',
     body        TEXT    NOT NULL,
     received_at TEXT    NOT NULL,
@@ -147,6 +148,18 @@ class Queue:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._open() as db:
             db.executescript(SCHEMA)
+            # **A column added to SCHEMA does not reach an existing database.**
+            # `CREATE TABLE IF NOT EXISTS` is a no-op once the table is there,
+            # so a new column exists on a fresh seat and is absent on every
+            # deployed one -- and the code reading it would see a shape that
+            # only some seats have. Measured: `sender_fqn` was added to SCHEMA
+            # and every seat with an existing comms.db carried on without it,
+            # so a reply's `to:` came back empty on exactly the seats that had
+            # been running longest.
+            held = {r[1] for r in db.execute("PRAGMA table_info(messages)")}
+            for column, ddl in (("sender_fqn", "TEXT NOT NULL DEFAULT ''"),):
+                if column not in held:
+                    db.execute(f"ALTER TABLE messages ADD COLUMN {column} {ddl}")
 
     def _open(self) -> sqlite3.Connection:
         """A FRESH connection, per operation. **Never a long-lived one.**
@@ -181,7 +194,8 @@ class Queue:
     # -- writing ------------------------------------------------------------
 
     def receive(self, *, hub_id: str, sender: str, body: str, agent: str = "",
-                subject: str = "", permalink: str = "", received_at: str | None = None) -> int:
+                sender_fqn: str = "", subject: str = "", permalink: str = "",
+                received_at: str | None = None) -> int:
         """Store one message. Idempotent on `hub_id`.
 
         `seq` is monotonic and local. It is a fact about the order WE saw things
@@ -190,9 +204,10 @@ class Queue:
         now = received_at or _now()
         cur = self.db.execute(
             "INSERT OR IGNORE INTO messages"
-            " (seq, hub_id, sender, agent, subject, body, received_at, state, permalink)"
-            " VALUES ((SELECT COALESCE(MAX(seq),0)+1 FROM messages),?,?,?,?,?,?,?,?)",
-            (hub_id, sender, agent, subject, body, now, RECEIVED, permalink))
+            " (seq, hub_id, sender, agent, sender_fqn, subject, body, received_at,"
+            "  state, permalink)"
+            " VALUES ((SELECT COALESCE(MAX(seq),0)+1 FROM messages),?,?,?,?,?,?,?,?,?)",
+            (hub_id, sender, agent, sender_fqn, subject, body, now, RECEIVED, permalink))
         if cur.rowcount == 0:
             return int(self.db.execute(
                 "SELECT id FROM messages WHERE hub_id=?", (hub_id,)).fetchone()["id"])
@@ -230,13 +245,16 @@ class Queue:
         self._log(message, was, to, cause, rule, attempt, db=conn)
 
     def record_attempt(self, message: int, *, delivered: bool, detail: str,
-                       consumes_attempt: bool = True) -> None:
+                       consumes_attempt: bool = True) -> int:
         """**The attempt and its outcome, in ONE transaction.**
 
         This method is the fix for the September flood. There is no window in
         which a message has been handed to the seat and not yet recorded,
         because the counter, the state and the transition row all land together
         or none of them do.
+
+        Returns the attempt count after this one, so a caller can see the bound
+        it has reached without asking again and getting a second answer.
         """
         with self._open() as db:                        # one unit of work
             db.execute("BEGIN")
@@ -272,6 +290,7 @@ class Queue:
                     self.move(message, ABANDONED,
                               f"{attempts} attempts reached", rule="max_attempts",
                               attempt=attempts, db=db)
+        return attempts
 
     def record_wake(self, message: int | None, outcome: str, detail: str = "") -> None:
         """A wake is not a message state. Recorded here and nowhere else.
@@ -432,7 +451,14 @@ class MessageStore(Queue):
             sender=row["sender"], channel=row["channel"], topic=row["subject"],
             content=row["body"], timestamp=int(row["received_at_epoch"] or 0),
             permalink=row["permalink"], read=bool(row["read_at"]),
+            agent=row["agent"] or "",
+            # **Persisted, because a reply needs it.** Computed on arrival and
+            # not stored, it was lost the moment anything read from the store:
+            # a reply's `to:` is the FQN the original sender declared, and it
+            # came back empty. Measured on the seats 2026-09-26.
+            sender_fqn=(row["sender_fqn"] if "sender_fqn" in row.keys() else "") or "",
             reason=row["reason"] or "mentioned",
+            state=state,
             delivered=state in (DELIVERED, RETRIEVED, REFUSED, EXPIRED, ABANDONED),
             attempts=int(row["attempts"]),
             authorised=state != REFUSED,
@@ -442,10 +468,24 @@ class MessageStore(Queue):
     def _rows(self):
         return self.db.execute("SELECT * FROM messages ORDER BY seq").fetchall()
 
-    def append(self, mention) -> None:
-        """Store one arrival. Idempotent on the hub id, as `receive` is."""
+    def append(self, mention, held: bool = False) -> None:
+        """Store one arrival. Idempotent on the hub id, as `receive` is.
+
+        `held` means the addressed agent's declared delivery mode is `hold`:
+        accepted and stored, never injected, the agent asks for it. It lands in
+        **HELD**, not QUEUED, and HELD is the only state `RETRIEVED` can be
+        reached from.
+
+        **This state existed and nothing wrote it.** `HELD` was in the schema
+        and in the transition map from the start, three places read it, and no
+        code ever moved a message into it -- so a `delivery: hold` message sat
+        in QUEUED, where `RETRIEVED` is unreachable, and the age bound expired
+        it however faithfully the agent had read it. Measured 2026-09-26.
+        """
         mid = self.receive(hub_id=str(mention.id), sender=mention.sender,
                            body=mention.content, subject=mention.topic,
+                           agent=getattr(mention, "agent", "") or "",
+                           sender_fqn=getattr(mention, "sender_fqn", "") or "",
                            permalink=mention.permalink,
                            received_at=datetime.fromtimestamp(
                                mention.timestamp, tz=timezone.utc).isoformat(timespec="seconds"))
@@ -461,6 +501,8 @@ class MessageStore(Queue):
             self.move(mid, EXPIRED, mention.retired, rule="retired")
             self.db.execute("UPDATE messages SET retired_reason=? WHERE id=?",
                             (mention.retired, mid))
+        elif held:
+            self.move(mid, HELD, "delivery: hold — the agent asks for it", rule="delivery")
         elif mention.delivered:
             self.move(mid, QUEUED, "permitted")
             self.record_attempt(mid, delivered=True, detail="already delivered on arrival")
@@ -480,6 +522,22 @@ class MessageStore(Queue):
         return self.db.execute("SELECT * FROM messages WHERE hub_id=?",
                                (str(hub_id),)).fetchone()
 
+    def attempt_by_hub_id(self, hub_id: int, detail: str) -> int:
+        """Record a failed attempt for a HUB id, and return the count after it.
+
+        `MessageStore` speaks hub ids to its callers and row ids to the store,
+        so the translation happens here -- once, explicitly. A shim that did
+        this translation ALSO skipped the bound: it added one to the counter
+        and never abandoned anything, so `max_attempts` governed nothing on the
+        live path and a message reached its eighth attempt against a cap of
+        three (UC-05, 2026-09-25). Translating and enforcing are different
+        jobs; this one only translates.
+        """
+        row = self._find(hub_id)
+        if row is None:
+            return 0
+        return self.record_attempt(row["id"], delivered=False, detail=detail)
+
     def mark_delivered(self, message_id: int) -> bool:
         row = self._find(message_id)
         if row is None:
@@ -491,10 +549,20 @@ class MessageStore(Queue):
         return True
 
     def mark_read(self, message_id: int) -> bool:
+        """The agent looked at it. For a HELD message that is the delivery.
+
+        `read` and `delivered` are different facts and stay separate -- but a
+        `delivery: hold` message is never injected, so the agent READING it is
+        the only way it ever reaches the agent. That is what moves HELD to
+        RETRIEVED, and it is why RETRIEVED is not DELIVERED: nothing was put in
+        front of anyone.
+        """
         row = self._find(message_id)
         if row is None:
             return False
         self.db.execute("UPDATE messages SET read_at=? WHERE id=?", (_now(), row["id"]))
+        if row["state"] == HELD:
+            self.move(row["id"], RETRIEVED, "the agent asked for it", rule="delivery")
         return True
 
     def mark_retired(self, message_id: int, reason: str) -> bool:
@@ -506,12 +574,3 @@ class MessageStore(Queue):
         self.db.execute("UPDATE messages SET retired_reason=? WHERE id=?", (reason, row["id"]))
         return True
 
-    def record_attempt_for(self, message_id: int) -> int:
-        """`Store.record_attempt(id) -> count`, kept by name for its callers."""
-        row = self._find(message_id)
-        if row is None:
-            return 0
-        attempts = int(row["attempts"]) + 1
-        self.db.execute("UPDATE messages SET attempts=? WHERE id=?", (attempts, row["id"]))
-        self._log(row["id"], row["state"], row["state"], f"attempt {attempts}", attempt=attempts)
-        return attempts

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import atexit
 import json
+from datetime import datetime, timezone
 import re
 import signal
 import os
@@ -18,7 +19,7 @@ import time
 import urllib.parse
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Collection
 
 from .config import Credential, Settings, load_credential, load_settings
 from .directory import Directory
@@ -39,11 +40,11 @@ from .errors import (
 )
 from .hub import Hub, Registration, Transport, build_transport
 from .seat import SeatUnavailable, speaks_contract
-from .seat import _client_version
+from .seat import _client_version, build_id
 from .seat import state as seat_state_now
-from .wake import WakeError, wake
+from .wake import Held, WakeError, wake
 from .store import DaemonState, Mention, Store
-from .queue import MessageStore
+from .queue import ForwardOnly, MessageStore
 
 
 def message_store(state_dir) -> MessageStore:
@@ -169,6 +170,39 @@ class Preflight:
             self.ok = False
 
 
+def agents_reaching(assigned: dict, mine) -> tuple[list[str], list[str]]:
+    """Split this seat's assigned agents into those pointing elsewhere and those
+    pointing nowhere. `doctor`'s mirror check, kept testable.
+
+    Returns `(wrong, undeclared)`:
+
+    `mine` is EVERY name this seat's bot may carry, not one name. ADR-0009 §7a
+    makes the canonical form conditional on role: a component bot is unambiguous
+    as `<seat>` in its own channel and as `<project>-<seat>` anywhere, and
+    **both are correct**. The directory authors the short form;
+    `identity.bot_name` is the long one. Comparing against one alone fails every
+    correctly-declared agent on every component seat — measured on test-claude
+    2026-09-25, where this check called a provably working delivery
+    "delivering to nobody".
+
+    - **wrong** — the declared bot is not a name this seat answers to. The
+      dangerous one: a sender obeying it posts where no bot of ours is subscribed, and a
+      post no bot holds produces no event at all. Success reported, nothing
+      delivered, nobody told.
+    - **undeclared** — no transport at all. Not dangerous since derivation was
+      removed: the send is refused at the sender and nothing is posted.
+    """
+    names = {mine} if isinstance(mine, str) else set(mine)
+    wrong, undeclared = [], []
+    for fqn, record in sorted(assigned.items()):
+        bot = ((record.get("transports") or {}).get("comms") or {}).get("bot")
+        if not bot:
+            undeclared.append(fqn)
+        elif bot not in names:
+            wrong.append(f"{fqn} → bot '{bot}'")
+    return wrong, undeclared
+
+
 def preflight(
     transport_factory: Callable[[Credential], Transport] = build_transport, **kw
 ) -> Preflight:
@@ -203,12 +237,36 @@ def preflight(
     report.add("identity", True, f"expected bot '{settings.identity.bot_name}'")
     report.warnings.extend(identity_notices)
 
-    try:
-        hub.verify_subscription()
-        report.add("subscription", True, f"subscribed to '{settings.channel}'")
-    except CommsError as exc:
-        report.add("subscription", False, str(exc))
-        return report
+    # **"Subscribed to ''" is not a pass.** `verify_subscription` returns early
+    # when there is no channel, because a seat with no assignments has nothing
+    # to be subscribed TO and must be allowed to idle -- but reporting that as
+    # a subscription is asserting one that cannot exist. Measured on
+    # test-claude 2026-09-29: a deaf seat read `PASS subscription — subscribed
+    # to ''`.
+    if not (settings.channel or "").strip():
+        report.add(
+            "subscription", False,
+            "this seat has no channel, so it is subscribed to nothing and can "
+            "receive nothing. That is the correct and temporary state of a seat "
+            "the estate has not assigned any agents to yet: the channel comes "
+            "from the agents' own `transports.comms`, and the daemon joins on "
+            "its next refresh once one is assigned. Nothing to fix here — ask "
+            "for an assignment, and do NOT ask the orchestrator to replay "
+            "provisioning, which reconciles subscriptions and would find "
+            "nothing wrong.")
+        # **Deliberately NOT an early return.** A genuine subscription error
+        # stops the run below, because every check after it asks the hub. This
+        # case is different: there is nothing wrong with the hub, and the
+        # checks that follow carry the rest of the picture -- in particular
+        # `deliverable`, which is the one a person actually reads to answer
+        # "can this seat receive". Returning here would hide it.
+    else:
+        try:
+            hub.verify_subscription()
+            report.add("subscription", True, f"subscribed to '{settings.channel}'")
+        except CommsError as exc:
+            report.add("subscription", False, str(exc))
+            return report
 
     # Every channel the directory says we must reach, checked against the ones
     # this bot actually holds. A transports record naming a channel we are not
@@ -259,6 +317,123 @@ def preflight(
                     "graph — but after a narrowing, a subscription left behind is what "
                     "the provisioning replay tidies.")
 
+    # THE MIRROR OF THE CHECK ABOVE, asked for by ansible-platform
+    # (ansible-needs-comms-multi-agent-seat-delivery 0.1, ask 3).
+    #
+    # The channel check catches "we cannot reach where mail is addressed". This
+    # catches the other half: an agent assigned to THIS seat whose declared
+    # transport names a bot that is NOT this seat's. A sender obeying that
+    # record posts where no bot of ours is subscribed, and §6 is measured on
+    # this — a message posted where no bot is subscribed produces **no event at
+    # all**. Not a refusal, not a log line. Silence.
+    #
+    # It is loud HERE and silent THERE, which is the whole reason it belongs at
+    # the seat: the seat can see what it is supposed to serve; the sender only
+    # sees a post that appeared to work.
+    mine = settings.identity.known_names()
+    assigned = config_sync.agent_set(settings.state_dir)
+    # **RESOLVE each one — the assignments answer carries no transports.**
+    # Measured 2026-09-25 on test-claude: `/v0/seats/<p>/<s>/assignments`
+    # returns agent, seat_local_id, label, runtime, delivery, route_revision
+    # and NO transports block. Reading the cache for them would report every
+    # agent as undeclared forever and could never catch the wrong-bot case --
+    # a check that fires every time and detects nothing (constitution §9).
+    # The need asks for the RESOLVED transport, and resolution is where it is.
+    from .resolve import Resolver
+    resolver = Resolver(local_agents=assigned)
+    resolved, unreadable = {}, []
+    for fqn in sorted(assigned):
+        # Each of our own agents asks about itself: a self-lookup needs no
+        # stated sender, and there is no seat identity to offer.
+        answer = resolver.resolve(fqn, caller=fqn)
+        if answer.success:
+            resolved[fqn] = {"transports": answer.transports}
+        else:
+            unreadable.append(f"{fqn} ({answer.status})")
+    wrong, undeclared = agents_reaching(resolved, mine)
+    if unreadable:
+        # We could not ask. Saying "undeclared" would be asserting an absence
+        # we did not observe -- the difference between a no and a silence.
+        report.notes.append(
+            f"could not resolve assigned agent(s), so their transport is unchecked: "
+            f"{', '.join(unreadable)}")
+    if wrong:
+        report.add(
+            "agents reach this seat", False,
+            f"DELIVERING TO NOBODY — this seat is assigned agent(s) whose declared "
+            f"transport names a different bot: {'; '.join(wrong)}. This seat answers to "
+            f"{' or '.join(repr(n) for n in mine)}. A sender obeying those records posts where no bot of ours is "
+            f"subscribed, and a post no bot holds produces no event at all — the send "
+            f"reports success and nothing ever arrives. Fix the directory's "
+            f"`transports.comms` for those agents to name {mine[0]!r}.")
+    elif undeclared:
+        # NOT a failure. Derivation is gone (§5, amended 2026-09-25), so an
+        # undeclared agent is refused at the sender, loudly, with nothing
+        # posted. That is a missing record, not a silent loss. It is still a
+        # CHECK rather than only a note, so the line exists either way.
+        report.add(
+            "agents reach this seat", True,
+            f"nothing to verify for {', '.join(undeclared)} — no declared transport "
+            f"yet. A seat serving more than one agent REQUIRES them, because one bot "
+            f"is one seat's mailbox and nothing derives a per-agent one. Until they "
+            f"are authored, a send to those names is refused at the sender with "
+            f"nothing posted.")
+    elif resolved:
+        report.add("agents reach this seat", True,
+                   f"all {len(resolved)} resolved agent(s) declare a bot this seat "
+                   f"answers to")
+    else:
+        # **A CHECK WITH NOTHING TO VERIFY SAYS SO BY NAME.**
+        #
+        # This branch used to be silent: no agents assigned, or none of them
+        # resolvable, and the check simply did not appear. Measured on the fresh
+        # test-codex 2026-09-26 — doctor reported 11 checks where test-claude
+        # reported 12, with nothing saying which was missing or why.
+        #
+        # An absent check and a passing check are indistinguishable to anyone
+        # counting, which is the diagnostic-without-information class in the one
+        # tool whose whole job is information. Ruled by arch the same day: a
+        # check with nothing to verify says so by name, never silently absent.
+        why = (f"could not resolve any of them ({', '.join(unreadable)})" if unreadable
+               else "this seat is assigned no agents yet" if not assigned
+               else f"{len(assigned)} assigned and none resolvable")
+        report.add("agents reach this seat", True,
+                   f"nothing to verify — {why}. Stated rather than omitted: an absent "
+                   f"check reads the same as a passing one.")
+
+    # **A policy entry this client cannot honour must be VISIBLE.**
+    #
+    # The per-agent blocked list is matched FQN to FQN exactly, with no
+    # last-segment fallback since 2026-09-28. That is the right comparison and
+    # it has one failure mode: an entry written in the old short form now
+    # matches nobody. The rule the estate meant to apply is silently inert, and
+    # silence here fails OPEN -- the sender is delivered.
+    #
+    # Every other refusal in this client is loud. This one cannot be, because
+    # nothing is refused; so the seat reports the entry instead, and names the
+    # agent it was authored against.
+    strays: list[str] = []
+    for fqn, record in (assigned or {}).items():
+        for entry in ((record.get("permissions") or {}).get("comms") or {}).get("blocked") or []:
+            text = str(entry).strip()
+            # An FQN is estate.project.agent -- three non-empty segments. Shape
+            # only: nothing is inferred from the parts.  # gate-exempt: SHAPE VALIDATION only — asks whether a string is FQN-shaped and infers no fact from the parts
+            if not (text.count(".") == 2 and all(text.split("."))):  # gate-exempt: SHAPE VALIDATION only — asks whether a string is FQN-shaped and infers no fact from the parts
+                strays.append(f"{text!r} on {fqn}")
+    if strays:
+        report.add(
+            "policy entries", False,
+            "blocked-list entries that are not FQNs and therefore match nobody: "
+            + "; ".join(strays)
+            + ". The estate authors these at the directory "
+            "(permissions.comms.blocked) and they are compared FQN to FQN, "
+            "exactly. A short name is not narrowed to a guess — it is reported "
+            "here, because an unenforceable block fails OPEN and would "
+            "otherwise be invisible. Re-author it as estate.project.agent.")
+    elif assigned:
+        report.add("policy entries", True,
+                   "every blocked-list entry this seat caches is an FQN")
+
     try:
         registration = hub.register_queue()
     except CommsError as exc:
@@ -278,20 +453,55 @@ def preflight(
     # `seat status` is ADVISORY (contract §3) and this is the only place this
     # client may use it: a health check for a person, never a pre-check before
     # delivering. Delivery asks `seat msg` and reads its answer, full stop.
-    try:
-        sess = seat_state_now()
-        report.add("deliverable", sess.ok, sess.summary())
-    except SeatUnavailable as exc:
-        report.add("deliverable", False, str(exc))
+    # **The one check whose question is "would a message reach the agent" must
+    # not answer YES when none could.**
+    #
+    # `seat_state_now()` asks the SEAT whether a session is there, and on a
+    # deaf seat the answer is a truthful yes -- a session is running. But comms
+    # has no channel to receive on, so nothing reaches it. Measured on
+    # test-claude 2026-09-29: `PASS deliverable — yes: a message sent now would
+    # reach the agent`, on a seat that could not receive at all. That is
+    # catalogue 0.58 in the check the question belongs to: green because it
+    # could not go red.
+    if not (settings.channel or "").strip():
+        report.add(
+            "deliverable", False,
+            "no: this seat has no channel, so a message sent now would reach "
+            "nobody however healthy the session is. The seat's own runtime may "
+            "be fine -- this is comms having nowhere to listen, not the agent "
+            "being absent.")
+    else:
+        try:
+            sess = seat_state_now()
+            report.add("deliverable", sess.ok, sess.summary())
+        except SeatUnavailable as exc:
+            report.add("deliverable", False, str(exc))
 
     # Who may talk to this seat. Reported because "no directory installed" is a
     # real state — the orchestrator installs the file with comms, so its absence
     # means permissions are a default rather than a declaration, and nobody
     # should have to read source to find that out.
     try:
-        directory = load_directory(settings.state_dir)
-        report.add("directory", True, directory.summary())
-        report.warnings.extend(directory.warnings)
+        # **Policy is per agent, from the directory. There is no seat file.**
+        # comms 2.x carries no `comms.yml` (ansible-platform's retire need,
+        # operator ruling 2026-09-28), so this reports which of this seat's
+        # agents the directory actually speaks for. An agent it says nothing
+        # about runs on the channel default -- which is a real configuration,
+        # not a fault, but it must be VISIBLE rather than assumed.
+        stated, defaulted = [], []
+        for fqn in sorted(assigned or {}):
+            (stated if agent_partners(fqn, settings.state_dir) is not None
+             else defaulted).append(fqn)
+        if stated or defaulted:
+            report.add("directory", True, "; ".join(filter(None, [
+                f"{len(stated)} agent(s) with a partners list from the directory"
+                if stated else "",
+                (f"{len(defaulted)} on the channel default (no partners stated): "
+                 + ", ".join(defaulted)) if defaulted else "",
+            ])))
+        else:
+            report.add("directory", True,
+                       "no agents assigned yet, so there is no policy to state")
         refused = [m for m in Store(settings.state_dir).all() if not m.authorised]
         if refused:
             # The stored flag records the rule in force when the message arrived,
@@ -345,12 +555,26 @@ def preflight(
     # measured by hand on 2026-09-10.
     side = Store(settings.state_dir)
     running_build = side.daemon_build()
-    if daemon_is_running(side) and running_build and running_build != _client_version():
+    mine = build_id()
+    if daemon_is_running(side) and running_build and running_build != mine:
+        # **The same version number is not the same build.** Until 2026-09-27
+        # both sides were bare `__version__`, so a daemon still running code
+        # from before a reinstall of the same version compared equal and the
+        # check reported "daemon and CLI both 2.1.1" -- green because it could
+        # not go red (catalogue 0.58). `build_id()` carries a hash of the code
+        # on disk, so this fires on the case that actually happens during
+        # development: reinstall without a version bump.
+        same_version = running_build.split("+")[0] == mine.split("+")[0]
+        extra = (
+            " Both call themselves "
+            f"{mine.split('+')[0]}, and the code differs — a reinstall of the same "
+            "version number, which a version comparison cannot see."
+            if same_version else "")
         report.add(
             "daemon build", False,
-            f"the RUNNING daemon is {running_build}; this CLI is {_client_version()}. "
+            f"the RUNNING daemon is {running_build}; this CLI is {mine}. "
             "They are out of step, which is a real state during an upgrade and not a "
-            "guess — the daemon is a process and the CLI is whatever is on disk now. "
+            f"guess — the daemon is a process and the CLI is whatever is on disk now.{extra} "
             "Restart it to bring them together: comms daemon --restart. Until then "
             "the two halves may disagree about where messages are stored.")
     elif running_build:
@@ -409,7 +633,12 @@ def _transport_channels(settings: Settings) -> set[str]:
     has been fetched yet, which is a note rather than a failure — there is
     genuinely nothing to check.
     """
-    channels = {settings.channel.strip().casefold()}
+    # **An absent channel is not a channel named ''.** A seat with no
+    # assignments has none, and including it made `reachable channels` report
+    # GRANT WITHOUT SUBSCRIPTION for a channel called nothing, then send the
+    # reader to orch to replay provisioning for a drift that did not exist.
+    # Measured on test-claude 2026-09-29.
+    channels = {c for c in {settings.channel.strip().casefold()} if c}
     records = config_sync.load(settings.state_dir).get("routes") or []
     for record in records:
         name = ((record or {}).get("transports") or {}).get("comms", {}).get("channel")
@@ -430,7 +659,264 @@ def _permalink(site: str, event_msg: dict) -> str:
     return f"{site}/#narrow/channel/{stream_id}-{slug}/topic/{quoted}/near/{event_msg['id']}"
 
 
-def is_permitted(directory: Directory, hub: Hub, sender: str) -> bool:
+def agent_partners(agent: str, state_dir) -> tuple[str, ...] | None:
+    """The ADDRESSED AGENT's own allow-list from the directory, or None.
+
+    **`None` and `()` mean different things and the difference is the whole
+    point.** `None` is *the directory says nothing about who may write to this
+    agent* — the seat file still governs. `()` would be *the directory says
+    nobody may*, which no caller should silently turn into "everybody".
+
+    Until 2026-09-28 comms read the directory's `blocked` and took `partners`
+    only from `comms.yml`, so an allow-list authored at the directory was
+    ignored while the file's copy decided. Two stores for one fact, and comms
+    obeying the one the estate had stopped authoring. Measured on test-claude:
+    `bakehouse.agent-eco.test-claude` carried three FQN partners at the
+    directory and nothing read them.
+    """
+    if not agent:
+        return None
+    from . import config_sync
+    try:
+        record = config_sync.agent_set(state_dir).get(agent) or {}
+    except Exception:  # noqa: BLE001 - an unreadable cache must not decide
+        return None
+    comms = (record.get("permissions") or {}).get("comms") or {}
+    if "partners" not in comms:
+        return None
+    return tuple(str(e).strip() for e in (comms.get("partners") or ()))
+
+
+def permits_sender(agent: str, sender_fqn: str, state_dir) -> bool | None:
+    """Does the addressed agent's own allow-list admit this sender?
+
+    `True` admitted, `False` refused, **`None` the directory has no opinion**
+    — and only `None` falls through to the seat file. Compared FQN to FQN,
+    exactly: an entry that is not an FQN matches nobody and is reported by
+    `doctor`, never narrowed to a guess.
+    """
+    allowed = agent_partners(agent, state_dir)
+    if allowed is None:
+        return None
+    theirs = (sender_fqn or "").strip().casefold()
+    if not theirs:
+        # An unmarked sender states no FQN, so a per-agent allow-list cannot
+        # name it. That is the seat file's case, not a silent admission here.
+        return None
+    return any(e.strip().casefold() == theirs for e in allowed)
+
+
+def blocks_sender(agent: str, sender_fqn: str, state_dir) -> bool:
+    """Does the ADDRESSED AGENT's own directory policy refuse this sender?
+
+    **The directory is the source of truth; the local file is its cache.** The
+    agent's `permissions.comms.blocked` is authored at the directory, cached
+    here by `config_sync`, and enforced at the receiving end -- the only end
+    that can, since the sender is the party being refused.
+
+    Per AGENT, not per seat. `comms.yml` declares one policy for the whole
+    seat and cannot say "another1 blocks test-codex while new001 does not",
+    which is exactly what the estate authored (UC-03, 2026-09-25). This check
+    runs FIRST and the seat-level file still applies to everything it does not
+    cover: a per-agent block narrows, it never widens.
+
+    **FQN to FQN, and nothing else.** `sender_fqn` comes from the envelope,
+    where the sending comms states its own; a hub display name is never used,
+    because it cannot be turned into one -- the directory answers
+    `canonical_id: null` for `test-codex` and `agent-eco-test-codex` alike.
+
+    Display-name matching was a bypass twice over. `short_name` splits on
+    dots, so a bot arriving as `agent-eco-test-codex` walked through a block
+    on `test-codex`; and any hyphen-stripping wide enough to catch that also
+    made `blocks-arch` answer to an agent-eco seat's entry of `arch`. There is
+    no spelling rule that is both tight enough and wide enough, which is the
+    signal that the comparison was on the wrong thing.
+
+    **FQN to FQN, exactly. No last-segment fallback, since 2026-09-28.**
+    Until then a short entry was also matched against the last segment of the
+    sender's FQN, because the estate wrote short names in these lists. The
+    estate now writes FQNs (directory generation 42, measured), so the
+    comparison is string equality between two FQNs and nothing is taken apart.
+
+    An entry that is not an FQN therefore matches nothing and is reported by
+    `doctor` rather than guessed at: a rule the estate meant to apply and
+    spelled in a form this client cannot honour must be visible, not silently
+    inert.
+
+    An unmarked sender states no FQN, so no per-agent block can name it: the
+    seat-level rules in `comms.yml` decide alone. That is a gap in what the
+    estate can express about older senders, not a silent bypass, and it closes
+    as senders carry the envelope.
+    """
+    if not agent or not sender_fqn:
+        return False
+    from . import config_sync
+    try:
+        record = config_sync.agent_set(state_dir).get(agent) or {}
+    except Exception:  # noqa: BLE001 - an unreadable cache must not block mail
+        return False
+    blocked = ((record.get("permissions") or {}).get("comms") or {}).get("blocked") or []
+    theirs = sender_fqn.strip().casefold()
+    if not theirs:
+        return False
+    return any(str(entry).strip().casefold() == theirs for entry in blocked)
+
+
+#: **FOR RETIREMENT after the estate has migrated.** A sender that states no
+#: FQN in its envelope is compared on its hub display name instead.
+#:
+#: It is kept because every seat in the estate is one of those until it
+#: upgrades, and refusing them would stop estate comms dead. It is not a
+#: design: a display name names a SEAT, so it cannot name the agent that
+#: wrote, and matching on it needs a spelling rule simultaneously tight enough
+#: to keep `blocks-arch` from matching `arch` and wide enough to catch
+#: `agent-eco-test-codex` against `test-codex`. No such rule exists.
+#:
+#: **Retire when no seat in the estate sends without an envelope.** The check
+#: is `comms stats --json` reporting zero legacy senders across a full poll on
+#: every seat. Then delete this flag, the `sender` parameter below and the
+#: display-name branch in `Directory.permits`, and make an absent FQN a
+#: refusal. Tracked with arch on the navigator.
+LEGACY_SENDER_MATCHING = True
+
+
+class SenderUnknown(CommsError):
+    """This seat serves several agents, so who is sending is not knowable here.
+
+    A seat has no FQN. An FQN names an agent session, and a seat that serves
+    more than one has no single sender to put in `from:`. Picking one would be
+    inventing an identity, so the caller states it.
+    """
+
+    tag = "sender-unknown"
+    exit_code = 1
+
+
+def sending_agent(explicit: str) -> str:
+    """The FQN of the agent sending a message. STATED, never supplied.
+
+    **One rule for every message: `--from` is required and has no default.**
+    A message is from an agent to an agent; the seat is only the delivery
+    mechanism, mapped to a bot on the hub. comms runs on the seat, so it cannot
+    know which of the seat's agents invoked it — and a seat has no FQN of its
+    own to fall back on.
+
+    Earlier versions read "the one agent this seat serves" when there was only
+    one. That is correct exactly while a seat serves one agent and silently
+    wrong the moment it serves two, which is the shape the estate is moving to.
+    One rule that always applies beats one that usually does.
+    """
+    fqn = (explicit or "").strip()
+    if not fqn:
+        raise SenderUnknown(
+            "every message states the agent it is from: --from "
+            "<estate.project.agent>. A message is from an agent to an agent, "
+            "and comms cannot tell which agent on this seat is asking."
+        )
+    return fqn
+
+
+def why_refused(mention, state_dir, in_project: bool = False) -> str:
+    """Which rule refused this sender, and WHERE THAT RULE LIVES.
+
+    **All policy is per agent and authored at the directory.** comms 2.x reads
+    no `~/.comms/comms.yml`, so there is no second layer to confuse this with
+    — which is what the old version of this function existed to get right.
+
+    Measured 2026-09-25, before the file went: a message correctly refused by
+    an agent's own blocked list was reported as *"not a permitted partner"* —
+    the seat file's sentence — while that file listed the sender in `partners`
+    with an empty `blocked`. The decision was right and the explanation sent
+    the reader to a file that said the opposite. With one layer there is one
+    sentence, and it can only name the rule that fired.
+    """
+    agent = getattr(mention, "agent", "") or ""
+    sender_fqn = getattr(mention, "sender_fqn", "") or ""
+    if agent and sender_fqn and blocks_sender(agent, sender_fqn, state_dir):
+        return (f"{sender_fqn} is on {agent}'s blocked list, which the estate "
+                f"authors at the directory (permissions.comms.blocked) and this "
+                f"seat caches in ~/.comms/routes.json. It applies to that agent "
+                f"alone, not to this seat")
+    allowed = agent_partners(agent, state_dir) if agent else None
+    if allowed is not None:
+        named = ", ".join(allowed) or "nobody"
+        return (f"{sender_fqn or mention.sender} is not on {agent}'s partners "
+                f"list, which the estate authors at the directory "
+                f"(permissions.comms.partners) and this seat caches in "
+                f"~/.comms/routes.json. That list names: {named}")
+    if not in_project:
+        return (f"{mention.sender} is not in this seat's channel, and the "
+                f"directory states no partners list for "
+                f"{agent or 'the addressed agent'}, so the channel is what "
+                f"decides. Author the list at the directory to say otherwise")
+    return (f"{mention.sender} was refused, and no rule this seat can read says "
+            f"why — which is itself the fault to report")
+
+
+def may_write_to(hub: Hub, agent: str, sender: str, sender_fqn: str, state_dir) -> bool:
+    """May this sender write to this agent? **The directory decides; no file.**
+
+    comms 2.x carries no `comms.yml` (ansible-platform's retire-comms-yml need,
+    operator ruling 2026-09-28). Policy is per AGENT and authored at the
+    directory, because a seat is a delivery mechanism and not a party to a
+    conversation — it has no FQN, so it cannot be the subject of a rule about
+    who may talk to whom.
+
+    The order, and each step is read rather than computed:
+
+    1. **Humans are never governed.** A human has no FQN and the hub display
+       name is the address; policy is between agents.
+    2. **The agent's own `blocked`** — FQN to FQN, exactly.
+    3. **The agent's own `partners`** — if the directory states one, it
+       decides, and nothing widens it.
+    4. **Otherwise the channel.** The directory has said nothing about this
+       agent, so the default is what a seat with no policy has always had:
+       anyone subscribed to this seat's channel, no cross-project. That is
+       reported by `doctor` per agent, so running on the default is visible
+       rather than assumed.
+
+    Measured before this replaced the file: a seat with no `comms.yml` already
+    behaved as step 4 (`project: true`, no partners), so removing the file
+    widens nothing that was not already the estate's no-file default — and for
+    any agent the directory speaks for, step 3 is narrower than the file was.
+    """
+    # **The directory answers first, because the directory holds the policy.**
+    #
+    # This asked the hub FIRST until 2026-09-29 — a live Zulip call on every
+    # admission, to read one boolean about account type — and any failure of
+    # that call made the verdict undeterminable, which stores the message
+    # `refused` and loses it. So a blocked sender and an allowed one were both
+    # gated behind a network round trip that could decide nothing about either.
+    #
+    # Both directory checks read `routes.json` from disk. No network. A sender
+    # the directory has an opinion about is now decided with the hub untouched.
+    if agent and sender_fqn and blocks_sender(agent, sender_fqn, state_dir):
+        return False
+    admitted = permits_sender(agent, sender_fqn, state_dir)
+    if admitted is not None:
+        return admitted
+
+    # **Only now the hub, and only for what the directory cannot express.**
+    #
+    # A human has no FQN, so no directory list can name them: `blocks_sender`
+    # and `permits_sender` both decline on an absent `sender_fqn`, which is
+    # why moving them ahead of this does not start governing humans. The
+    # channel fallback below is for an agent the directory states nothing
+    # about — which, since every agent carries an authored partners list, is
+    # now rare.
+    #
+    # **Accepted cost, operator's decision 2026-09-29:** if the hub is
+    # unreachable at this point the verdict is undeterminable and the message
+    # is lost. That now costs only senders the directory could not decide —
+    # humans, and agents with no list — instead of every sender.
+    in_project, is_human = hub.in_channel(sender)
+    if is_human:
+        return True
+    return in_project
+
+
+def is_permitted(directory: Directory, hub: Hub, sender: str,
+                 sender_fqn: str = "") -> bool:
     """May this sender exchange messages with this seat? ADR-0009 §9.
 
     Declared by the estate in `~/.comms/comms.yml`, never by the seat. Compared
@@ -442,11 +928,24 @@ def is_permitted(directory: Directory, hub: Hub, sender: str) -> bool:
     morning is permitted this afternoon with no file to edit.
     """
     in_project, is_human = hub.in_channel(sender)
-    return directory.permits(sender, in_project=in_project, is_human=is_human)
+    # **Compare the FQN when the sender states one.** A hub display name names
+    # a SEAT, so it cannot name the agent that wrote, and matching on it needed
+    # a spelling rule that had to be tight enough to keep `blocks-arch` from
+    # matching `arch` and wide enough to catch `agent-eco-test-codex` against
+    # `test-codex`. No such rule exists -- which is the signal the comparison
+    # was on the wrong thing.
+    #
+    # A sender that states no FQN still gets the display-name comparison. Not
+    # because it is right, but because every seat in the estate is one of those
+    # until it upgrades, and refusing them would stop estate comms dead. It
+    # narrows to nothing as senders carry the envelope.
+    return directory.permits(sender_fqn or sender, in_project=in_project,
+                             is_human=is_human)
 
 
 def addressed_to_seat(
-    settings: Settings, msg: dict, flags: list[str], own_email: str | None = None
+    settings: Settings, msg: dict, flags: list[str], own_email: str | None = None,
+    serves: Collection[str] = (),
 ) -> str | None:
     """Is this message for this seat? Returns why, or None.
 
@@ -473,7 +972,34 @@ def addressed_to_seat(
     """
     sender = (msg.get("sender_email") or "").casefold()
     if own_email and sender == own_email.casefold():
-        return None
+        # **Our own post is ours -- unless it is addressed to one of our own
+        # agents.** One bot is one SEAT's mailbox, so an agent addressing a
+        # SIBLING on the same seat posts through this very bot and the message
+        # comes straight back. Dropping every self-post made same-seat
+        # addressing impossible.
+        #
+        # Only the explicit marker counts here, never the topic prefix: an
+        # agent replying in its own thread has a topic naming itself, and
+        # accepting that would hand the agent back its own words forever.
+        # A send carries the marker; a reply does not.
+        #
+        # **And the marker must name an agent THIS SEAT SERVES.** Asking only
+        # whether a marker EXISTS admits every message this seat sends to
+        # anyone -- which every seat on the channel then stores and hands to
+        # its own default agent. Measured on test-codex 2026-09-25: a message
+        # it had sent to `…test-claude-another1` came back through its own
+        # daemon as "addressed to an agent on this seat" and was delivered to
+        # its own main. A silent delivery to the wrong recipient, one layer up
+        # from the one this envelope was built to fix.
+        # **Name the agent.** "an agent on this seat" does not say WHICH, so a
+        # recipient cannot tell whether the message is for it. Reported by a
+        # live agent on test-claude 2026-09-25: it read the unnamed line as
+        # "some OTHER agent on my seat", inferred that the addressee shared
+        # its seat, and declined to act -- correctly, on a wrong label. A right
+        # answer and a wrong answer must not read alike (write-time gate 9).
+        marked = envelope_from_body(msg.get("content") or "")
+        mine = marked and marked in set(serves or ())
+        return f"addressed to {marked}, an agent on this seat" if mine else None
 
     if "mentioned" in flags:
         return "mentioned"
@@ -482,7 +1008,7 @@ def addressed_to_seat(
 
     topic = (msg.get("subject") or "").strip()
     prefix = topic.split(":", 1)[0].strip().casefold() if ":" in topic else ""
-    if prefix and prefix in {n.casefold() for n in settings.identity.bot_names}:
+    if prefix and prefix in {n.strip().casefold() for n in settings.identity.known_names()}:
         return "topic addressed to this seat"
     return None
 
@@ -498,7 +1024,8 @@ def mention_from_event(
     if event.get("type") != "message":
         return None
     msg = event["message"]
-    reason = addressed_to_seat(settings, msg, event.get("flags") or [], own_email)
+    serves = config_sync.agent_set(settings.state_dir)
+    reason = addressed_to_seat(settings, msg, event.get("flags") or [], own_email, serves)
     if reason is None:
         return None
     return Mention(
@@ -506,6 +1033,9 @@ def mention_from_event(
         sender=msg.get("sender_full_name") or msg.get("sender_email", "unknown"),
         channel=msg.get("display_recipient") if isinstance(msg.get("display_recipient"), str) else "",
         topic=msg.get("subject") or "",
+        agent=addressed_agent(msg.get("subject") or "", serves,
+                              body=msg.get("content") or ""),
+        sender_fqn=envelope_sender(msg.get("content") or ""),
         content=msg.get("content") or "",
         timestamp=msg.get("timestamp", 0),
         permalink=_permalink(site, msg),
@@ -515,6 +1045,49 @@ def mention_from_event(
             else permitted(msg.get("sender_full_name") or msg.get("sender_email", ""))
         ),
     )
+
+
+def addressed_agent(topic: str, serves: Collection[str] = (), body: str = "") -> str:
+    """The FQN a message was addressed to, from its topic prefix. Empty if none.
+
+    The sender writes the topic as `<what --to named>: <subject>`, so when a
+    caller addressed an FQN the topic prefix IS that FQN. That is the only
+    place it survives: the body carries an `@`-mention of the seat's bot, and
+    one bot serves every agent on the seat.
+
+    **Shape only, and deliberately not a lookup.** An FQN is
+    `estate.project.agent` — three non-empty dot-separated segments, no spaces.
+    A bare seat name (`test-claude: uc01`) has no dots and returns empty, which
+    is what keeps plain seat-name addressing working exactly as it did.
+
+    **It must also name an agent THIS seat is assigned.** A REPLY stays in the
+    topic it answers, so the prefix names whoever the thread was opened to —
+    not whoever this message is for. Measured 2026-09-25: test-claude's agent
+    replied to test-codex in topic
+    `bakehouse.agent-eco.test-claude-another1: uc01-another1`; test-codex read
+    that prefix as its envelope address, and its seat answered `unknown-agent`
+    — *"assigned to another seat"*. The reply sat queued and undelivered.
+
+    So the seat's assigned set is the filter. It is not a second opinion on the
+    seat's authority: the question here is not "does this seat serve the name"
+    but "is this prefix MY envelope, or somebody else's thread name". Whether a
+    name we DO claim can be delivered to remains the seat's call, answered
+    loudly as `unknown-agent` at exit 10.
+
+    Fails safe: an empty assigned set yields no `--agent`, so the seat's
+    default answers — the 1.0 behaviour, never worse than before.
+    """
+    marked = envelope_from_body(body)
+    if marked:
+        return marked if marked in set(serves) else ""
+
+    prefix = (topic or "").split(":", 1)[0].strip()
+    if not prefix or any(c.isspace() for c in prefix):
+        return ""
+    parts = prefix.split(".")  # gate-exempt: SHAPE VALIDATION only — is this topic prefix FQN-shaped; the value itself is then matched WHOLE against the served set
+    if len(parts) != 3 or not all(parts):
+        return ""
+    return prefix if prefix in set(serves) else ""
 
 
 def inbox(unread_only: bool = True, **kw) -> list[Mention]:
@@ -625,16 +1198,18 @@ def send(
     subject: str | None = None,
     topic: str | None = None,
     channel: str | None = None,
+    from_fqn: str | None = None,
     transport_factory: Callable[[Credential], Transport] = build_transport,
     **kw,
 ) -> dict:
-    """Post to this seat's project channel, addressed to a named seat.
+    """Post to this seat's channel, addressed from one AGENT to another.
 
-    **The protocol is one line: the sender names the seat, this client spells the
-    address.** `--to` is required and carries a plain seat name; the topic
-    becomes `<recipient>: <subject>` and the body is prefixed with a real
-    `@**<recipient>**` mention, so both of the two routes a recipient matches on
-    are covered without the sender knowing which.
+    **The protocol is one line: both ends are FQNs, and the directory resolves
+    them.** `--to` is required and carries the recipient AGENT's FQN — a bare
+    name resolves to `unknown` and is refused. The topic becomes
+    `<recipient>: <subject>` and the body is prefixed with a real mention of the
+    recipient's seat bot, so both of the two routes a recipient matches on are
+    covered without the sender knowing which.
 
     **The body is never rewritten.** An earlier version scanned message text for
     `@name` and converted it, which is guesswork about prose — it has to decide
@@ -658,9 +1233,10 @@ def send(
 
     if not to or not to.strip():
         raise Unaddressed(
-            "nothing to address this to. Every message names its recipient: "
-            "--to <seat> --subject '<what it is about>'. The body is not scanned "
-            "for addressing, so a seat named only in the text reaches nobody."
+            "nothing to address this to. Every message names its recipient by "
+            "FQN: --to <estate.project.agent> --subject '<what it is about>'. "
+            "The body is not scanned for addressing, so a name that appears only "
+            "in the text reaches nobody."
         )
 
     recipient = to.lstrip("@").strip("*").strip()
@@ -674,14 +1250,174 @@ def send(
 
     credential = load_credential(settings.identity)
     hub = Hub(transport_factory(credential), settings, credential)
-    recipient = _resolve_recipient(settings, hub, recipient)
 
-    channel = channel or settings.channel
+    # **Resolve first, and only fall back to a seat name.** Until 2026-09-25
+    # this went straight to `_resolve_recipient`, a hub seat-name lookup, so
+    # R7/R10/R15 were built, tested, green and NOT CONNECTED: an FQN was
+    # refused as an unknown seat while `comms resolve` answered `resolved` for
+    # the same name in the same second. Found by running UC-02, not by reading
+    # the code — a suite that cannot fail on an unwired component is not
+    # evidence about wiring.
+    routed = _route(settings, recipient, caller=sending_agent(from_fqn or ""))
+    if routed is not None:
+        # **The derived bot must be an account the hub actually has.**
+        # R15 derives `bot` from the FQN's agent segment, which assumes one hub
+        # identity PER AGENT. The deployed hub has one per SEAT. Measured
+        # 2026-09-25: `bakehouse.agent-eco.test-claude-new001` derives
+        # `test-claude-new001`, which is not an account, so the post mentioned
+        # nobody — posted, `sent` reported, read by no one. A successful
+        # delivery to the wrong audience, which is the thing nobody notices.
+        #
+        # So this checks before posting and refuses loudly. It does NOT guess a
+        # substitute: falling back to the seat's bot would deliver to the seat's
+        # default agent while the caller named a different one, which is the
+        # same silent-wrong-recipient failure wearing a helpful face.
+        # EXISTENCE, not reachability: a cross-project recipient's bot is
+        # legitimately outside this seat's channel, and `require_reachable`
+        # below is what judges the channel.
+        if not hub.in_realm(routed.bot):
+            raise UnknownRecipient(
+                f"'{recipient}' resolves to {routed.fqn}, whose declared transport "
+                f"names the hub identity '{routed.bot}' — and the hub has no such "
+                f"account.\n"
+                "  Nothing was posted. A message mentioning an account that does not "
+                "exist reaches nobody while reporting success.\n"
+                "  The bot comes from the directory's `transports.comms` block for "
+                "this agent, and nothing is derived from the FQN — derivation was "
+                "removed on 2026-09-25 because it named accounts that do not exist. "
+                "So either the hub account is missing, or the directory declares the "
+                "wrong bot for this agent.")
+        recipient, channel = routed.bot, channel or routed.channel
+    else:
+        # **A human has no FQN; a bot is not an address.**
+        #
+        # The directory could not resolve this name, so there is no FQN to
+        # address. Two very different cases hide behind that:
+        #
+        # - a **human**. Humans are not agents and never will be, so there is
+        #   nothing to resolve and the hub display name IS the address. The
+        #   message carries a `from:` and no `to:`, truthfully.
+        # - a **bot**. A bot is a SEAT's mailbox, not an agent, so addressing
+        #   one asks comms to deliver to a machine rather than to anybody. It
+        #   is refused: the agent on that seat is addressed by its FQN, and if
+        #   the directory does not know it, that is the fact to fix.
+        _, is_human = hub.in_channel(recipient)
+        if not is_human:
+            # **The near-misses belong here too.** This gate was added in front
+            # of `_resolve_recipient`, and `_directory_hint` — the "did you
+            # mean" that `comms resolve` prints — lives behind it. So from
+            # 2026-09-25 to 2026-09-27 the same name got an actionable answer
+            # from `resolve` and a dead end from `send`: two surfaces, one
+            # directory, different amounts of help at the moment it is needed.
+            # Measured on UC-02 step 4 (`--to arch`).
+            hint = _directory_hint(recipient, caller=sending_agent(from_fqn or ""))
+            raise UnknownRecipient(
+                f"'{recipient}' is not an agent the directory can resolve, and it is "
+                f"not a human.\n"
+                "  Nothing was posted. A message is from an agent to an agent; a bot "
+                "is a SEAT's mailbox, not an address, so delivering to one would "
+                "deliver to a machine rather than to anybody.\n"
+                "  Address the agent by its FQN (estate.project.agent). If the "
+                "directory does not know it, it has no announced slot yet — that is "
+                "the thing to fix, not the address to work around."
+                + (f"\n  {hint}" if hint else ""))
+        recipient = _resolve_recipient(settings, hub, recipient,
+                                       caller=sending_agent(from_fqn or ""))
+        channel = channel or settings.channel
+
     require_reachable(hub, channel)
 
     warnings = _mention_warnings(hub, content, channel)
-    response = hub.send(channel, topic, addressed(recipient, content))
+    response = hub.send(channel, topic,
+                        addressed(recipient, content,
+                                  to_fqn=routed.fqn if routed is not None else "",
+                                  from_fqn=sending_agent(from_fqn or "")))
     return Posted(response=response, warnings=warnings)
+
+
+@dataclass
+class Routed:
+    """Where the directory says a name goes, and as whom."""
+
+    fqn: str
+    channel: str
+    bot: str
+    delivery: str
+
+
+def _route(settings: Settings, name: str, caller: str = "", **kw):
+    """Ask the directory where a name goes. `None` means 'not an estate name'.
+
+    Three things happen here that used not to happen at all:
+
+    1. **The name is resolved** against the directory (R7), so an FQN or an
+       authored alias addresses an AGENT rather than being mistaken for a seat.
+    2. **The delivery mode is honoured at send** (R10) — `none` refuses here,
+       and a value outside `inject | hold | none` refuses with the value
+       quoted. Comms is the only component that ever reads this field.
+    3. **The transport is derived from the FQN** (R15) — project is the
+       channel, agent is the bot — with a declared override taking precedence.
+
+    Returning `None` for a name the directory does not know is deliberate: a
+    bare seat name is still a legitimate address between seats, and this must
+    add a capability without removing one. But a name the directory REFUSES is
+    an error we raise, not a seat name to try next — falling through would turn
+    'you may not address that' into 'no such seat', which is the wrong-cause
+    class.
+    """
+    from .delivery import NotDeliverable, permitted_to_send, plan, transport_for
+    from .resolve import Resolver
+
+    # The caller is the SENDING AGENT, stated by --from. The directory decides
+    # permissions per agent, so telling it the wrong caller gets the wrong
+    # answer -- and there is no seat-level identity to offer instead.
+    answer = Resolver(local_agents=config_sync.agent_set(settings.state_dir)).resolve(
+        name, caller=caller)
+
+    if not answer.success:
+        if answer.status == "not-permitted":
+            # A permission DECISION. Refusing here is the point; falling
+            # through would turn "you may not address that" into "no such
+            # seat", which is the wrong-cause class this change exists to fix.
+            raise UnknownRecipient(
+                f"'{name}' is not permitted: {answer.message or 'no reason given'}")
+        # Anything else — `unknown` (not an estate name) or `not-registered`
+        # (known, no route yet) — means the DIRECTORY cannot route it, not that
+        # the message cannot be sent. A bare seat name is still a legitimate
+        # address between seats, and most estate agents have no announced slot
+        # today: refusing here would break every send that works now. Add a
+        # capability without removing one.
+        return None
+
+    allowed, why = permitted_to_send(answer.delivery or "inject")
+    if not allowed:
+        raise UnknownRecipient(f"'{name}' will not be sent to: {why}")
+
+    # **A permission verdict is READ, never computed here.**
+    #
+    # 733e717 added a matcher on this path: it took the recipient's
+    # `permissions.comms.blocked` out of the resolution answer and matched the
+    # caller's FQN against the entries, scoping short entries by parsing the
+    # project out of the FQN. That is pattern-matching an identifier to reach a
+    # permission decision, and the operator has ruled against it repeatedly.
+    # Reverted 2026-09-26.
+    #
+    # The decision is the directory's and it already makes it: its own
+    # `/v0/addressable?from=<caller>` EXCLUDES a recipient whose blocked list
+    # names that caller. `POST /v0/resolve` for the same pair answers
+    # `resolved` — so two directory surfaces disagree, and the fix is there,
+    # not a matcher here. Raised with a measurement rather than worked around.
+    #
+    # `not-permitted` is the verdict comms consumes, and it is handled above
+    # where the answer is read. Nothing else is inferred.
+
+    p = plan(answer)
+    try:
+        t = transport_for(p.fqn, answer.transports)
+    except NotDeliverable as exc:
+        raise UnknownRecipient(str(exc)) from None
+    return Routed(fqn=p.fqn, channel=t["channel"], bot=t["bot"],
+                  delivery=p.delivery)
 
 
 def require_reachable(hub: Hub, channel: str) -> None:
@@ -714,7 +1450,7 @@ def require_reachable(hub: Hub, channel: str) -> None:
     )
 
 
-def _resolve_recipient(settings: Settings, hub: Hub, name: str) -> str:
+def _resolve_recipient(settings: Settings, hub: Hub, name: str, caller: str = "") -> str:
     """Return the recipient as Zulip spells it, or refuse and say why.
 
     Matched case-insensitively so a seat need not know the hub's capitalisation,
@@ -722,7 +1458,7 @@ def _resolve_recipient(settings: Settings, hub: Hub, name: str) -> str:
     contain to resolve. Addressing yourself is refused: a seat ignores its own
     posts, so it is the one mention guaranteed to reach nobody.
     """
-    ours = {n.casefold() for n in settings.identity.canonical_names(settings.role)}
+    ours = {n.strip().casefold() for n in settings.identity.known_names()}
     if name.casefold() in ours:
         raise UnknownRecipient(
             f"'{name}' is this seat. A seat ignores its own posts, so this would "
@@ -735,12 +1471,13 @@ def _resolve_recipient(settings: Settings, hub: Hub, name: str) -> str:
         # Reachable is not permitted. The hub says a message *can* arrive; the
         # directory says whether the estate allows it. Same rule as inbound, so
         # a link cannot be one-way by accident.
-        directory = load_directory(settings.state_dir)
-        if not is_permitted(directory, hub, match):
-            in_project, _ = hub.in_channel(match)
+        in_project, is_human = hub.in_channel(match)
+        if not (is_human or in_project):
             raise UnknownRecipient(
-                f"not permitted: {directory.refusal(match, in_project=in_project)}"
-            )
+                f"'{match}' is on the hub but not in this seat's channel, so a "
+                "message to it would render and reach nobody. Policy for an agent "
+                "is authored at the directory per agent; this path is the legacy "
+                "seat-name one and checks only reachability.")
         return match
 
     others = ", ".join(n for n in reachable if n.casefold() not in ours) or "nobody"
@@ -752,14 +1489,117 @@ def _resolve_recipient(settings: Settings, hub: Hub, name: str) -> str:
             "a channel you both sit in, or ask the estate to subscribe it. "
             f"Reachable from here: {others}."
         )
+    # **Say WHY it failed, not just that it did.** Until 2026-09-25 this was the
+    # only sentence a bad address ever got, so a correctly-spelled,
+    # never-authored estate shorthand was refused as a typo — "check the
+    # spelling" against a name spelled perfectly. A refusal naming the wrong
+    # cause is worse than a bare refusal, because it is actionable in the wrong
+    # direction. Ask the directory, and if it has something to say, say that
+    # instead.
+    hint = _directory_hint(name, caller=caller)
+    if hint:
+        raise UnknownRecipient(hint + f"\n  Seats reachable from here: {others}.")
     raise UnknownRecipient(
-        f"no seat named '{name}' exists on the hub — check the spelling. "
-        f"Reachable from here: {others}."
+        f"no seat named '{name}' exists on the hub, and the directory does not "
+        f"know it either — check the spelling. Reachable from here: {others}."
     )
 
 
-def addressed(sender: str, content: str) -> str:
+def _directory_hint(name: str, caller: str = "", **kw) -> str:
+    """What the directory says about a name `send` could not place, or "".
+
+    This is the same answer `comms resolve` gives, brought to the place a
+    person actually hits the problem. Best-effort: a directory that cannot be
+    reached costs the hint, never the refusal.
+
+    **`caller` is the SENDING AGENT, and it is not optional in effect.**
+    Near-misses are caller-relative — the caller's own project comes first
+    (UC-08 fact 2) — so the directory answers a nonsense caller with an empty
+    set. This function used to pass `caller=name`, the TARGET, which is never a
+    real caller: `comms resolve --from <me> arch` listed five candidates and
+    `comms send --to arch` got none, from the same directory, in the same
+    second. Measured on test-claude 2026-09-27.
+    """
+    try:
+        from .resolve import Resolver
+        settings = load_settings(**kw)
+        answer = Resolver(
+            local_agents=config_sync.agent_set(settings.state_dir)).resolve(
+                name, caller=caller or name)
+    except Exception:                                    # noqa: BLE001 — a hint
+        return ""
+    if answer.near_misses:
+        hint = (f"'{name}' is not a seat, and the directory does not know it as an "
+                f"agent either.\n  Did you mean: {', '.join(answer.near_misses[:5])}")
+        # The bare-role note only when it IS one — the same name ending several
+        # FQNs in different projects. On a plain typo it is noise, and a hint
+        # that explains something the reader did not do is a hint they stop
+        # reading.
+        tail = name.strip().casefold()
+        projects = {m.split(".")[1] for m in answer.near_misses  # gate-exempt: a HINT in a refusal message, not a decision. It groups near-misses by project so a person reading 'did you mean' sees them ordered; nothing branches on it
+                    if m.count(".") >= 2 and m.rsplit(".", 1)[-1].casefold() == tail}  # gate-exempt: a HINT in a refusal message, not a decision. It groups near-misses by project so a person reading 'did you mean' sees them ordered; nothing branches on it
+        if len(projects) > 1:
+            hint += ("\n  (A bare role like this is never authored as an alias — it "
+                     "exists in several projects, so which one is meant depends on "
+                     "who is asking. Use the full name.)")
+        return hint
+    if answer.status == "not-registered":
+        return (f"'{name}' IS a known estate agent, but the directory has no route "
+                "for it yet — it has not been assigned and announced. This is not a "
+                "spelling mistake.")
+    return ""
+
+
+#: The envelope marker the sender writes and the receiver reads:
+#: `@**seat-bot** \u2192`estate.project.agent` body`.
+#:
+#: **Why the body and not the topic.** The topic cannot tell "addressed to"
+#: from "thread named after": a reply stays in the topic it answers, so an
+#: agent replying in its own thread looks exactly like a message addressed to
+#: that agent. That is harmless across seats and a LOOP on one seat -- we would
+#: store our own reply and hand it back to the agent that wrote it. A marker
+#: the sender writes is carried by a send and not by a reply, which is the
+#: distinction the topic cannot make.
+ENVELOPE = re.compile(
+    r"^@\*\*[^*]+\*\*\s*(?:`([^`]+)`)?\s*\u2192(?:`([^`]+)`)?")
+
+
+def envelope_from_body(content: str) -> str:
+    """The FQN the sender ADDRESSED, from the marker. Empty if unmarked."""
+    m = ENVELOPE.match((content or "").lstrip())
+    # `to` is optional -- a reply states its sender and addresses no agent.
+    return (m.group(2) or "").strip() if m else ""
+
+
+def envelope_sender(content: str) -> str:
+    """The FQN the message came FROM, from the marker. Empty if unmarked.
+
+    **Policy compares FQN to FQN, never display names.** A hub bot name cannot
+    be turned into an FQN: the directory recognises `test-codex` and
+    `agent-eco-test-codex` alike and returns `canonical_id: null` for both,
+    because the answer is `not-registered` (known name, no announced slot).
+    So the only FQN for a sender is the one the sender states, and it states
+    it here.
+
+    Matching display names instead is what this replaces, and it was a bypass
+    twice over: `short_name` splits on dots, so a bot arriving as
+    `agent-eco-test-codex` walked straight through a block on `test-codex`;
+    and any hyphen-stripping wide enough to catch it also made `blocks-arch`
+    answer to an agent-eco seat's entry of `arch`.
+
+    This is POLICY, not authentication. The hub's bot attribution is what says
+    who posted; this says which agent behind that bot. A block keeps an agent
+    out of a conversation; it is not a security boundary and was never one.
+    """
+    m = ENVELOPE.match((content or "").lstrip())
+    return (m.group(1) or "").strip() if m else ""
+
+
+def addressed(sender: str, content: str, to_fqn: str = "", from_fqn: str = "") -> str:
     """Prefix a message with an @-mention of the seat it is for.
+
+    `to_fqn` adds the envelope marker: one bot serves every agent on a seat, so
+    the mention says WHICH SEAT and the marker says WHICH AGENT.
 
     Without this the arch↔component loop is invisible from the arch side: a
     seat's inbox is mention-based, and a reply posted into
@@ -772,18 +1612,35 @@ def addressed(sender: str, content: str) -> str:
     this client writes hub syntax.
     """
     name = (sender or "").lstrip("@").strip("*").strip()
+    # **Both ends are stated whenever they are known.** A REPLY knows its
+    # sender and not its recipient agent -- it answers a seat, in a thread --
+    # so `to` is omitted and `from` is still stated. Without that, an upgraded
+    # seat's replies looked exactly like a legacy sender's and fell to the
+    # display-name comparison for no reason.
+    mark = (f" `{from_fqn}`\u2192`{to_fqn}`" if to_fqn and from_fqn
+            else f" \u2192`{to_fqn}`" if to_fqn
+            else f" `{from_fqn}`\u2192" if from_fqn else "")
     if not name:
         return content
-    return f"@**{name}** {content}"
+    return f"@**{name}**{mark} {content}"
 
 
 def reply(
     message_id: int,
     content: str,
+    from_fqn: str | None = None,
     transport_factory: Callable[[Credential], Transport] = build_transport,
     **kw,
 ) -> dict:
-    """Reply in the mention's own topic, so the conversation stays one thread."""
+    """Reply in the mention's own topic, so the conversation stays one thread.
+
+    **A reply states both ends as FQNs too.** `to:` is the FQN the original
+    sender declared in ITS envelope (`sender_fqn`), which is exactly who the
+    reply is for — so a reply is addressed as precisely as a send, and the
+    receiving seat can dispatch it to the agent that asked rather than to its
+    default. Where the original stated no sender FQN, there is no `to:` to
+    state: that sender is on a build that predates the envelope.
+    """
     settings = load_settings(**kw)
     store = message_store(settings.state_dir)
     target = next((m for m in store.all() if m.id == message_id), None)
@@ -793,9 +1650,43 @@ def reply(
     hub = Hub(transport_factory(credential), settings, credential)
     channel = target.channel or settings.channel
     warnings = _mention_warnings(hub, content, channel)
-    result = hub.send(channel, target.topic, addressed(target.sender, content))
+    result = hub.send(channel, target.topic,
+                      addressed(target.sender, content,
+                                to_fqn=getattr(target, "sender_fqn", "") or "",
+                                from_fqn=sending_agent(from_fqn or "")))
     store.mark_read(message_id)
     return Posted(response=result, warnings=warnings)
+
+
+@dataclass(frozen=True)
+class Woken:
+    """What one wake did, as a WORD plus the line a person reads.
+
+    `outcome` is a closed set and it exists because the word used to be the
+    first token of a prose sentence, read by callers as
+    `startswith("queued")`. That is a prefix-match on a closed word set --
+    `queued-for-review` would match `queued` -- and a caller choosing an EXIT
+    CODE from it is choosing a consumer surface by guesswork. Write-time
+    gate 1; fixed on arch's ruling 2026-09-25.
+
+    `str(Woken)` is the human line, so a caller that echoes it is unchanged.
+    """
+
+    outcome: str
+    line: str
+
+    DELIVERED = "delivered"
+    QUEUED = "queued"
+    HELD = "held"
+    REFUSED = "refused"
+
+    def __str__(self) -> str:
+        return self.line
+
+
+def _woken(result) -> "Woken":
+    return Woken(Woken.DELIVERED if result.success else Woken.REFUSED,
+                 result.summary())
 
 
 def wake_agent(
@@ -830,18 +1721,32 @@ def wake_agent(
 
     try:
         result = wake(mention)
+    except Held as held:
+        # `hold`: accepted and stored, never injected. The agent asks for it
+        # with `comms inbox`. Not a failure, so nothing is retried and no
+        # attempt is consumed; the message simply stays queued and readable.
+        store.record("info", f"held: {held}")
+        return Woken(Woken.HELD, f"held: {held}")
     except WakeError as exc:
         # The seat could not be invoked at all — a different fault from anything
         # the seat reports. The message stays ours and stays queued.
         store.record("warn", f"delivery could not be attempted for {mid}: {exc}")
         _announce_held(settings, store, mention, str(exc), transport_factory)
-        return f"queued: {exc}"
+        return Woken(Woken.QUEUED, f"queued: {exc}")
 
     if result.success:
         store.mark_delivered(mid) if mid is not None else None
         store.set_sleeping(False)
-        store.record("info", f"wake: {result.summary()}")
-        return result.summary()
+        # **Millisecond stamp on the delivery line.** `events.log` is
+        # second-granularity, which was enough until agent-seat asked how long
+        # after a session appeared a lost probe was typed — a question the
+        # existing logs could not answer at all. The suspected cause is an
+        # async redraw of the input line landing on the same keystroke, so the
+        # interval that matters is sub-second and a whole-second stamp cannot
+        # show it. Added on arch's word, 2026-09-28 (hub 3647).
+        store.record("info", f"wake: {result.summary()} "
+                             f"[at {datetime.now(tz=timezone.utc).isoformat(timespec='milliseconds')}]")
+        return _woken(result)
 
     store.record("warn", f"wake: {result.summary()}")
 
@@ -855,7 +1760,7 @@ def wake_agent(
             "until the seat is fixed, because no retry can change this state.",
             transport_factory,
         )
-        return result.summary()
+        return _woken(result)
 
     if not result.retryable:
         # exit 2 — we called the seat wrongly. Ours to fix, and loud about it.
@@ -864,10 +1769,10 @@ def wake_agent(
         _tell_sender(settings, store, mention,
                      f"could not deliver that to my agent: {result.message}",
                      transport_factory)
-        return result.summary()
+        return _woken(result)
 
     _announce_held(settings, store, mention, result.message, transport_factory)
-    return result.summary()
+    return _woken(result)
 
 
 def _announce_held(
@@ -1011,9 +1916,37 @@ def retry_undelivered(
     for mention in pending:
         try:
             result = wake(asdict(mention))
+        except Held as held:
+            # `hold`: accepted and stored, never injected. NOT a failure, so no
+            # attempt is consumed and the bound is not walked towards -- a held
+            # message that burned attempts would be abandoned for obeying its
+            # own declared mode. It stays queued and readable; the age bound
+            # still applies, so it cannot wait forever.
+            store.record("info", f"held: {held}")
+            continue
         except WakeError:
             break  # the seat is not reachable at all; nothing else will land either
-        attempts = store.record_attempt_for(mention.id)
+        # **The bound is applied HERE, in the same transaction as the attempt.**
+        # This used to call a shim that added 1 to the counter and enforced
+        # nothing, so `max_attempts` governed no live path at all.
+        try:
+            attempts = store.attempt_by_hub_id(mention.id, result.summary())
+        except ForwardOnly as refused:
+            # **Another pass got there first, and that is not this pass's
+            # problem.** Two passes overlap whenever `comms daemon --once` runs
+            # beside the running daemon -- a normal thing to do, and documented
+            # as such. The loser selected this message as undelivered, the
+            # winner delivered it, and the store then correctly refuses to move
+            # a `delivered` message to `abandoned`.
+            #
+            # The guard is right; stopping is not. Measured on test-claude
+            # 2026-09-28: this exception left the pass, left the daemon loop,
+            # and killed the detached daemon, after which the seat read "NOT
+            # RECEIVING -- messages sent to this seat are being lost, not
+            # queued". A refused write must never cost a seat its mail.
+            store.record("info", f"retry: message {mention.id} was already "
+                                 f"settled by another pass — {refused}")
+            continue
         if not result.success:
             if not result.retryable:
                 # broken, or our own usage error. Leave it stored and stop: both
@@ -1021,7 +1954,7 @@ def retry_undelivered(
                 store.record("warn", f"retry: giving up on {mention.id} — "
                                      f"{result.summary()} is not retryable")
                 break
-            if attempts >= MAX_DELIVERY_ATTEMPTS:
+            if attempts >= store.max_attempts:
                 # Retryable by status, but not in fact. Say so once, loudly, and
                 # leave it stored — a person can see it in `comms inbox`, and the
                 # queue behind it stops being held hostage.
@@ -1031,7 +1964,8 @@ def retry_undelivered(
                     f"no longer being retried — {result.summary()}. It is still "
                     "stored and visible in `comms inbox`.",
                 )
-                store.mark_delivered(mention.id)  # out of the queue, not lost
+                # `record_attempt` has already moved it to `abandoned`, in the
+                # same transaction as the attempt. Nothing to do here but stop.
             break
         store.mark_delivered(mention.id)
         landed += 1
@@ -1046,7 +1980,6 @@ def _refuse_sender(
     settings: Settings,
     store: Store,
     mention: Mention,
-    directory: Directory,
     hub: Hub,
     bounced: set[str],
     transport_factory: Callable[[Credential], Transport],
@@ -1063,7 +1996,8 @@ def _refuse_sender(
     """
     store.record(
         "warn",
-        f"refused message {mention.id} from {mention.sender!r}: not a permitted partner",
+        f"refused message {mention.id} from {mention.sender!r}: "
+        f"{why_refused(mention, settings.state_dir)}",
     )
     key = mention.sender.strip().casefold()
     if key in bounced:
@@ -1080,7 +2014,8 @@ def _refuse_sender(
         settings, store, mention.channel or settings.channel,
         mention.topic or f"{settings.identity.seat}: not a permitted sender",
         f"@**{mention.sender}** **your message was not delivered to "
-        f"{settings.identity.seat}.** {directory.refusal(mention.sender, in_project=in_project)}"
+        f"{settings.identity.seat}.** "
+        f"{why_refused(mention, settings.state_dir, in_project=in_project)}"
         f"\n\nIt is stored on the seat and visible to the operator, but it did not reach "
         f"the agent. Cite: {mention.permalink}\n\n"
         "Further messages from you to this seat are refused without a reply until the "
@@ -1426,6 +2361,7 @@ def run_daemon(
     transport_factory: Callable[[Credential], Transport] = build_transport,
     max_iterations: int | None = None,
     on_mention: Callable[[Mention], None] | None = None,
+    _reconnects: int = 0,
     **kw,
 ) -> int:
     """Hold the outbound connection and record what arrives.
@@ -1453,10 +2389,10 @@ def run_daemon(
         store.record("warn", notice)
     hub.verify_subscription()
 
-    directory = load_directory(settings.state_dir)
-    for notice in directory.warnings:
-        store.record("warn", notice)
-    store.record("info", f"comms directory: {directory.summary()}")
+    store.record("info", "comms policy: per agent, from the directory "
+                         "(permissions.comms.partners / blocked). This build reads "
+                         "no ~/.comms/comms.yml — a seat is not a party to a "
+                         "conversation, so it is not the subject of one of these rules.")
 
     # Said once per daemon, at the top of the log, because it governs everything
     # the daemon does afterwards: with no trigger it will store every mention and
@@ -1480,7 +2416,7 @@ def run_daemon(
     # so without this a freshly started daemon carries the *previous* daemon's
     # last tick and reads as wedged for its first minute — a false alarm on the
     # one signal that has to stay trustworthy.
-    store.record_build(_client_version())
+    store.record_build(build_id())
     store.save_position(registration.queue_id, registration.last_event_id)
 
     stored, iterations, backoff = 0, 0, 1
@@ -1527,8 +2463,31 @@ def run_daemon(
 
             def _permitted(name: str) -> bool:
                 nonlocal undetermined
+                # **This seat is always permitted to address its own agents.**
+                # A sibling message never crosses a trust boundary: it is this
+                # seat's bot, this seat's agents, and this machine. The
+                # permission graph governs who may reach us from OUTSIDE, and
+                # making a seat list itself as its own partner would be a
+                # config trap that reads as an error when it is omitted.
+                #
+                # Narrow on purpose: only a post from our own bot that carries
+                # an envelope for one of our agents gets here at all --
+                # `addressed_to_seat` has already dropped every other self-post.
+                if name.strip().casefold() in {
+                        n.strip().casefold() for n in settings.identity.known_names()}:
+                    return True
+                # The ADDRESSED AGENT's own policy, from the directory, first.
+                addressed = addressed_agent(
+                    (event.get("message") or {}).get("subject") or "",
+                    config_sync.agent_set(settings.state_dir),
+                    body=(event.get("message") or {}).get("content") or "")
+                sender_fqn = envelope_sender(
+                    (event.get("message") or {}).get("content") or "")
                 try:
-                    return is_permitted(directory, hub, name)
+                    # **One decision, from the directory.** No seat file is
+                    # consulted: comms 2.x carries none.
+                    return may_write_to(hub, addressed, name, sender_fqn,
+                                        settings.state_dir)
                 except Exception as exc:  # noqa: BLE001 - any hub failure
                     undetermined = True
                     store.record(
@@ -1544,7 +2503,11 @@ def run_daemon(
             )
             if mention is None:
                 return
-            store.append(mention)
+            # The addressed agent's declared mode decides the arrival state:
+            # `hold` lands in HELD, which is the only state RETRIEVED can be
+            # reached from. Read once here rather than at every delivery pass.
+            from .wake import holds
+            store.append(mention, held=holds(mention.agent or "", settings.state_dir))
             stored += 1
             if not mention.authorised:
                 # **Refused, not delivered.** Labelling it and handing it to the
@@ -1557,7 +2520,7 @@ def run_daemon(
                 # directory is recoverable.
                 if undetermined:
                     return  # held, already logged; no bounce for a non-answer
-                _refuse_sender(settings, store, mention, directory, hub,
+                _refuse_sender(settings, store, mention, hub,
                                bounced, transport_factory)
                 return
             _notify(settings, store, mention)
@@ -1586,6 +2549,52 @@ def run_daemon(
             elif got.reason:
                 store.record("warn", f"config: {got.reason}; running from file")
 
+            # **A seat that had no channel must JOIN when one is assigned.**
+            #
+            # The daemon reads its channel once, at startup, from its own
+            # assignment rows. A seat installed before the estate assigned it
+            # anything correctly has none and idles -- but it then idled
+            # FOREVER, because nothing re-read the channel when assignments
+            # arrived. Measured on test-claude 2026-09-28 (UC-12's
+            # zero-assignment control, on fresh drives): generation 48 brought
+            # four agents and a channel, and the daemon kept polling with
+            # `channel ''`, so every inbound message failed its permission
+            # check with "this bot is not subscribed to channel ''".
+            #
+            # "Idles on refresh until the estate assigns, then joins" is the
+            # ruled behaviour (ansible-platform's retire-comms-yml need); the
+            # idling half shipped and the joining half did not.
+            fresh = load_settings(**kw)
+            if (fresh.channel or "").strip() != (settings.channel or "").strip():
+                store.record(
+                    "info",
+                    f"channel changed from {settings.channel or '(none)'!r} to "
+                    f"{fresh.channel or '(none)'!r} — reconnecting. A seat with no "
+                    "assignments has no channel to join; this is the join.")
+                # Bounded: a channel that keeps changing is a fault to report,
+                # not something to chase round a loop. Three reconnects is more
+                # than a first assignment needs and fewer than a flap costs.
+                # **Reconnect in place. Do NOT re-enter `run_daemon`.**
+                # This first recursed, and the recursive call tried to take the
+                # daemon lock the outer one already held: `DaemonAlreadyRunning`,
+                # which would have ended the daemon on the very transition it
+                # exists to handle. Caught by this case's own test before it
+                # reached a seat.
+                _reconnects += 1
+                if _reconnects > 3:
+                    store.record(
+                        "warn",
+                        f"channel changed {_reconnects} times this run (now "
+                        f"{fresh.channel or '(none)'!r}). Not reconnecting again — "
+                        "a channel that will not settle is a directory fault, and "
+                        "chasing it would hide that behind a busy daemon.")
+                else:
+                    settings = fresh
+                    hub = Hub(transport_factory(credential), settings, credential)
+                    hub.verify_subscription()
+                    registration = _register(hub, store)
+                    gap_recovery = True   # read history forward into the new channel
+
         if time.monotonic() - last_backstop >= BACKSTOP_SECS:
             last_backstop = time.monotonic()
             # The queue is ours, so something has to work it. Without this,
@@ -1594,8 +2603,22 @@ def run_daemon(
             # backstop: both ask "what did the fast path miss?".
             try:
                 retry_undelivered(transport_factory=transport_factory, **kw)
-            except CommsError as exc:
-                store.record("warn", f"retry pass failed: {exc}")
+            except Exception as exc:                 # noqa: BLE001 — see below
+                # **Nothing a pass can raise is worth the daemon.** This caught
+                # `CommsError` only, and `ForwardOnly` — the store's own
+                # integrity guard — is a plain Exception, so it escaped here and
+                # ended the process. A daemon that exits stops the seat
+                # receiving *silently*: `comms status` then says "NOT RECEIVING
+                # — messages sent to this seat are being lost, not queued",
+                # which is the worst outcome this component has.
+                #
+                # So the net is deliberately wide, and loud to compensate: the
+                # exception TYPE is recorded, because a bare message makes a new
+                # fault look like a known one. Narrowing this to the exceptions
+                # we have already seen is how it was wrong the first time.
+                store.record("warn", f"retry pass failed: "
+                                     f"{type(exc).__name__}: {exc} — the pass stopped, "
+                                     "the daemon did not")
             before = store.last_message_id()
             found = _catch_up(hub, store, handle_event, "backstop")
             if found:
@@ -1641,7 +2664,12 @@ CONFIG_REFRESH_SECS = 300
 #: every time. Unbounded retry would spin on it forever and bury the queue behind
 #: it. Six attempts across the retry cadence is long enough for a seat to be
 #: restarted and short enough that a permanent failure surfaces the same day.
-MAX_DELIVERY_ATTEMPTS = 6
+#: **The attempt bound lives in ONE place: `Queue.max_attempts`, which is 3.**
+#: There were three definitions of it here and in the store, and a shim that
+#: counted attempts while enforcing none of them. A message on test-codex
+#: reached its EIGHTH attempt against a cap of three — measured by UC-05,
+#: 2026-09-25. A bound written down three times and applied nowhere is worse
+#: than no bound, because everyone who reads it believes it.
 
 #: A message must be this old before its absence from the queue is evidence the
 #: queue is broken. Without it, a message arriving between the doorbell firing
@@ -1781,7 +2809,8 @@ def _flush_pending(
                                  state_dir=settings.state_dir)
         except WakeError:
             break  # already recorded and reported; the seat is not takeable
-        if outcome.startswith("queued"):
+        # Exact match on a named outcome; was a prefix-match until 2026-09-25.
+        if outcome.outcome == Woken.QUEUED:
             break  # still dormant — leave the rest in order for the next tick
         store.mark_delivered(mention.id)
         sent += 1
@@ -1864,8 +2893,18 @@ def _state_of(m: "Mention") -> str:
     """
     if not m.authorised:
         return "refused"
+    # `retired` still wins: it is the FACT that nobody saw it, where `expired`
+    # is only the mechanism that got it there. Reading them the other way round
+    # is the conflation that made the 1.0.0 store ambiguous.
     if m.retired:
         return "retired"
+    # **The store's own word, when there is one.** Deriving it from the booleans
+    # below collapsed nine states into two: `retrieved`, `expired` and
+    # `abandoned` all set `delivered`, so a message given up on after three
+    # attempts read as delivered and a HELD message read as queued -- hiding
+    # exactly the distinctions UC-04 and UC-05 turn on. Measured 2026-09-26.
+    if getattr(m, "state", ""):
+        return m.state
     if m.delivered:
         return "delivered"
     return "queued"
@@ -1944,7 +2983,41 @@ def trace(message_id: int, **kw) -> list[str]:
     return lines
 
 
-def resolve_name(name: str, **kw) -> list[str]:
+def partners(from_fqn: str = "", **kw) -> list[str]:
+    """Who the directory says a claimed sender may address. DISCOVERY ONLY.
+
+    **This is not a permission check and nothing may treat it as one.** `?from`
+    is a claim, not identity — anyone may ask about anyone — so this answers
+    *what the directory says about a claimed sender*, and the header says so.
+    `POST /v0/resolve` at send time remains the authorisation, and the send path
+    does not consult this.
+
+    Nothing is cached. A cache of this would be a second copy of a graph only
+    the directory can evaluate per caller, and the first thing a reader would do
+    is trust it.
+    """
+    from . import addressable
+
+    answer = addressable.fetch(from_fqn)
+    who = answer.claimed_from or "(no sender claimed — the whole estate)"
+    out = [
+        f"addressable as claimed by {who}",
+        "  the directory's answer about a CLAIMED sender — discovery, not permission.",
+        "  a send is authorised when it is resolved, not by appearing here.",
+        "",
+    ]
+    if not answer.entries:
+        out.append("  nobody. The directory answered, and the set is empty.")
+    else:
+        out.append(f"  {'FQN':<44} {'LIFECYCLE':<12} {'DELIVERY':<7} CHANNEL/BOT")
+        out.extend(e.line() for e in answer.entries)
+        out.append("")
+        out.append(f"  {len(answer.entries)} addressable")
+    out.extend(f"  WARN  {w}" for w in answer.warnings)
+    return out
+
+
+def resolve_name(name: str, from_fqn: str = "", **kw) -> list[str]:
     """`comms resolve <name>` — what would this address resolve to, and WHY.
 
     **The command that ends arguments.** It prints the resolution path, the
@@ -1957,7 +3030,10 @@ def resolve_name(name: str, **kw) -> list[str]:
     from .resolve import Resolver
 
     settings = load_settings(**kw)
-    me = f"bakehouse.{settings.identity.project}.{settings.identity.seat}"
+    # **`resolve` states its agent too.** It prints a permission verdict, and
+    # the directory decides permissions PER CALLER -- so asking as the wrong
+    # agent prints the wrong verdict, confidently. Same rule as a send.
+    me = sending_agent(from_fqn or "")
     answer = Resolver(local_agents=config_sync.agent_set(settings.state_dir)).resolve(
         name, caller=me)
 
@@ -1967,7 +3043,18 @@ def resolve_name(name: str, **kw) -> list[str]:
     if answer.near_misses:
         out.append(f"  did you mean  {', '.join(answer.near_misses[:5])}")
     if not answer.success:
-        out.append("  would send  NO — nothing would be delivered")
+        # **A refusal and a typo are two situations, so they get two
+        # sentences.** Both used to end "NO — nothing would be delivered",
+        # which is true of each and tells the reader nothing about which one
+        # they are in: one is fixed by correcting the name, the other by
+        # asking the estate to change a permission, and the last line sent
+        # both readers the same way. One generic sentence serving two
+        # situations is what UC-08 exists to kill; ruled 2026-09-28 (arch
+        # 3548). The cause is on the `because` line either way — this makes
+        # the verdict line carry it too.
+        out.append("  would send  NO — the directory refuses this sender"
+                   if answer.status == "not-permitted" else
+                   "  would send  NO — nothing would be delivered")
         return out
 
     out += [f"  canonical  {answer.canonical_id}",
@@ -2038,6 +3125,15 @@ def requeue(message_id: int, reason: str, **kw) -> str:
     store._log(row["id"], row["state"], QUEUED, f"requeued by hand: {reason}",
                rule="operator")
     store.record("info", f"requeued {message_id} by hand: {reason}")
-    return (f"requeued {message_id} from {row['state']} — {reason}\n"
+    # **Say the word `trace` says.** `row['state']` is the raw column, and a
+    # hand retirement is stored as EXPIRED with a reason beside it -- so this
+    # line announced "from expired" about a message the operator had retired
+    # by hand thirty seconds earlier, contradicting the `trace` two lines
+    # above it. `_state_of` already holds the rule (retired is the FACT,
+    # expired only the mechanism that got it there); printing the column
+    # instead of asking is how the two surfaces came apart.
+    # Measured on UC-07 step 5, 2026-09-27.
+    was = "retired" if (row["retired_reason"] or "").strip() else row["state"]
+    return (f"requeued {message_id} from {was} — {reason}\n"
             "Attempts reset. The age bound still applies: if it is past the bound "
             "it will retire again on the next pass rather than deliver.")

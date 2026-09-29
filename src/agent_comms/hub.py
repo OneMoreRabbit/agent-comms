@@ -75,6 +75,22 @@ class Hub:
         mint time, so a failure here means the bootstrap did not complete — and
         it must be visible immediately, not discovered a week later.
         """
+        # **No channel is not an unverified subscription — it is a seat with
+        # nothing assigned yet.**
+        #
+        # A seat on its first install has no assignments, so the directory has
+        # named no channel and there is nothing to be subscribed TO. Until
+        # 2026-09-28 the channel fell back to the project name, so this check
+        # always had something to test; with that construction removed, an
+        # unassigned seat reached here with an empty channel and was told
+        # `bot '' is not subscribed to channel ''` — refusing to start over a
+        # state that is correct and temporary.
+        #
+        # A seat with no agents can receive no mail, so idling is the right
+        # behaviour, and `doctor` says so rather than this being silent
+        # (ansible-platform's retire-comms-yml need, operator ruling).
+        if not (self._settings.channel or "").strip():
+            return
         result = self._t.call_endpoint(url="users/me/subscriptions", method="GET")
         if result.get("result") != "success":
             raise NotSubscribed(
@@ -106,20 +122,20 @@ class Hub:
         arch bot carries its project as `<project>-<seat>`. Either is correct;
         anything else is reported, not refused.
         """
-        accepted = self._settings.identity.canonical_names(self._settings.role)
+        known = self._settings.identity.known_names()
         result = self._t.call_endpoint(url="users/me", method="GET")
         if result.get("result") != "success":
             return [f"could not read this bot's own identity ({result.get('msg') or result!r})"]
 
         notices: list[str] = []
         actual = result.get("full_name") or ""
-        if actual not in accepted:
-            expected = " or ".join(f"'{n}'" for n in accepted)
+        if actual.strip().casefold() not in {n.strip().casefold() for n in known}:
             notices.append(
-                f"bot is named '{actual}', and this {self._settings.role} seat's canonical "
-                f"name is {expected}. ADR-0009 §7a requires a bot's name to be unambiguous "
-                "in every channel it appears in; this one does not identify the seat it "
-                "speaks for, so a message from it cannot be traced back by name alone."
+                f"the hub says this bot is named '{actual}', which is not a name this "
+                f"seat is known by ({', '.join(repr(n) for n in known)}). The directory "
+                "declares the bot for this seat; one of the two is wrong and neither is "
+                "guessable from here — a message from this bot cannot be traced back to "
+                "the seat the directory thinks it speaks for."
             )
         if not result.get("is_bot"):
             notices.append(
@@ -297,6 +313,16 @@ class Hub:
             for x in subs.get("subscriptions", [])
         )
 
+    def addressable(self, name: str) -> bool:
+        """Does the hub have an account by this name, in a channel we share?
+
+        Asked before posting a derived mention. A mention of a name the hub does
+        not hold renders as plain text and notifies nobody, so the post succeeds
+        and the message is never read.
+        """
+        folded = name.strip().casefold()
+        return any(folded == n.strip().casefold() for n in self.addressable_names())
+
     def in_channel(self, name: str) -> tuple[bool, bool]:
         """`(is in my channel, is a human)`, re-fetching at most once a minute on a miss.
 
@@ -368,6 +394,26 @@ class Hub:
             u["full_name"] for u in users.get("members", [])
             if u.get("is_active") and u.get("full_name")
         )
+
+    def in_realm(self, name: str) -> bool:
+        """Does the hub have an account by this name — anywhere in the realm?
+
+        **Existence, not reachability.** `addressable_names()` answers "in the
+        realm AND in this channel", which is the right question for *can a
+        mention from here arrive*. It is the wrong question for *does this
+        account exist*: a cross-project recipient's bot is legitimately not in
+        our channel, and the two failures have different remedies — a missing
+        account is the estate's to mint, an unreachable channel is a
+        subscription to grant.
+
+        Separated 2026-09-26, when refusing unresolvable bots made the
+        existence check fire first and it started refusing real cross-project
+        bots as nonexistent.
+        """
+        users = self._t.call_endpoint(url="users", method="GET")
+        folded = name.strip().casefold()
+        return any(u.get("full_name", "").strip().casefold() == folded
+                   for u in users.get("members", []))
 
     def addressable_names(self) -> list[str]:
         """The seats this seat can reach: in the realm **and** in this channel.

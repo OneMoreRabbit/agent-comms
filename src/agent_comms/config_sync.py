@@ -107,15 +107,88 @@ def fetch(project: str, seat: str, state_dir: Path, timeout: float = 10.0) -> Fe
         # Fail closed. An answer we cannot read must never replace a set we can.
         return _from_file(target, "the directory answered something that is not an assignment set")
 
+    # **An EMPTY answer must not silently replace a populated set.**
+    #
+    # Zero assignments is correct on a seat that has never been assigned — it
+    # has no agents, so no mail is possible and there is nothing to join. On a
+    # seat that served five agents a minute ago it is almost certainly a fault,
+    # and accepting it costs that seat its bot and its channel: it goes quiet,
+    # which is the failure this whole client is built to make impossible.
+    #
+    # The shape above already fails closed on a body we cannot READ. This is
+    # the same rule for a body we can read and should not believe: keep what we
+    # have, and say so loudly rather than degrading in silence. A seat whose
+    # agents really were all unassigned reports this once and clears on the
+    # next answer that agrees.
+    if not (body.get("assignments") or []):
+        held = load(target.parent)
+        if held.get("routes"):
+            return _from_file(
+                target,
+                f"the directory answered with NO assignments while this seat holds "
+                f"{len(held['routes'])}. Keeping the held set: accepting an empty "
+                f"answer would take this seat's bot and channel with it and leave it "
+                f"silent. If the estate really did unassign every agent here, the "
+                f"next answer that agrees will clear this.")
+
     fetched_at = datetime.now(tz=timezone.utc).isoformat(timespec="seconds")
     record = {"contract": body.get("contract", ""),
               "generation": body.get("generation", 0),
               "fetched_at": fetched_at,
               "source": "directory",
-              "routes": body.get("assignments") or []}
+              # Each agent is its own caller when we complete its record:
+              # a seat has no FQN, so there is no seat-level caller to use.
+              "routes": _complete(body.get("assignments") or [])}
     _write_atomic(target, record)
     return Fetched(generation=record["generation"], fetched_at=fetched_at,
                    agents=len(record["routes"]), source="directory")
+
+
+def _complete(assignments: list) -> list:
+    """The assignment list, with anything the directory left out filled in.
+
+    **The assignments answer now carries the whole record** -- agent, label,
+    runtime, delivery, transports and permissions -- since the directory was
+    extended on 2026-09-25. One call for one seat's agents, which is what the
+    cache is for.
+
+    Before that it carried no transports and no permissions, so this resolved
+    each agent separately to complete the record. That fallback stays for a
+    directory that has not been extended yet: a seat cached half its own
+    configuration and enforced none of the rest, and a blocked sender was
+    delivered (UC-03, measured). It costs nothing when the fields are present.
+
+    **An agent that will not resolve keeps whatever the assignment gave.** A
+    failed lookup is not a statement that a value is absent, and treating it as
+    one would quietly widen a permission the moment the directory hiccuped.
+    """
+    # `agent` is the key the estate-directory contract names, and the only one
+    # read. `or a.get("id")` stood here until 2026-09-28: a guess at a second
+    # shape, which succeeds silently when it is wrong.
+    missing = [a for a in assignments
+               if a.get("agent")
+               if "transports" not in a or "permissions" not in a]
+    if not missing:
+        return [dict(a) for a in assignments]
+
+    from .resolve import Resolver
+    resolver = Resolver()
+    out = []
+    for record in assignments:
+        record = dict(record)
+        fqn = record.get("agent")
+        if fqn and ("transports" not in record or "permissions" not in record):
+            try:
+                answer = resolver.resolve(fqn, caller=fqn)
+            except Exception:  # noqa: BLE001 - a sync must not die on one agent
+                answer = None
+            if answer is not None and answer.success:
+                if answer.delivery:
+                    record["delivery"] = answer.delivery
+                record.setdefault("transports", answer.transports or {})
+                record.setdefault("permissions", answer.permissions or {})
+        out.append(record)
+    return out
 
 
 def _write_atomic(target: Path, record: dict) -> None:
@@ -156,9 +229,28 @@ def agent_set(state_dir: Path) -> dict[str, dict]:
     """
     out: dict[str, dict] = {}
     for record in load(state_dir).get("routes") or []:
-        fqn = record.get("agent") or record.get("id")
-        if fqn:
-            out[fqn] = {"id": fqn, "delivery": record.get("delivery", ""),
-                        "label": record.get("label", ""),
-                        "transports": record.get("transports") or {}}
+        # **`agent` is the key. There is no second candidate, and no guess.**
+        #
+        # This read `record.get("agent") or record.get("id")` until 2026-09-28:
+        # a fallback chain over key names, which is deciding for yourself where
+        # an identifier lives rather than reading the one place that records
+        # it. The estate-directory contract names `agent` in every assignment
+        # row; `id` was a guess at some other shape, and a guess that silently
+        # succeeds is worse than one that fails, because it produces an answer
+        # nobody checks.
+        #
+        # A row without `agent` is a contract break, not a row to skip
+        # quietly: it is kept here under the empty key so `doctor` can report
+        # it, because a route dropped in silence reads exactly like a route
+        # that was never assigned.
+        fqn = record.get("agent")
+        if not fqn:
+            out.setdefault("", {"id": "", "unreadable": True,
+                                "delivery": "", "label": "",
+                                "transports": {}, "permissions": {}})
+            continue
+        out[fqn] = {"id": fqn, "delivery": record.get("delivery", ""),
+                    "label": record.get("label", ""),
+                    "transports": record.get("transports") or {},
+                    "permissions": record.get("permissions") or {}}
     return out

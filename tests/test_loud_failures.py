@@ -257,6 +257,19 @@ def test_doctor_reports_every_check_not_just_the_first(running_daemon, monkeypat
                      # channel this bot is not subscribed to is silent non-delivery
                      # waiting to happen, and doctor is where it is found out.
                      "reachable channels",
+                     # "agents reach this seat" added 2026-09-25 (ansible-platform's
+                     # ask 3): the MIRROR of the check above. That one catches "we
+                     # cannot reach where mail is addressed"; this catches an agent
+                     # assigned here whose transport names another seat's bot, which
+                     # is silent at the sender and visible only here.
+                     "agents reach this seat",
+                     # "policy entries" added 2026-09-28, when the per-agent blocked
+                     # list became FQN-exact and the last-segment fallback was
+                     # removed. An entry still written in the old short form now
+                     # matches NOBODY: the rule is inert and it fails OPEN, so
+                     # nothing is refused and nothing is loud. This is the only
+                     # place it can be seen.
+                     "policy entries",
                      "event queue", "deliverable", "directory", "seat build", "daemon",
                      "wake trigger"]
     assert report.ok
@@ -293,7 +306,7 @@ def test_unrecognisable_bot_name_is_reported(seat):
     report = operations.preflight(
         transport_factory=lambda c: FakeTransport(full_name="zulip-bot-3")
     )
-    assert any("does not identify the seat" in w for w in report.warnings)
+    assert any("not a name this seat is known by" in w for w in report.warnings)
 
 
 def test_human_account_credential_is_reported(seat):
@@ -415,7 +428,7 @@ def test_reply_goes_to_the_mentions_own_topic(seat):
             "timestamp": 1, "stream_id": 7}},
     ]}])
     operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
-    operations.reply(301, "answered", transport_factory=lambda c: transport)
+    operations.reply(301, "answered", transport_factory=lambda c: transport, from_fqn="bakehouse.agent-eco.agent-comms")
     assert transport.sent[-1]["topic"] == "agent-comms: a question"
     assert operations.inbox() == []
 
@@ -1098,8 +1111,8 @@ def test_a_send_refuses_a_channel_whose_replies_we_could_not_read(seat, monkeypa
     monkeypatch.setattr(operations, "_resolve_recipient", lambda s, h, n: n)
 
     with pytest.raises(ChannelNotReachable) as caught:
-        operations.send("hello", to="orch-arch", subject="x", channel="orchestrator",
-                        transport_factory=lambda c: FakeTransport())
+        operations.send("hello", to="bakehouse.orchestrator.arch", subject="x", channel="orchestrator",
+                        transport_factory=lambda c: FakeTransport(), from_fqn="bakehouse.agent-eco.agent-comms")
 
     said = str(caught.value)
     assert "not subscribed to 'orchestrator'" in said
@@ -1114,22 +1127,31 @@ def test_a_send_to_a_held_channel_is_not_refused(seat, monkeypatch):
     monkeypatch.setattr(Hub, "subscribed_channels",
                         lambda self: frozenset({"agent-eco", "orchestrator"}))
     monkeypatch.setattr(operations, "_resolve_recipient", lambda s, h, n: n)
-    posted = operations.send("hello", to="orch-arch", subject="x", channel="orchestrator",
-                             transport_factory=lambda c: FakeTransport())
+    posted = operations.send("hello", to="bakehouse.orchestrator.arch", subject="x", channel="orchestrator",
+                             transport_factory=lambda c: FakeTransport(), from_fqn="bakehouse.agent-eco.agent-comms")
     assert posted.response
 
 
-def test_doctor_fails_when_a_routed_channel_is_unreachable(seat, monkeypatch):
-    """A transports record naming a channel we do not hold is a message that
-    will post and never be answered. Doctor is where that is found out."""
+def test_doctor_fails_when_our_declared_channel_is_unreachable(seat, monkeypatch):
+    """A channel the directory declares for this seat that its bot does not hold
+    is a message that will post and never be answered.
+
+    **Rewritten 2026-09-26.** This used to plant ANOTHER seat's agent in this
+    seat's cache and expect the later `reachable channels` check to catch it.
+    Two things changed: the cache holds only this seat's own assignments, so the
+    old fixture was not a state that can occur; and the channel is now READ from
+    that cache, so an unsubscribed declared channel is caught by the earlier
+    `subscription` check, which names it. Earlier and more specific is better,
+    and the message a person reads is about the channel rather than about a
+    routing record."""
     import json
 
     from agent_comms.hub import Hub
 
     (seat / ".comms").mkdir(parents=True, exist_ok=True)
     (seat / ".comms" / "routes.json").write_text(json.dumps({"routes": [
-        {"id": "bakehouse.orchestrator.arch",
-         "transports": {"comms": {"channel": "orchestrator", "bot": "orch-arch"}}}]}))
+        {"agent": "bakehouse.agent-eco.agent-comms",
+         "transports": {"comms": {"channel": "orchestrator", "bot": "agent-comms"}}}]}))
 
     monkeypatch.setattr(Hub, "subscribed_channels", lambda self: frozenset({"agent-eco"}))
     monkeypatch.setattr("agent_comms.operations.seat_state_now",
@@ -1138,9 +1160,10 @@ def test_doctor_fails_when_a_routed_channel_is_unreachable(seat, monkeypatch):
                             version="1.0.2", contract="1.0"))
     report = operations.preflight(transport_factory=lambda c: FakeTransport())
 
-    check = next(c for c in report.checks if c[0] == "reachable channels")
-    assert check[1] is False
-    assert "orchestrator" in check[2]
+    failed = [c for c in report.checks if c[1] is False]
+    assert failed, "an unsubscribed declared channel must fail, not warn"
+    assert any("orchestrator" in c[2] for c in failed), \
+        "the failure names the channel the directory declared"
 
 
 def test_doctor_passes_when_every_routed_channel_is_held(seat, monkeypatch):
@@ -1150,7 +1173,9 @@ def test_doctor_passes_when_every_routed_channel_is_held(seat, monkeypatch):
 
     (seat / ".comms").mkdir(parents=True, exist_ok=True)
     (seat / ".comms" / "routes.json").write_text(json.dumps({"routes": [
-        {"transports": {"comms": {"channel": "agent-eco"}}}]}))
+        {"agent": "bakehouse.agent-eco.agent-comms",
+         "transports": {"comms": {"channel": "agent-eco",
+                                  "bot": "agent-eco-agent-comms"}}}]}))
 
     monkeypatch.setattr(Hub, "subscribed_channels", lambda self: frozenset({"agent-eco"}))
     monkeypatch.setattr("agent_comms.operations.seat_state_now",
@@ -1172,7 +1197,9 @@ def test_doctor_names_grant_without_subscription_as_drift(seat, monkeypatch):
 
     (seat / ".comms").mkdir(parents=True, exist_ok=True)
     (seat / ".comms" / "routes.json").write_text(json.dumps({"routes": [
-        {"transports": {"comms": {"channel": "orchestrator"}}}]}))
+        {"agent": "bakehouse.agent-eco.agent-comms",
+         "transports": {"comms": {"channel": "orchestrator",
+                                  "bot": "agent-eco-agent-comms"}}}]}))
     monkeypatch.setattr(Hub, "subscribed_channels", lambda self: frozenset({"agent-eco"}))
     monkeypatch.setattr("agent_comms.operations.seat_state_now",
                         lambda: __import__("agent_comms.seat", fromlist=["x"]).SeatState(
@@ -1180,10 +1207,24 @@ def test_doctor_names_grant_without_subscription_as_drift(seat, monkeypatch):
                             version="1.0.2", contract="1.0"))
     report = operations.preflight(transport_factory=lambda c: FakeTransport())
 
-    check = next(c for c in report.checks if c[0] == "reachable channels")
+    # **Since 2026-09-28 this is caught one gate EARLIER, and that is better.**
+    #
+    # The seat's own channel used to fall back to the project name, so a seat
+    # routed to `orchestrator` still passed `subscription` on `agent-eco` and
+    # the drift showed up later as a note. With that construction removed, the
+    # seat's channel is the one the directory states — `orchestrator` — and
+    # the bot is not subscribed to it, so comms refuses to start rather than
+    # starting and receiving nothing.
+    #
+    # Same fault, named sooner and harder. `preflight` stops at the first
+    # failure, which is why `reachable channels` is not in the report at all.
+    names = [c[0] for c in report.checks]
+    assert "reachable channels" not in names, names
+    check = next(c for c in report.checks if c[0] == "subscription")
     assert check[1] is False
-    assert "GRANT WITHOUT SUBSCRIPTION" in check[2]
-    assert "replay provisioning" in check[2]
+    assert "orchestrator" in check[2] and "agent-eco" in check[2], (
+        "it must name the channel it wanted AND what the bot actually holds")
+    assert "agent-eco-agent-comms" in check[2], "and which bot"
 
 
 def test_subscription_without_grant_is_a_note_not_a_warning(seat, monkeypatch):
@@ -1200,7 +1241,9 @@ def test_subscription_without_grant_is_a_note_not_a_warning(seat, monkeypatch):
 
     (seat / ".comms").mkdir(parents=True, exist_ok=True)
     (seat / ".comms" / "routes.json").write_text(json.dumps({"routes": [
-        {"transports": {"comms": {"channel": "agent-eco"}}}]}))
+        {"agent": "bakehouse.agent-eco.agent-comms",
+         "transports": {"comms": {"channel": "agent-eco",
+                                  "bot": "agent-eco-agent-comms"}}}]}))
     monkeypatch.setattr(Hub, "subscribed_channels",
                         lambda self: frozenset({"agent-eco", "seat-testing"}))
     monkeypatch.setattr("agent_comms.operations.seat_state_now",
@@ -1358,14 +1401,14 @@ def test_doctor_names_a_daemon_running_a_different_build(seat, monkeypatch):
 
 def test_doctor_is_quiet_when_the_builds_agree(seat, monkeypatch):
     """It must not fire on the ordinary case, or it stops being read (§9)."""
-    from agent_comms import __version__
     from agent_comms.hub import Hub
-    from agent_comms.seat import SeatState
+    from agent_comms.seat import SeatState, build_id
     from agent_comms.store import Store
 
     s = Store(seat / ".comms")
     s.ensure()
-    s.record_build(__version__)
+    # Stamp what a daemon actually stamps: version PLUS a hash of its code.
+    s.record_build(build_id())
     monkeypatch.setattr(Store, "daemon_state",
                         lambda self: __import__("agent_comms.store", fromlist=["x"]).DaemonState(
                             running=True, pid=1, last_tick=None))
@@ -1376,6 +1419,17 @@ def test_doctor_is_quiet_when_the_builds_agree(seat, monkeypatch):
     report = operations.preflight(transport_factory=lambda c: FakeTransport())
 
     assert next(c for c in report.checks if c[0] == "daemon build")[1] is True
+
+    # **The near-miss on the named boundary** (gate 6): the version agrees and
+    # the code does not. This is the case a version comparison cannot see, and
+    # the case that actually happens -- `pipx install --force` over the same
+    # version, measured on a test seat 2026-09-26.
+    version, _, _hash = build_id().partition("+")
+    s.record_build(f"{version}+0000000000000000")
+    report = operations.preflight(transport_factory=lambda c: FakeTransport())
+    check = next(c for c in report.checks if c[0] == "daemon build")
+    assert check[1] is False, "a same-version stale daemon read as in step"
+    assert "reinstall of the same version number" in check[2], check[2]
 
 
 # -- R17: the rest of the §6 surface -----------------------------------------
@@ -1397,10 +1451,14 @@ def test_resolve_prints_the_path_and_sends_nothing(seat, monkeypatch):
     monkeypatch.setattr(R, "directory_address", lambda: "http://d")
     monkeypatch.setattr(operations, "send", lambda *a, **k: sent.append(a))
 
-    out = "\n".join(operations.resolve_name("arch"))
+    out = "\n".join(operations.resolve_name("arch", from_fqn="bakehouse.agent-eco.agent-comms"))
     assert "bakehouse.agent-eco.arch" in out
-    assert "channel agent-eco" in out and "bot arch" in out
-    assert "would send  YES" in out
+    # `resolve` tells the truth about what WOULD happen. Since 2026-09-25 that
+    # is a refusal for an agent with no declared transport — so it must say so
+    # here, before a person sends, rather than printing a transport it would
+    # not actually use.
+    assert "would send  NO" in out
+    assert "no comms transport is declared" in out
     assert sent == [], "resolve sent something"
 
 
@@ -1408,7 +1466,7 @@ def test_resolve_says_why_when_it_would_not_send(seat, monkeypatch):
     import agent_comms.resolve as R
 
     monkeypatch.setattr(R, "directory_address", lambda: "")
-    out = "\n".join(operations.resolve_name("nobody"))
+    out = "\n".join(operations.resolve_name("nobody", from_fqn="bakehouse.agent-eco.agent-comms"))
     assert "would send  NO" in out and "unknown" in out
 
 
@@ -1457,7 +1515,423 @@ def test_requeue_is_the_one_backwards_move_and_needs_a_person(seat):
     assert [r["id"] for r in operations.recent(last=9, state="queued")] == [302]
     assert any("requeued by hand" in r["cause"] for r in store.history(store._find(302)["id"]))
 
+    # **It must name the state `trace` names.** A hand retirement is STORED as
+    # `expired` with a reason beside it, so printing the raw column announced
+    # "requeued 302 from expired" about a message a person had just retired by
+    # hand -- the same conflation `_state_of` exists to prevent, on a surface
+    # that had not been asked. Measured on UC-07 step 5, 2026-09-27.
+    assert "from retired" in said, said
+    assert "from expired" not in said, (
+        "requeue reported the mechanism where trace reports the fact")
+
 
 def test_retire_and_requeue_refuse_an_unknown_id(seat):
     assert "no message 999" in operations.retire(999, "x")
     assert "no message 999" in operations.requeue(999, "x")
+
+
+def test_a_derived_bot_the_hub_does_not_have_is_refused_not_posted(seat, monkeypatch):
+    """MEASURED 2026-09-25 on the test containers, and it was a silent
+    non-delivery of my own making.
+
+    R15 derives the hub identity from the FQN's agent segment, which assumes one
+    hub account PER AGENT. The deployed hub has one per SEAT. So
+    `bakehouse.agent-eco.test-claude-new001` derived `test-claude-new001`, the
+    post mentioned an account that does not exist, `sent` was reported, and the
+    message reached nobody.
+
+    It refuses instead — and does NOT fall back to the seat's bot, because
+    delivering to the seat's default agent when the caller named a different one
+    is the same wrong-recipient failure wearing a helpful face.
+    """
+    from agent_comms.hub import Hub
+    from agent_comms.operations import UnknownRecipient
+
+    monkeypatch.setattr(Hub, "subscribed_channels", lambda self: frozenset({"agent-eco"}))
+    monkeypatch.setattr(Hub, "addressable_names", lambda self: ["test-claude", "agent-eco-arch"])
+    monkeypatch.setattr(operations, "_route", lambda s, n, **k: operations.Routed(
+        fqn="bakehouse.agent-eco.test-claude-new001", channel="agent-eco",
+        bot="test-claude-new001", delivery="inject"))
+
+    posted = []
+    monkeypatch.setattr(Hub, "send", lambda self, c, t, b: posted.append((c, t)))
+
+    with pytest.raises(UnknownRecipient) as caught:
+        operations.send("x", to="bakehouse.agent-eco.test-claude-new001", subject="s",
+                        transport_factory=lambda c: FakeTransport(), from_fqn="bakehouse.agent-eco.agent-comms")
+
+    said = str(caught.value)
+    assert "test-claude-new001" in said and "no such account" in said
+    assert "Nothing was posted" in said
+    assert posted == [], "it posted anyway"
+
+
+def test_a_derived_bot_the_hub_does_have_is_posted(seat, monkeypatch):
+    """The gate must not fire on the working case, or it stops being read."""
+    from agent_comms.hub import Hub
+
+    monkeypatch.setattr(Hub, "subscribed_channels", lambda self: frozenset({"agent-eco"}))
+    monkeypatch.setattr(Hub, "addressable_names", lambda self: ["test-claude"])
+    # Existence is `in_realm` since 2026-09-26, separated from reachability so a
+    # cross-project bot outside our channel is not called nonexistent.
+    monkeypatch.setattr(Hub, "in_realm", lambda self, n: n == "test-claude")
+    monkeypatch.setattr(operations, "_route", lambda s, n, **k: operations.Routed(
+        fqn="bakehouse.agent-eco.test-claude", channel="agent-eco",
+        bot="test-claude", delivery="inject"))
+    posted = []
+    monkeypatch.setattr(Hub, "send", lambda self, c, t, b: posted.append((c, t)) or {"id": 1})
+
+    operations.send("x", to="bakehouse.agent-eco.test-claude", subject="s",
+                    transport_factory=lambda c: FakeTransport(), from_fqn="bakehouse.agent-eco.agent-comms")
+    assert posted and posted[0][0] == "agent-eco"
+
+
+# -- doctor's mirror check: agents assigned here must reach THIS seat --------
+
+def test_an_agent_declaring_another_seats_bot_is_named_as_wrong():
+    """The silent case, made loud at the seat. A sender obeying a record naming
+    someone else's bot posts where no bot of ours is subscribed, and a post no
+    bot holds produces NO EVENT AT ALL — success reported, nothing delivered.
+    The seat can see this; the sender cannot."""
+    from agent_comms.operations import agents_reaching
+    wrong, undeclared = agents_reaching({
+        "bakehouse.agent-eco.test-claude-new001":
+            {"agent": "bakehouse.agent-eco.test-claude",
+             "transports": {"comms": {"bot": "test-claude", "channel": "seat-testing"}}},
+        "bakehouse.agent-eco.stray":
+            {"agent": "bakehouse.agent-eco.other",
+             "transports": {"comms": {"bot": "some-other-seat", "channel": "seat-testing"}}},
+    }, ("test-claude", "agent-eco-test-claude"))
+    assert wrong == ["bakehouse.agent-eco.stray \u2192 bot 'some-other-seat'"]
+    assert undeclared == []
+
+
+def test_both_canonical_spellings_of_this_seats_bot_are_accepted():
+    """ADR-0009 §7a: a component bot is unambiguous as <seat> in its own channel
+    and as <project>-<seat> anywhere. BOTH are correct, and the directory
+    authors the short one. Accepting only `identity.bot_name` failed every
+    correctly-declared agent on every component seat -- measured on test-claude
+    2026-09-25, calling a provably working delivery 'delivering to nobody'."""
+    from agent_comms.operations import agents_reaching
+    assert agents_reaching(
+        {"a.b.one": {"transports": {"comms": {"bot": "test-claude"}}},
+         "a.b.two": {"transports": {"comms": {"bot": "agent-eco-test-claude"}}}},
+        ("test-claude", "agent-eco-test-claude")) == ([], [])
+
+
+def test_an_undeclared_agent_is_a_note_not_a_failure():
+    """Derivation is gone, so an undeclared agent is refused at the sender with
+    nothing posted — a missing record, not a silent loss. Failing on it would
+    fire on every seat mid-authoring, and a check that always fires is
+    constitution §9's speech when it should be silent."""
+    from agent_comms.operations import agents_reaching
+    wrong, undeclared = agents_reaching(
+        {"bakehouse.agent-eco.pending": {"transports": {}}},
+        ("test-claude", "agent-eco-test-claude"))
+    assert wrong == []
+    assert undeclared == ["bakehouse.agent-eco.pending"]
+
+
+def test_a_seat_whose_agents_all_point_at_it_reports_nothing_wrong():
+    from agent_comms.operations import agents_reaching
+    assert agents_reaching({
+        "a.b.one": {"transports": {"comms": {"bot": "test-claude"}}},
+        "a.b.two": {"transports": {"comms": {"bot": "test-claude"}}},
+    }, ("test-claude", "agent-eco-test-claude")) == ([], [])
+
+
+def test_the_wake_outcome_is_a_word_not_a_prefix_of_a_sentence():
+    """Write-time gate 1, fixed 2026-09-25. `wake_agent` returned prose and the
+    CLI chose an EXIT CODE with `outcome.startswith("queued")` -- a
+    prefix-match on a closed word set, picking a consumer surface by guesswork.
+    `queued-for-review` would have matched `queued`.
+
+    The near-miss is the point: a word that STARTS WITH the right word is the
+    wrong word."""
+    from agent_comms.operations import Woken
+    w = Woken(Woken.QUEUED, "queued: the seat could not be invoked")
+    assert w.outcome == Woken.QUEUED
+    # The human line is unchanged for anything that echoes it.
+    assert str(w) == "queued: the seat could not be invoked"
+
+    near = Woken("queued-for-review", "queued-for-review: not a real state")
+    assert near.outcome != Woken.QUEUED, \
+        "an exact match must reject a word that merely starts with the right one"
+    assert near.line.startswith("queued"), \
+        "...and the near-miss really would have passed the old prefix test"
+
+
+def test_a_check_with_nothing_to_verify_says_so_by_name():
+    """Write-time gate 9, ruled by arch 2026-09-26.
+
+    `agents reach this seat` used to be omitted entirely when there was nothing
+    to verify. Measured on a fresh test-codex: doctor reported 11 checks where
+    test-claude reported 12, with nothing saying which was missing or why.
+
+    **An absent check and a passing check are indistinguishable to anyone
+    counting** — the diagnostic-without-information class, in the one tool whose
+    whole job is information. The check now always appears; what varies is what
+    it says."""
+    import ast
+    import pathlib
+
+    src = pathlib.Path("src/agent_comms/operations.py").read_text()
+    tree = ast.parse(src)
+    pre = next(n for n in ast.walk(tree)
+               if isinstance(n, ast.FunctionDef) and n.name == "preflight")
+    # Every branch of the mirror check must add the check, so no path omits it.
+    adds = [n for n in ast.walk(pre)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "add"
+            and n.args and isinstance(n.args[0], ast.Constant)
+            and n.args[0].value == "agents reach this seat"]
+    assert len(adds) >= 4, (
+        f"only {len(adds)} branches name this check; a branch that omits it makes "
+        "an absent check read as a passing one")
+
+
+def test_resolve_says_NO_when_the_directory_answers_not_permitted(seat, monkeypatch):
+    """**agent-comms' half of the resolve-permissions fix.**
+
+    The estate's ruling (arch 3441/3444, need
+    `agenteco-needs-resolve-answers-permissions-v0_1`) is that `POST /v0/resolve`
+    answers `not-permitted` for a blocked pair, as `GET /v0/addressable?from=`
+    already does. Comms consumes the VERDICT and never evaluates the permission
+    itself: the blocked list comes back as short names, and matching a caller
+    FQN against a bare token is identity taken apart to reach a decision --
+    built and reverted twice, and failed at build time by gates 1 and 1b.
+
+    Nothing is being fixed in comms here. This pins that the consuming side is
+    already right so it cannot regress before the directory change lands, and
+    it is the test that turns the discovery count case from 1 to 0 on the day
+    it does.
+
+    **The control is a near-miss on the named boundary (gate 6): the two
+    answers differ ONLY in status.** Same FQN, same canonical id, same
+    delivery, same transport, same revision. If comms decided on the route it
+    was handed -- as it must not -- both would read YES. It reads NO then YES,
+    so the STATUS is what decided and nothing else.
+
+    Two earlier versions of this test passed for the wrong reason and are worth
+    recording. The first returned a refusal carrying **no transport**, so the
+    verdict rested on the missing route: the status could be ignored entirely
+    and the test stayed green. The second kept that fixture and tried to break
+    the code by mutation instead -- and comms refuses a malformed answer at
+    three separate layers, so every single-point mutation left it green too. A
+    refusal fixture with nothing to route to cannot tell "refused" from
+    "unroutable" (catalogue 0.58).
+    """
+    import agent_comms.resolve as R
+
+    TARGET = "bakehouse.agent-eco.fixture-blocked"
+    ROUTE = {"canonical_id": TARGET, "delivery": "inject", "route_revision": 7,
+             "transports": {"comms": {"channel": "seat-testing", "bot": "test-claude"}}}
+
+    def answering(status: str):
+        """The same routable agent, refused or permitted -- status is the only
+        difference on the wire, as it is from the real directory."""
+        def directory(address, payload, timeout):
+            body = {"kind": "resolution-result", "contract": "0.2",
+                    "requested": TARGET, **ROUTE}
+            if status == "not-permitted":
+                body |= {"success": False, "status": "not-permitted",
+                         "message": (f"{payload.get('caller')} is on {TARGET}'s blocked "
+                                     "list (permissions.comms.blocked)")}
+            else:
+                body |= {"success": True, "status": "resolved"}
+            return 200, body
+        return directory
+
+    sent = []
+    monkeypatch.setattr(R, "directory_address", lambda: "http://d")
+    monkeypatch.setattr(operations, "send", lambda *a, **k: sent.append(a))
+    me = "bakehouse.agent-eco.agent-comms"
+
+    monkeypatch.setattr(R, "_post", answering("not-permitted"))
+    refused = "\n".join(operations.resolve_name(TARGET, from_fqn=me))
+
+    monkeypatch.setattr(R, "_post", answering("resolved"))
+    allowed = "\n".join(operations.resolve_name(TARGET, from_fqn=me))
+
+    assert "would send  NO" in refused, refused
+    assert "not-permitted" in refused, refused
+    # A refusal and a typo are two situations and get two sentences (arch 3548).
+    assert "the directory refuses this sender" in refused, refused
+    # Gate 10: the refusal names the rule that fired, in the directory's words.
+    assert "permissions.comms.blocked" in refused, (
+        "the directory's reason did not reach the person who asked")
+
+    # The near-miss: identical route, permitted.
+    assert "would send  YES" in allowed, allowed
+    assert "seat-testing" in allowed, "the control did not get as far as a transport"
+
+    # **The near-miss on the OTHER boundary: a refusal is not a typo.** An
+    # unknown name must keep its own last line, or the distinction ruled on
+    # 2026-09-28 (arch 3548) is a string nobody can tell apart from the one it
+    # replaced. The reader of a typo fixes the name; the reader of a refusal
+    # asks the estate to change a permission.
+    def unknown(address, payload, timeout):
+        return 200, {"kind": "resolution-result", "contract": "0.2",
+                     "success": False, "status": "unknown", "requested": TARGET,
+                     "message": "no agent or alias named that is known"}
+
+    monkeypatch.setattr(R, "_post", unknown)
+    typo = "\n".join(operations.resolve_name(TARGET, from_fqn=me))
+    assert "would send  NO" in typo, typo
+    assert "the directory refuses this sender" not in typo, (
+        "a name that does not exist was reported as a permission refusal")
+
+    # **The case the well-formed fixture could not catch (2026-09-28).**
+    # This test's fixtures are correct by construction, so it proves comms
+    # consumes a GOOD not-permitted body — and stays green while the live
+    # estate is broken. It was: estate-directory shipped the refusal without
+    # `kind`/`contract` (this client's shape gate), comms rejected it as "not a
+    # resolution", degraded to cache and answered `unknown`, and the discovery
+    # count case reached 0 for the WRONG reason.
+    #
+    # A refusal that does not reach the parser must not read as a refusal.
+    def envelopeless(address, payload, timeout):
+        body = {"status": "not-permitted", "success": False, "requested": TARGET,
+                **ROUTE, "message": "blocked"}
+        return 200, body                      # no `kind`, no `contract`
+
+    monkeypatch.setattr(R, "_post", envelopeless)
+    malformed = "\n".join(operations.resolve_name(TARGET, from_fqn=me))
+    assert "would send  NO" in malformed, "comms must fail closed on a shape it cannot read"
+    assert "the directory refuses this sender" not in malformed, (
+        "an unparseable body was reported as a permission refusal — the count case "
+        "would read 0 while the estate is degraded")
+    assert "degraded" in malformed or "cache" in malformed, (
+        "comms degraded without saying so: " + malformed)
+
+    assert not sent, "resolve must answer without sending anything"
+
+
+def test_a_seat_with_no_channel_JOINS_when_one_is_assigned(seat, monkeypatch):
+    """**Idling shipped; joining did not.**
+
+    A seat installed before the estate assigns it anything has no channel —
+    correct, and ruled (ansible-platform's retire-comms-yml need): no agents
+    means no mail is possible and there is nothing to join. The daemon reads
+    its channel once, at startup, from its own assignment rows.
+
+    It then idled FOREVER. Measured on test-claude 2026-09-28, on fresh drives,
+    by UC-12's zero-assignment control: generation 48 brought four agents and a
+    channel, nothing re-read it, and every inbound message failed its
+    permission check with "this bot is not subscribed to channel ''" — while
+    `comms status`, which loads settings fresh, cheerfully printed the right
+    channel. The two halves of the seat disagreed and only the daemon mattered.
+    """
+    import json
+
+    from agent_comms import operations
+    from tests.conftest import FakeTransport
+
+    routes = seat / ".comms" / "routes.json"
+    routes.write_text(json.dumps({"routes": []}))          # nothing assigned yet
+
+    joined: list[str] = []
+
+    real = operations.Hub
+
+    class Watching(real):
+        def __init__(self, transport, settings, credential):
+            joined.append(settings.channel)
+            super().__init__(transport, settings, credential)
+
+    monkeypatch.setattr(operations, "Hub", Watching)
+
+    # The assignment lands between one config refresh and the next.
+    def assigned(*a, **k):
+        routes.write_text(json.dumps({"routes": [
+            {"agent": "bakehouse.agent-eco.agent-comms",
+             "transports": {"comms": {"channel": "agent-eco",
+                                      "bot": "agent-eco-agent-comms"}}}]}))
+        from agent_comms.config_sync import Fetched
+        return Fetched(generation=2, fetched_at="now", agents=1, source="directory")
+
+    monkeypatch.setattr(operations.config_sync, "fetch", assigned)
+    monkeypatch.setattr(operations, "CONFIG_REFRESH_SECS", 0)
+
+    operations.run_daemon(transport_factory=lambda c: FakeTransport(), max_iterations=1)
+
+    assert joined, "no hub was built at all"
+    assert joined[0] == "", "a seat with no assignments must start with no channel"
+    assert "agent-eco" in joined, (
+        f"the daemon never joined the channel it was assigned: {joined}")
+
+
+def test_doctor_tells_the_truth_about_a_deaf_seat(seat, monkeypatch):
+    """**UC-13.** A seat with no channel cannot receive. `doctor` said otherwise
+    in all three places that matter, measured on test-claude 2026-09-29:
+
+    - `deliverable` — *"yes: a message sent now would reach the agent"*. False,
+      and it is catalogue 0.58 in the one check whose own question that is: the
+      seat was deaf and it could not go red.
+    - `subscription` — **PASS**, *"subscribed to ''"*. It asserted a
+      subscription that cannot exist.
+    - `reachable channels` — FAIL blaming *GRANT WITHOUT SUBSCRIPTION* for a
+      channel named nothing, remedy *"ask the orchestrator to replay
+      provisioning"*. Wrong cause, and the remedy sends a person to another
+      component for a drift that does not exist (gate 10).
+
+    Together they are worse than silence: an operator who follows them leaves
+    the seat deaf with a plausible explanation attached.
+
+    **Both states on one build**, because a version that fails `deliverable`
+    always has only moved the false answer to the other side.
+    """
+    import json
+
+    from agent_comms import operations
+    from agent_comms.config import load_settings
+    from agent_comms.hub import Hub
+    from agent_comms.seat import SeatState
+    from tests.conftest import FakeTransport
+
+    monkeypatch.setattr(Hub, "subscribed_channels",
+                        lambda self: frozenset({"agent-eco", "seat-testing"}))
+    # The seat's runtime is healthy throughout — the point is that a healthy
+    # session does not make a channel-less seat deliverable.
+    monkeypatch.setattr("agent_comms.operations.seat_state_now",
+                        lambda: SeatState(answer="yes", reason="a session is up",
+                                          runtime="claude", sessions=1,
+                                          version="2.7.1", contract="2.5-draft"))
+
+    routes = seat / ".comms" / "routes.json"
+    held = routes.read_text()
+
+    def check(name, report):
+        return next(c for c in report.checks if c[0] == name)
+
+    # -- DEAF: no assignments, so no channel ------------------------------
+    routes.write_text(json.dumps({"routes": []}))
+    assert not (load_settings().channel or "").strip(), "fixture is not deaf"
+    deaf = operations.preflight(transport_factory=lambda c: FakeTransport())
+
+    ok, why = check("deliverable", deaf)[1], check("deliverable", deaf)[2]
+    assert ok is False, "deliverable said a message would reach the agent on a deaf seat"
+    assert "no channel" in why, why
+
+    ok, why = check("subscription", deaf)[1], check("subscription", deaf)[2]
+    assert ok is False, "subscription passed on an empty channel name"
+    assert "replay provisioning" in why, (
+        "it must say NOT to ask orch — that is the wrong turn this fixes")
+
+    # `reachable channels` must not invent a drift. Either it is absent (nothing
+    # to check) or it does not claim grant-without-subscription.
+    reach = [c for c in deaf.checks if c[0] == "reachable channels"]
+    assert not any("GRANT WITHOUT SUBSCRIPTION" in c[2] for c in reach), (
+        "estate drift was reported for a channel named nothing")
+
+    # **The later checks still ran** — a failing subscription here must not
+    # return early, or the deliverable finding is hidden.
+    assert "deliverable" in [c[0] for c in deaf.checks]
+
+    # -- ASSIGNED: the same build must go quiet ---------------------------
+    routes.write_text(held)
+    fine = operations.preflight(transport_factory=lambda c: FakeTransport())
+    assert check("deliverable", fine)[1] is True, check("deliverable", fine)[2]
+    assert check("subscription", fine)[1] is True, check("subscription", fine)[2]
+    for _n, _ok, why in fine.checks:
+        assert "no channel" not in why, f"deaf-state wording leaked into a healthy seat: {why}"

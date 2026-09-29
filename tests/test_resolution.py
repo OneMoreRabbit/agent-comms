@@ -384,3 +384,33 @@ def test_a_0_2_answer_tells_us_where_to_send_and_nothing_about_the_seat(director
     # route block at all.
     for internal in ("seat", "host", "seat_local_id"):
         assert not hasattr(a, internal), f"a seat internal survives: {internal}"
+
+
+def test_a_field_nothing_reads_does_not_exist_on_a_resolution(directory, monkeypatch):
+    """`route` was parsed off every answer and read nowhere. The strong form is
+    that the attribute does not EXIST, so nothing can come to rely on it.
+
+    **`permissions` was removed with it on 2026-09-25 and restored the same
+    day.** It was not a phantom, it was UNWIRED: the estate authors blocks in
+    `permissions.comms.blocked` and nothing read them, so a blocked sender was
+    delivered (UC-03, measured live). "Parses and nothing reads it" describes
+    both a phantom and a gap; they are told apart by asking whether anyone
+    WRITES it. Neither I nor arch asked that before deleting it.
+
+    So the rule this test pins is not "delete unread fields" but the sharper
+    one: a field must have a READER or no WRITER. `permissions` now has both."""
+    monkeypatch.setattr(R, "_post", _refuses(200, {
+        "kind": "resolution-result", "contract": "0.2", "success": True,
+        "status": "resolved", "requested": "arc-web-review",
+        "canonical_id": "bakehouse.arc-web.review", "delivery": "inject",
+        "transports": {"comms": {"channel": "arc-web", "bot": "arc-web-arch"}},
+        "permissions": {"comms": {"blocked": ["someone"]}},
+        "route": {"seat": "arc-web-01", "host": "10.0.0.9"}}))
+    a = R.Resolver(local_agents={}).resolve("arc-web-review", caller="c")
+
+    assert a.success and a.delivery == "inject"
+    assert not hasattr(a, "route"), "a field nothing reads survives: route"
+    # Carried, because it is enforced at the receiving end.
+    assert a.permissions["comms"]["blocked"] == ["someone"]
+    from agent_comms.delivery import permitted_to_send
+    assert permitted_to_send(a.delivery)[0] is True

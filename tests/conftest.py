@@ -26,11 +26,23 @@ class FakeTransport:
         # exists and is unreachable from this seat. That distinction is the
         # whole point of the reachability check, so the fake carries it.
         self.realm = realm if realm is not None else [
-            "agent-comms", "agent-eco-arch", "agent-skeleton", "orchestrator",
+            "agent-comms", "agent-eco-agent-comms",
+            "agent-eco-arch", "agent-skeleton", "orchestrator",
             "blocks-android", "blocks-service", "blocks-arch",
+            # In the realm, NOT in this seat's channel -- the reachability gate
+            # needs a bot that exists and cannot be reached from here.
+            "orch-arch",
+            # A HUMAN. The live hub has them and they are not agents: they have
+            # no FQN and never will, so they are addressed by hub name. Since
+            # 2026-09-26 that is the ONLY name-addressing comms still does --
+            # a bot the directory cannot resolve is refused, because a bot is a
+            # seat's mailbox and not an address.
+            "Oliver Blakeman",
         ]
         self.channel_members = channel_members if channel_members is not None else [
-            "agent-comms", "agent-eco-arch", "agent-skeleton", "orchestrator",
+            "agent-comms", "agent-eco-agent-comms",
+            "agent-eco-arch", "agent-skeleton", "orchestrator",
+            "Oliver Blakeman",
         ]
         self.full_name = full_name
         self.is_bot = is_bot
@@ -59,7 +71,9 @@ class FakeTransport:
             return {
                 "result": "success",
                 "members": [
-                    {"full_name": n, "user_id": 1 + i, "is_active": True, "is_bot": True}
+                    {"full_name": n, "user_id": 1 + i, "is_active": True,
+                     # Everything in the fake realm is a bot except the human.
+                     "is_bot": " " not in n}
                     for i, n in enumerate(self.realm)
                 ],
             }
@@ -161,6 +175,83 @@ def seat(tmp_path, monkeypatch):
         )
         (shim / binary).chmod(0o755)
     monkeypatch.setenv("PATH", f"{shim}:{os.environ.get('PATH', '')}")
+
+    # **This seat's OWN assignments — one bot, one channel.**
+    #
+    # `routes.json` is the cache of `/v0/seats/<p>/<s>/assignments`, so it holds
+    # the agents THIS SEAT serves and nothing else. A first version of this
+    # fixture put four different seats' agents in it to make them addressable,
+    # and `declared_identity` correctly refused the result as "disagreeing
+    # transports" -- a seat cannot have four bots. Addressing OTHER agents goes
+    # through the directory, which is faked below.
+    import json as _json
+    (home / ".comms").mkdir(parents=True, exist_ok=True)
+    (home / ".comms" / "routes.json").write_text(_json.dumps({
+        "contract": "0.2", "generation": 1, "source": "directory",
+        "fetched_at": "2026-09-26T00:00:00+00:00",
+        "routes": [
+            {"agent": "bakehouse.agent-eco.agent-comms", "delivery": "inject",
+             "transports": {"comms": {"channel": "agent-eco",
+                                      "bot": "agent-eco-agent-comms"}}},
+        ]}), encoding="utf-8")
+
+    # **A directory that answers.** Addressing is by FQN and resolution is the
+    # directory's job, so the suite must have one: without it every cross-seat
+    # send falls to the hub-name path, which since 2026-09-26 refuses a bot.
+    (home / ".secrets" / "estate-directory-address").write_text(
+        "https://directory.test", encoding="utf-8")
+    (home / ".secrets" / "estate-directory-seat").write_text("t0ken", encoding="utf-8")
+
+    #: The agent-eco agents the fake directory knows, with the bot each is
+    #: reached on. Measured shapes: a component bot is its seat name, an arch
+    #: bot carries its project, and `blocks-android` is deliberately on another
+    #: channel so the reachability check has something real to catch.
+    KNOWN = {
+        "bakehouse.agent-eco.agent-skeleton": ("agent-eco", "agent-skeleton"),
+        "bakehouse.agent-eco.arch": ("agent-eco", "agent-eco-arch"),
+        "bakehouse.agent-eco.agent-comms": ("agent-eco", "agent-eco-agent-comms"),
+        "bakehouse.blocks.blocks-android": ("blocks", "blocks-android"),
+        # Another project's arch, on a channel this seat does not hold -- the
+        # grant-without-subscription shape the reachability gate exists for.
+        "bakehouse.orchestrator.arch": ("orchestrator", "orch-arch"),
+    }
+
+    #: Callers the fixture treats as real besides the KNOWN agents: this seat's
+    #: own agents, which the directory knows even when the fake's KNOWN map is
+    #: only the remote set.
+    LOCAL_CALLERS = {"bakehouse.agent-eco.agent-comms"}
+
+    def _directory(address, payload, timeout):
+        target = payload.get("target", "")
+        folded = {k.casefold(): v for k, v in KNOWN.items()}
+        if target.strip().casefold() in folded:
+            channel, bot = folded[target.strip().casefold()]
+            return 200, {"kind": "resolution-result", "contract": "0.2",
+                         "success": True, "status": "resolved", "requested": target,
+                         "canonical_id": target, "delivery": "inject",
+                         "route_revision": 1,
+                         "transports": {"comms": {"channel": channel, "bot": bot}}}
+        # The real directory answers a bare role with the FQNs that end in it
+        # -- that is where `did you mean` comes from, and a fixture without it
+        # cannot tell a refusal that helps from one that does not.
+        #
+        # **And it answers them only to a caller it knows.** Near-misses are
+        # caller-relative (the caller's own project first, UC-08 fact 2), so a
+        # nonsense caller gets an empty set. A fake that ignores `caller`
+        # cannot fail on code that passes the wrong one -- and it did not:
+        # `_directory_hint` passed the TARGET as the caller, the unit test
+        # passed, and the live seat printed no near-misses. Measured
+        # 2026-09-27; catalogue 0.59.
+        caller = (payload.get("caller") or "").strip()
+        tail = target.strip().casefold()
+        near = (sorted(k for k in KNOWN if k.rsplit(".", 1)[-1].casefold() == tail)
+                if caller.casefold() in folded or caller in LOCAL_CALLERS else [])
+        return 200, {"kind": "resolution-result", "contract": "0.2", "success": False,
+                     "status": "unknown", "requested": target,
+                     "near_misses": near,
+                     "message": f"no agent or alias named {target!r} is known"}
+
+    monkeypatch.setattr("agent_comms.resolve._post", _directory)
 
     monkeypatch.setattr("pathlib.Path.home", classmethod(lambda cls: home))
     for var in (

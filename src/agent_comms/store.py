@@ -27,6 +27,39 @@ class Mention:
     timestamp: int
     permalink: str
     read: bool = False
+    #: The FQN this message was addressed to, when it was addressed to an agent
+    #: rather than to the seat at large. **This is the envelope address.**
+    #:
+    #: The hub cannot carry it: one bot is one SEAT's mailbox (comms-design §5),
+    #: so several agents on a seat share one `@`-mention. The design's rule is
+    #: therefore "the agent is nothing on the hub — the addressed FQN travels
+    #: inside the message, and the receiving comms hands it to its seat"
+    #: (comms-design-v1_0 §5, the `agent` row). This field is that FQN, and
+    #: `wake()` is where it is handed over as `seat msg --agent <FQN>`.
+    #:
+    #: Empty means addressed to the seat, which delivers to the seat's default
+    #: agent — the 1.0 behaviour, unchanged.
+    agent: str = ""
+    #: The FQN the message came FROM, when the sender stated one.
+    #:
+    #: **Addressing is by FQN — including who a message is from.** The hub can
+    #: only tell us a bot display name, and a bot is a SEAT, so a display name
+    #: cannot name the agent that wrote. Every policy comparison wants the FQN,
+    #: and this is where it is kept.
+    #:
+    #: Empty for a sender that states none. Those fall back to the display
+    #: name, which is a migration, not a design: it is marked as such at every
+    #: point it is used.
+    sender_fqn: str = ""
+    #: The store's OWN state word, when the record came from the SQLite store.
+    #: Empty for a 1.0-shaped record that never had one.
+    #:
+    #: It exists because the display word used to be DERIVED from the booleans
+    #: below, which collapsed nine states into two: `retrieved`, `expired` and
+    #: **`abandoned`** all set `delivered`, so `comms trace` showed "delivered"
+    #: for a message that had been given up on after three attempts. A right
+    #: answer and a wrong answer must not read alike (write-time gate 9).
+    state: str = ""
     #: Why this message was stored — mention, topic, or direct message. Shown in
     #: the inbox so a seat can tell an explicit summons from a topic it owns.
     reason: str = "mentioned"

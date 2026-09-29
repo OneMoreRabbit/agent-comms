@@ -84,8 +84,28 @@ class Resolution:
     #: nothing read them: §11 question 1, the same rule that deleted
     #: `local_route`. A field that governs nothing is deleted, not kept
     #: "in case" — a phantom does nothing while advertising that it does.
+    #:
+    #: `permissions` was DELETED for the same reason (2026-09-25, found by
+    #: the operator's `role` verification). The directory sends it, we
+    #: parsed it, and nothing ever read it. It is the worse kind of
+    #: phantom: a reader would assume it governs the delivery verdict.
+    #: It does not — `permitted_to_send()` reads `delivery` and nothing
+    #: else. If a permission answer is ever to govern a send, it gets
+    #: wired to a reader in the same change that reintroduces the field.
     delivery: str = ""
     transports: dict = field(default_factory=dict)
+    #: The agent's own inbound policy, from the directory — `permissions.comms`
+    #: carries `partners` and `blocked`.
+    #:
+    #: **Restored 2026-09-25, having been deleted the same morning as a
+    #: phantom.** It was not a phantom, it was UNWIRED: the estate authors
+    #: blocks here and nothing read them, so a blocked sender was delivered
+    #: (UC-03, measured). "Parses and nothing reads it" describes both a
+    #: phantom and a gap, and the two are told apart by asking whether anyone
+    #: WRITES it — which neither I nor arch did before removing it.
+    #:
+    #: It has a reader now: `config_sync` caches it per agent and the receive
+    #: path enforces it. If that reader ever goes, this field goes with it.
     permissions: dict = field(default_factory=dict)
     route_revision: int | None = None
     near_misses: tuple[str, ...] = ()
@@ -374,7 +394,6 @@ def _read(target: str, body: dict) -> Resolution:
                           message="the directory returned something that is not an answer")
 
     if body.get("success"):
-        route = body.get("route") or {}
         return Resolution(
             success=True, status=str(body.get("status") or "resolved"), requested=target,
             canonical_id=str(body.get("canonical_id") or ""),

@@ -126,9 +126,10 @@ def show(message_id: int) -> None:
 @main.command()
 @click.argument("message_id", type=int)
 @click.argument("content")
-def reply(message_id: int, content: str) -> None:
+@click.option("--from", "from_fqn", required=True, help="The FQN of the AGENT sending this — estate.project.agent. Required: a message is from an agent to an agent, and the seat is only the delivery mechanism, so comms cannot supply it.")
+def reply(message_id: int, content: str, from_fqn: str) -> None:
     """Reply in the mention's own topic."""
-    posted = operations.reply(message_id, content)
+    posted = operations.reply(message_id, content, from_fqn=from_fqn)
     _say_sent(posted, "replied")
 
 
@@ -147,30 +148,40 @@ def _say_sent(posted, word: str = "sent") -> None:
 
 @main.command()
 @click.option("--to", required=True,
-              help="The seat this message is for, by plain name (agent-skeleton).")
+              help="The FQN of the AGENT this message is for — "
+                   "estate.project.agent. A bare name is not an address: the "
+                   "directory answers `unknown` for it and the send is refused.")
 @click.option("--subject", default=None, help="Subject; the topic becomes '<to>: <subject>'.")
 @click.option("--topic", default=None,
               help="Continue an existing topic instead of starting one. Still needs --to.")
+@click.option("--from", "from_fqn", required=True, help="The FQN of the AGENT sending this — estate.project.agent. Required: a message is from an agent to an agent, and the seat is only the delivery mechanism, so comms cannot supply it.")
 @click.argument("content")
-def send(to: str, subject: str | None, topic: str | None, content: str) -> None:
-    """Post to this seat's project channel, addressed to a named seat.
+def send(to: str, subject: str | None, topic: str | None, from_fqn: str,
+         content: str) -> None:
+    """Post to this seat's channel, addressed from one AGENT to another.
 
-    You name the seat; this client spells the address:
+    Both ends are FQNs. A message is from an agent to an agent; the seat is the
+    delivery mechanism and has no FQN of its own, so neither end can be defaulted:
 
-        comms send --to agent-skeleton --subject 'the ask' 'body text'
+        comms send --from estate.project.sender --to estate.project.recipient \
+                   --subject 'the ask' 'body text'
 
-    gives the topic `agent-skeleton: the ask` and a real `@**agent-skeleton**`
-    mention — both routes a recipient matches on, so it does not matter which.
+    gives the topic `estate.project.recipient: the ask` and a real mention of the
+    recipient's seat bot — both routes a recipient matches on, so it does not
+    matter which.
 
-    The body is never rewritten: a seat name typed in prose is prose, and
-    addressing travels in the flag, not the text. It IS now read for one thing —
-    an explicit `@**name**` is checked for reachability, and you get a warning on
-    stderr if that name cannot see this channel. The message still posts.
+    **A bare name is not an address.** `--to agent-skeleton` resolves to
+    `unknown` at the directory and the send is refused rather than posted. The
+    directory is read, never pattern-matched: nothing here builds an identifier
+    out of parts or guesses among candidates.
 
-    The name in --to is checked against the hub first, and a seat that does not
-    exist or is not in this channel is refused rather than posted to.
+    The body is never rewritten: a name typed in prose is prose, and addressing
+    travels in the flag, not the text. It IS read for one thing — an explicit
+    `@**name**` is checked for reachability, and you get a warning on stderr if
+    that name cannot see this channel. The message still posts.
     """
-    posted = operations.send(content, to=to, subject=subject, topic=topic)
+    posted = operations.send(content, to=to, subject=subject, topic=topic,
+                             from_fqn=from_fqn)
     _say_sent(posted)
 
 
@@ -199,7 +210,10 @@ def wake(message_id: int | None) -> None:
 
     outcome = operations.wake_agent(payload)
     click.echo(outcome)
-    if outcome.startswith("queued"):
+    # Exact match on a named outcome. This was `outcome.startswith("queued")`
+    # until 2026-09-25: a prefix-match on a closed word set, choosing a
+    # consumer-facing EXIT CODE by guesswork (write-time gate 1).
+    if outcome.outcome == operations.Woken.QUEUED:
         sys.exit(EXIT_QUEUED)
 
 
@@ -391,11 +405,32 @@ def trace(message_id: int) -> None:
         click.echo(line)
 
 
+@main.command("partners")
+@click.option("--from", "from_fqn", default="",
+              help="The FQN whose addressable set to ask about. A CLAIM, not "
+                   "identity: anyone may ask about anyone. Omit it for the whole "
+                   "estate.")
+def partners_cmd(from_fqn: str) -> None:
+    """Who the directory says an agent may address. Discovery, not permission.
+
+    Wraps `GET /v0/addressable?from=<FQN>`. The surface is tokenless, so this
+    reads public information and does not speak for you: `?from` is a claim the
+    directory evaluates, not proof of who is asking.
+
+    **Appearing here does not authorise a send.** `comms send` resolves every
+    message at the moment it sends it, which is the only answer that cannot go
+    stale between the asking and the sending.
+    """
+    for line in operations.partners(from_fqn=from_fqn):
+        click.echo(line)
+
+
 @main.command("resolve")
 @click.argument("name")
-def resolve_cmd(name: str) -> None:
+@click.option("--from", "from_fqn", required=True, help="The FQN of the AGENT asking — estate.project.agent. Required: the permission verdict depends on who is asking, so asking as the wrong agent prints the wrong answer.")
+def resolve_cmd(name: str, from_fqn: str) -> None:
     """What would this address resolve to, and why. Sends nothing."""
-    for line in operations.resolve_name(name):
+    for line in operations.resolve_name(name, from_fqn=from_fqn):
         click.echo(line)
 
 

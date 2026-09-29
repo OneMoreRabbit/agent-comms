@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 
 #: Delivery statuses, from the contract's table. `success` is the field to branch
 #: on; these are for deciding what to do NEXT, which is this client's business.
@@ -238,7 +239,7 @@ def _major(contract: str) -> int | None:
     major 1, and `"2.0-draft"` must read as 2 — that is the spelling a seat
     reports while a contract is published but not yet tagged.
     """
-    head = contract.strip().split(".", 1)[0]
+    head = contract.strip().split(".", 1)[0]  # gate-exempt: a CONTRACT VERSION, not an addressing value. Reading a version's major is not deriving an identity
     digits = ""
     for ch in head:
         if not ch.isdigit():
@@ -263,6 +264,43 @@ def speaks_contract(contract: str) -> bool:
 def _client_version() -> str:
     from . import __version__
     return __version__
+
+
+def _client_fingerprint() -> str:
+    """A hash of the code actually on disk, not the number it calls itself.
+
+    **Catalogue 0.58, on the one check that exists to catch build drift.** The
+    daemon stamped its `__version__` and `doctor` compared version strings — so
+    a daemon running code from before a reinstall of the SAME version read as
+    "daemon and CLI both 2.1.1" and the check could not go red. That is not a
+    hypothetical: `pipx install --force` left a stale install on a test seat on
+    2026-09-26 and only hashing content found it.
+
+    A version string is bumped per release and says what someone intended; this
+    varies with the bytes that are running. Empty on any read failure — a
+    fingerprint that cannot be taken must not read as a mismatch.
+    """
+    import hashlib
+    here = Path(__file__).resolve().parent
+    digest = hashlib.blake2b(digest_size=8)
+    try:
+        for path in sorted(here.glob("*.py")):
+            digest.update(path.name.encode())
+            digest.update(path.read_bytes())
+    except OSError:
+        return ""
+    return digest.hexdigest()
+
+
+def build_id() -> str:
+    """What this build IS: its version and a hash of its code.
+
+    Stamped by the daemon, compared by a later CLI. The version is kept in
+    front because it is what a person says out loud; the hash is what makes
+    the comparison able to fail.
+    """
+    fp = _client_fingerprint()
+    return f"{_client_version()}+{fp}" if fp else _client_version()
 
 
 def deliver(body: str, timeout: int = 30, agent: str | None = None) -> Delivery:

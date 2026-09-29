@@ -93,30 +93,49 @@ def permitted_to_send(mode: str) -> tuple[bool, str]:
 def transport_for(fqn: str, declared: dict | None = None) -> dict:
     """Where a message to this FQN is posted, and as whom.
 
-    `<estate>.<project>.<agent>` carries the routing rule: **project is the
-    channel, agent is the bot**. A declared `transports.comms` block overrides
-    either or both, and a partial override overrides only what it names —
-    an exception that had to restate the defaults would drift from them.
+    **Declared only, since 2026-09-25.** `transports.comms` from the resolution
+    answer gives the channel and the hub identity. There is no derivation.
 
-    Raises on an FQN we cannot read rather than posting somewhere derived from
-    a guess. A message in the wrong channel is not a failed delivery; it is a
-    successful delivery to the wrong audience, which nobody notices.
+    Two rules meet here and leave nothing to derive from:
+
+    - **§5 (amended)**: the hub identity is the *resolved seat's* bot — the
+      agent segment must never pick a hub identity. That was measured: deriving
+      `bot` from the agent produced accounts the hub does not have, and a send
+      "succeeded" mentioning nobody.
+    - **estate-directory-resolution 0.2**, in its own words: *"There is no
+      `route`, seat, host, `control`, `local_route`, `seat_local_id` or
+      runtime-session field in the 0.2 result."* Deliberate, and pinned by our
+      own privacy test.
+
+    So the seat §5 wants is not in the answer §5 says to take it from. The only
+    honest reading is: **use what is declared, and refuse when nothing is.**
+    Guessing a seat from the FQN's shape — stripping `-new001` to get
+    `test-claude` — is prefix-matching, the trap this client refuses everywhere
+    else, and it would be wrong the first time a seat is named unlike its
+    agents.
+
+    A refusal here costs a message nobody could have routed. A guess costs a
+    message delivered to the wrong audience, which nobody notices.
     """
     override = ((declared or {}).get("comms") or {})
-    parts = fqn.strip().split(".")
-    if len(parts) != 3 or not all(parts):
-        if override.get("channel") and override.get("bot"):
-            return {"channel": override["channel"], "bot": override["bot"]}
-        raise NotDeliverable(
-            f"cannot derive a transport from {fqn!r}: an FQN is "
-            "<estate>.<project>.<agent>, three non-empty dot-separated segments. "
-            "Nothing is guessed — a message posted to a derived-from-nonsense "
-            "channel is not a failed delivery, it is a successful delivery to the "
-            "wrong audience, and nobody notices that."
-        )
-    _estate, project, agent = parts
-    return {"channel": override.get("channel") or project,
-            "bot": override.get("bot") or agent}
+    channel, bot = override.get("channel"), override.get("bot")
+    if channel and bot:
+        return {"channel": channel, "bot": bot}
+
+    raise NotDeliverable(
+        f"no comms transport is declared for {fqn!r}, and none can be derived.\n"
+        "  The hub identity is the resolved SEAT's bot (comms-design §5, amended "
+        "2026-09-25) — the agent segment must never pick one, because that "
+        "produced hub accounts which do not exist.\n"
+        "  But estate-directory-resolution 0.2 carries no seat in its answer, by "
+        "design: 'There is no route, seat, host, control, local_route, "
+        "seat_local_id or runtime-session field in the 0.2 result.'\n"
+        "  So the seat is not available to derive from, and it is not guessed "
+        "from the FQN's shape — that is prefix-matching, and it is wrong the "
+        "first time a seat is named unlike its agents.\n"
+        "  FIX: author `transports.comms` for this agent at the directory "
+        "(channel + bot), which §5 already makes the winning case. Until then "
+        "address the seat by name.")
 
 
 #: **Caller-relative shorthands are never resolvable here** (arch ruling,

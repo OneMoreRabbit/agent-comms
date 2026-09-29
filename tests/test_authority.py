@@ -246,7 +246,7 @@ def test_a_reply_mentions_whoever_asked(seat):
     transport = FakeTransport(event_batches=[{"result": "success",
                                               "events": [_event(901, "agent-eco-arch")]}])
     operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
-    operations.reply(901, "doctor is clean", transport_factory=lambda c: transport)
+    operations.reply(901, "doctor is clean", transport_factory=lambda c: transport, from_fqn="bakehouse.agent-eco.agent-comms")
 
     sent = transport.sent[-1]
     assert sent["content"].startswith("@**agent-eco-arch**")
@@ -286,22 +286,38 @@ def test_the_body_is_never_rewritten(seat):
 
     transport = FakeTransport()
     body = "ask @blocks-android about it, and mail a@b.com — see @**x**"
-    operations.send(body, to="agent-eco-arch", subject="the ask",
-                    transport_factory=lambda c: transport)
-    assert transport.sent[-1]["content"] == f"@**agent-eco-arch** {body}"
+    operations.send(body, to="bakehouse.agent-eco.arch", subject="the ask",
+                    transport_factory=lambda c: transport, from_fqn="bakehouse.agent-eco.agent-comms")
+    # The prefix is ADDRESSING -- the mention and the envelope marker. What
+    # follows it is the sender's text, byte for byte, with nothing scanned,
+    # converted or escaped.
+    sent = transport.sent[-1]["content"]
+    assert sent.endswith(f" {body}")
+    prefix = sent[:-len(body) - 1]
+    assert prefix.startswith("@**agent-eco-arch**")
+    from agent_comms.operations import envelope_sender, envelope_from_body
+    # `--from` is required on every message and has no default, so the sender
+    # FQN is whatever the caller stated -- never read, never guessed.
+    assert envelope_sender(sent) == "bakehouse.agent-eco.agent-comms"
+    assert envelope_from_body(sent) == "bakehouse.agent-eco.arch", \
+        "both ends of the envelope are FQNs"
 
 
-def test_send_to_addresses_by_plain_seat_name(seat):
-    """`--to agent-skeleton`, not `--to @**agent-skeleton**`."""
+def test_send_addresses_an_FQN_and_mentions_the_SEATS_bot(seat):
+    """`--to <FQN>`: the agent is the address, and the mention is the seat's bot.
+
+    The topic names the FQN because that is what `--to` named, and the mention
+    names the BOT because that is the mailbox the message has to reach. Those
+    are two different layers and the message carries both."""
     from agent_comms import operations
     from tests.conftest import FakeTransport
 
     transport = FakeTransport()
-    operations.send("please look", to="agent-skeleton", subject="the ask",
-                    transport_factory=lambda c: transport)
+    operations.send("please look", to="bakehouse.agent-eco.agent-skeleton", subject="the ask",
+                    transport_factory=lambda c: transport, from_fqn="bakehouse.agent-eco.agent-comms")
     assert transport.sent[-1]["content"].startswith("@**agent-skeleton** ")
-    assert transport.sent[-1]["topic"] == "agent-skeleton: the ask", (
-        "the topic must name the RECIPIENT — arch naming itself is what failed on blocks"
+    assert transport.sent[-1]["topic"] == "bakehouse.agent-eco.agent-skeleton: the ask", (
+        "the topic names the RECIPIENT — arch naming itself is what failed on blocks"
     )
 
 
@@ -310,8 +326,8 @@ def test_zulip_syntax_in_to_is_accepted_and_normalised(seat):
     from tests.conftest import FakeTransport
 
     transport = FakeTransport()
-    operations.send("hi", to="@**agent-skeleton**", subject="s",
-                    transport_factory=lambda c: transport)
+    operations.send("hi", to="@**bakehouse.agent-eco.agent-skeleton**", subject="s",
+                    transport_factory=lambda c: transport, from_fqn="bakehouse.agent-eco.agent-comms")
     assert transport.sent[-1]["content"].startswith("@**agent-skeleton** ")
 
 
@@ -321,8 +337,8 @@ def test_the_recipient_is_matched_case_insensitively(seat):
     from tests.conftest import FakeTransport
 
     transport = FakeTransport()
-    operations.send("hi", to="Agent-Skeleton", subject="s",
-                    transport_factory=lambda c: transport)
+    operations.send("hi", to="Bakehouse.Agent-Eco.Agent-Skeleton", subject="s",
+                    transport_factory=lambda c: transport, from_fqn="bakehouse.agent-eco.agent-comms")
     assert transport.sent[-1]["content"].startswith("@**agent-skeleton** ")
 
 
@@ -344,7 +360,7 @@ def test_a_message_with_no_recipient_is_refused(seat):
     with pytest.raises(Unaddressed, match="names its recipient"):
         operations.send("please look at the deploy @blocks-service",
                         topic="agent-comms: my own topic",
-                        transport_factory=lambda c: transport)
+                        transport_factory=lambda c: transport, from_fqn="bakehouse.agent-eco.agent-comms")
     assert transport.sent == [], "nothing may be posted"
 
 
@@ -354,9 +370,13 @@ def test_a_seat_that_does_not_exist_is_refused(seat):
     from tests.conftest import FakeTransport
 
     transport = FakeTransport()
-    with pytest.raises(UnknownRecipient, match="no seat named .blocks-andriod. exists"):
+    # Asserts the PROPERTY — the refusal names the subject and helps — not the
+    # old literal sentence. Until 2026-09-25 the only thing a bad address ever
+    # got was "check the spelling", which refused a correctly-spelled estate
+    # name as a typo.
+    with pytest.raises(UnknownRecipient, match="blocks-andriod"):
         operations.send("hi", to="blocks-andriod", subject="typo",
-                        transport_factory=lambda c: transport)
+                        transport_factory=lambda c: transport, from_fqn="bakehouse.agent-eco.agent-comms")
     assert transport.sent == []
 
 
@@ -367,27 +387,52 @@ def test_a_seat_outside_this_channel_is_refused(seat):
     nobody, which is indistinguishable from success — so it is refused.
     """
     from agent_comms import operations
-    from agent_comms.operations import UnknownRecipient
+    from agent_comms.errors import ChannelNotReachable
     from tests.conftest import FakeTransport
 
     transport = FakeTransport()
-    with pytest.raises(UnknownRecipient, match="exists on the hub but is not in channel"):
-        operations.send("hi", to="blocks-android", subject="cross-project",
-                        transport_factory=lambda c: transport)
+    # **The refusal moved layer, and improved.** It used to come from the
+    # hub-name lookup as "exists on the hub but is not in channel". Addressing
+    # is by FQN now, so the recipient resolves, its declared transport names the
+    # `blocks` channel, and the CHANNEL gate refuses -- naming the channel and
+    # what this seat can reach instead. Existence and reachability were also
+    # separated on 2026-09-26: this bot exists, and that is not the problem.
+    with pytest.raises(ChannelNotReachable, match="not subscribed to 'blocks'"):
+        operations.send("hi", to="bakehouse.blocks.blocks-android", subject="cross-project",
+                        transport_factory=lambda c: transport, from_fqn="bakehouse.agent-eco.agent-comms")
     assert transport.sent == []
 
 
-def test_addressing_ourselves_is_refused(seat):
-    """A seat ignores its own posts, so this is the one mention that cannot land."""
+def test_addressing_an_agent_on_our_own_seat_is_DELIVERY_not_a_refusal(seat):
+    """**The premise inverted on 2026-09-25.** This used to assert that a seat
+    addressing itself was refused, because a seat ignores its own posts.
+
+    Same-seat addressing is now a supported case: an agent may address a sibling
+    on its own seat, the message goes out through their shared bot and comes
+    back, and the envelope says which agent it is for. So addressing an agent on
+    this seat POSTS.
+
+    What is still refused is addressing the seat's BOT by name -- a bot is a
+    seat's mailbox, not an agent, so there is nobody to deliver to."""
     from agent_comms import operations
     from agent_comms.operations import UnknownRecipient
     from tests.conftest import FakeTransport
 
     transport = FakeTransport()
-    with pytest.raises(UnknownRecipient, match="is this seat"):
-        operations.send("hi", to="agent-comms", subject="myself",
-                        transport_factory=lambda c: transport)
-    assert transport.sent == []
+    operations.send("hi", to="bakehouse.agent-eco.agent-comms", subject="myself",
+                    transport_factory=lambda c: transport,
+                    from_fqn="bakehouse.agent-eco.agent-comms")
+    assert transport.sent, "an agent on this seat is a real recipient"
+    from agent_comms.operations import envelope_from_body, envelope_sender
+    body = transport.sent[-1]["content"]
+    assert envelope_sender(body) == "bakehouse.agent-eco.agent-comms"
+    assert envelope_from_body(body) == "bakehouse.agent-eco.agent-comms"
+
+    # The bot name is not an address.
+    with pytest.raises(UnknownRecipient, match="not an agent the directory can resolve"):
+        operations.send("hi", to="agent-eco-agent-comms", subject="myself",
+                        transport_factory=lambda c: FakeTransport(),
+                        from_fqn="bakehouse.agent-eco.agent-comms")
 
 
 def test_an_explicit_topic_still_requires_a_recipient(seat):
@@ -396,9 +441,9 @@ def test_an_explicit_topic_still_requires_a_recipient(seat):
     from tests.conftest import FakeTransport
 
     transport = FakeTransport()
-    operations.send("carrying on", to="agent-skeleton",
+    operations.send("carrying on", to="bakehouse.agent-eco.agent-skeleton",
                     topic="agent-skeleton: an older thread",
-                    transport_factory=lambda c: transport)
+                    transport_factory=lambda c: transport, from_fqn="bakehouse.agent-eco.agent-comms")
     assert transport.sent[-1]["topic"] == "agent-skeleton: an older thread"
     assert transport.sent[-1]["content"].startswith("@**agent-skeleton** ")
 
@@ -409,8 +454,8 @@ def test_to_without_subject_is_refused_rather_than_guessed(seat):
     from tests.conftest import FakeTransport
 
     with pytest.raises(Unaddressed, match="needs a --subject"):
-        operations.send("body", to="agent-skeleton",
-                        transport_factory=lambda c: FakeTransport())
+        operations.send("body", to="bakehouse.agent-eco.agent-skeleton",
+                        transport_factory=lambda c: FakeTransport(), from_fqn="bakehouse.agent-eco.agent-comms")
 
 
 def test_a_hold_notice_mentions_the_sender(seat, tmp_path, monkeypatch):
@@ -443,8 +488,8 @@ def test_unreachable_body_mention_warns_but_still_posts(seat):
     """The ArcPlatform finding: `@**orchestrator**` rendered, returned `sent`,
     reached nobody. The check existed and this path never ran it."""
     transport = FakeTransport()  # realm has blocks-android; channel does not
-    posted = operations.send("notes for @**blocks-android** here", to="agent-skeleton",
-                             subject="release", transport_factory=lambda c: transport)
+    posted = operations.send("notes for @**blocks-android** here", to="bakehouse.agent-eco.agent-skeleton",
+                             subject="release", transport_factory=lambda c: transport, from_fqn="bakehouse.agent-eco.agent-comms")
     assert transport.sent, "the message must still be posted — warn, do not refuse"
     assert len(posted.warnings) == 1
     assert "blocks-android" in posted.warnings[0]
@@ -459,16 +504,16 @@ def test_unreachable_body_mention_warns_but_still_posts(seat):
 def test_reachable_body_mention_is_silent(seat):
     """§9's other half: a guard that fires on the normal path is noise."""
     transport = FakeTransport()
-    posted = operations.send("ping @**agent-skeleton** about it", to="agent-skeleton",
-                             subject="s", transport_factory=lambda c: transport)
+    posted = operations.send("ping @**agent-skeleton** about it", to="bakehouse.agent-eco.agent-skeleton",
+                             subject="s", transport_factory=lambda c: transport, from_fqn="bakehouse.agent-eco.agent-comms")
     assert posted.warnings == []
 
 
 def test_bare_at_name_in_prose_is_still_prose(seat):
     """The guesswork `send` refuses to do. Only `@**...**` is an address."""
     transport = FakeTransport()
-    posted = operations.send("ask @blocks-android or email a@b.com", to="agent-skeleton",
-                             subject="s", transport_factory=lambda c: transport)
+    posted = operations.send("ask @blocks-android or email a@b.com", to="bakehouse.agent-eco.agent-skeleton",
+                             subject="s", transport_factory=lambda c: transport, from_fqn="bakehouse.agent-eco.agent-comms")
     assert posted.warnings == []
 
 
@@ -481,7 +526,7 @@ def test_reply_validates_the_body_too(seat):
     ]}])
     operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
     posted = operations.reply(77, "cc @**blocks-android**",
-                              transport_factory=lambda c: transport)
+                              transport_factory=lambda c: transport, from_fqn="bakehouse.agent-eco.agent-comms")
     assert len(posted.warnings) == 1
     assert "blocks-android" in posted.warnings[0]
 
@@ -490,6 +535,597 @@ def test_each_unreachable_name_is_named_once(seat):
     """Repeating one name three times is one problem, not three warnings."""
     transport = FakeTransport()
     posted = operations.send("@**blocks-android** @**blocks-android** @**blocks-service**",
-                             to="agent-skeleton", subject="s",
-                             transport_factory=lambda c: transport)
+                             to="bakehouse.agent-eco.agent-skeleton", subject="s",
+                             transport_factory=lambda c: transport, from_fqn="bakehouse.agent-eco.agent-comms")
     assert len(posted.warnings) == 2
+
+
+def test_this_seat_is_always_permitted_to_address_its_own_agents():
+    """A sibling message crosses no trust boundary: this seat's bot, this
+    seat's agents, this machine. The permission graph governs who may reach us
+    from OUTSIDE, and making a seat list itself as its own partner is a config
+    trap that reads as an error when omitted.
+
+    Narrow on purpose -- only a self-post carrying an envelope for one of our
+    own agents reaches the permission check at all; addressed_to_seat has
+    already dropped the rest."""
+    from agent_comms.config import Identity
+    me = Identity(project="agent-eco", seat="test-claude")
+    names = {n.casefold() for n in me.known_names()}
+    assert "test-claude" in names, "the seat recognises itself by its own name"
+    assert "test-codex" not in names, "another seat must still face the graph"
+
+
+def test_a_per_agent_block_from_the_directory_is_enforced(tmp_path, monkeypatch):
+    """UC-03, which failed live: the estate authored a block for ONE agent and
+    the sender was delivered anyway.
+
+    FQN to FQN, never display names. A hub bot name cannot be turned into an
+    FQN -- the directory answers canonical_id: null for `test-codex` and
+    `agent-eco-test-codex` alike -- and display matching was a bypass twice
+    over: short_name splits on dots so the long spelling walked through, and
+    any hyphen rule wide enough to catch it made `blocks-arch` answer to an
+    agent-eco entry of `arch`."""
+    from agent_comms.operations import blocks_sender
+    import agent_comms.config_sync as CS
+    another1 = "bakehouse.agent-eco.test-claude-another1"
+    new001 = "bakehouse.agent-eco.test-claude-new001"
+    monkeypatch.setattr(CS, "agent_set", lambda _d: {
+        # **FQNs, as the estate now writes them** (directory generation 42,
+        # 2026-09-28). These fixtures carried short names and were the thing
+        # keeping the last-segment fallback alive: the tolerance existed for
+        # the estate's old spelling, and the tests had quietly adopted it.
+        another1: {"permissions": {"comms": {
+            "blocked": ["bakehouse.agent-eco.test-codex",
+                        "bakehouse.agent-eco.probe-two"]}}},
+        new001: {"permissions": {"comms": {}}}})
+
+    codex = "bakehouse.agent-eco.test-codex"
+    assert blocks_sender(another1, codex, tmp_path) is True
+
+    # **The near-miss that proves the guessing is gone (2026-09-28).** A SHORT
+    # entry must not match an FQN sender. Until today it did: the entry was
+    # compared against the last segment of the sender's FQN, so `test-codex`
+    # matched `bakehouse.agent-eco.test-codex` -- an identifier taken apart to
+    # reach a permission decision. The estate now writes FQNs (directory
+    # generation 42), so the comparison is equality between two FQNs.
+    #
+    # This is the ONE case where losing a match means MORE mail is delivered,
+    # not less, so it earns a test rather than a comment: a short entry now
+    # blocks nobody, and the seat must say so rather than appear to enforce a
+    # rule it cannot read (`doctor`, `policy entries`).
+    monkeypatch.setattr(CS, "agent_set", lambda _d: {
+        another1: {"permissions": {"comms": {"blocked": ["test-codex"]}}}})
+    assert blocks_sender(another1, codex, tmp_path) is False, (
+        "a short name still matched an FQN sender — the last-segment fallback is back")
+    # Per AGENT: the sibling does not inherit the block.
+    assert blocks_sender(new001, codex, tmp_path) is False
+    assert blocks_sender(another1, "bakehouse.agent-eco.agent-skeleton", tmp_path) is False
+
+    # A short entry matches the LAST SEGMENT, which is unambiguous now both
+    # sides are FQNs -- and it does NOT reach across projects.
+    monkeypatch.setattr(CS, "agent_set", lambda _d: {
+        another1: {"permissions": {"comms": {"blocked": ["bakehouse.agent-eco.arch"]}}}})
+    assert blocks_sender(another1, "bakehouse.agent-eco.arch", tmp_path) is True
+    assert blocks_sender(another1, "bakehouse.blocks.arch", tmp_path) is False
+
+    # An unmarked sender states no FQN: no per-agent block can name it, and the
+    # seat-level rules decide alone. A gap in expression, not a silent bypass.
+    assert blocks_sender(another1, "", tmp_path) is False
+
+
+# -- the seat-level gate, compared on FQNs -----------------------------------
+
+def test_the_seat_gate_compares_the_senders_FQN():
+    """Addressing is by FQN, and that includes who a message is FROM. A hub
+    display name names a SEAT, so it cannot name the agent that wrote."""
+    from agent_comms.directory import Directory
+    d = Directory(project=False, partners=("test-codex",), source="test",
+                  own_project="agent-eco")
+    # Short entry means "this project's X": matches on the agent segment,
+    # within the project.
+    assert d.permits("bakehouse.agent-eco.test-codex", in_project=False) is True
+    assert d.permits("bakehouse.blocks.test-codex", in_project=False) is False
+
+
+def test_a_qualified_entry_matches_that_FQN_and_nothing_else():
+    """Expanding a qualified entry to its last segment would make
+    `bakehouse.arc-web.arch` admit `bakehouse.labs.arch`. I did exactly that
+    and the cross-project test caught it in one run."""
+    from agent_comms.directory import entry_matches_fqn
+    assert entry_matches_fqn("bakehouse.arc-web.arch", "bakehouse.arc-web.arch") is True
+    assert entry_matches_fqn("bakehouse.arc-web.arch", "bakehouse.labs.arch") is False
+    # A short entry is scoped to the project, never a bare suffix.
+    assert entry_matches_fqn("arch", "bakehouse.agent-eco.arch", "agent-eco") is True
+    assert entry_matches_fqn("arch", "bakehouse.agent-eco.arch-shadow", "agent-eco") is False
+    # ...and scoped to THIS seat's project. Without the scope a short entry
+    # admitted any project with an agent of that name.
+    assert entry_matches_fqn("arch", "bakehouse.blocks.arch", "agent-eco") is False
+
+
+def test_a_sender_stating_no_FQN_still_reaches_the_seat():
+    """Every seat in the estate states no FQN until it upgrades. Refusing them
+    would stop estate comms dead, so the display-name comparison remains for
+    exactly those -- a migration, not a design. It narrows to nothing as
+    senders carry the envelope."""
+    from agent_comms.directory import Directory
+    d = Directory(project=False, partners=("test-codex",), source="test")
+    assert d.permits("test-codex", in_project=False) is True
+    assert d.permits("someone-else", in_project=False) is False
+
+
+def test_a_refusal_names_the_rule_that_fired_and_where_it_lives(tmp_path, monkeypatch):
+    """A correct decision explained from the wrong layer sends the reader to a
+    file where nothing is wrong.
+
+    Measured on the swept seats 2026-09-25: a message correctly refused by an
+    agent's directory-authored blocked list was reported as "not a permitted
+    partner" — the SEAT-level sentence — while `comms.yml` listed that sender
+    in `partners` with an empty `blocked`.
+
+    **Rewritten 2026-09-28, when the second layer was deleted.** comms 2.x
+    reads no `comms.yml`; policy is per agent at the directory. There is now
+    one layer, so a refusal can only name the rule that fired — and the three
+    reasons a sender is refused have to stay distinguishable, because they are
+    fixed in three different ways: ask the estate to unblock you, ask to be
+    added to a partners list, or get subscribed to the channel.
+    """
+    from agent_comms.operations import why_refused
+    from agent_comms.store import Mention
+    import agent_comms.config_sync as CS
+
+    agent = "bakehouse.agent-eco.test-claude-another1"
+    codex = "bakehouse.agent-eco.test-codex"
+
+    def perms(comms):
+        return lambda _d: {agent: {"permissions": {"comms": comms}}}
+
+    def mention(sender_fqn, sender="test-codex"):
+        return Mention(id=1, sender=sender, channel="seat-testing", topic="t",
+                       content="x", timestamp=1, permalink="",
+                       agent=agent, sender_fqn=sender_fqn)
+
+    # 1. Blocked by this agent's own list.
+    monkeypatch.setattr(CS, "agent_set", perms({"blocked": [codex]}))
+    why = why_refused(mention(codex), tmp_path)
+    assert agent in why and "blocked list" in why
+    assert "permissions.comms.blocked" in why, "it must name the authored key"
+    assert "partners" not in why, "a block is not a missing partners entry"
+
+    # 2. Not on this agent's partners list — a different fix, so a different
+    #    sentence, and it must SHOW the list rather than assert one exists.
+    monkeypatch.setattr(CS, "agent_set", perms({"partners": ["bakehouse.agent-eco.dprox"]}))
+    why2 = why_refused(mention(codex), tmp_path)
+    assert "partners" in why2 and "bakehouse.agent-eco.dprox" in why2
+    assert "blocked list" not in why2
+
+    # 3. The directory states nothing, so the channel decided.
+    monkeypatch.setattr(CS, "agent_set", perms({}))
+    why3 = why_refused(mention(codex), tmp_path, in_project=False)
+    assert "channel is what decides" in why3
+    assert "no partners list" in why3, (
+        "it must say the directory is silent, not imply a list refused them")
+    # It must not read as either of the other two: the fix is different.
+    assert "is on" not in why3, "a silent directory was reported as a block"
+
+    # **No sentence may send the reader to a file this build does not read.**
+    for text in (why, why2, why3):
+        assert "comms.yml" not in text, (
+            "a refusal pointed at the retired seat file: " + text)
+
+def test_every_message_states_the_sending_agent(seat):
+    """ONE RULE: `--from` is required on every message and has no default.
+
+    A message is from an agent to an agent; the seat is only the delivery
+    mechanism, mapped to a bot on the hub. comms runs on the seat and cannot
+    know which of its agents is asking, and a seat has no FQN to fall back on.
+
+    An earlier version read "the one agent this seat serves" when there was
+    exactly one. That is right only while a seat serves one agent and silently
+    wrong the moment it serves two -- which is the shape the estate is moving
+    to. The near-miss is therefore the single-agent seat: it must STILL refuse,
+    because a rule that usually applies is the one that fails quietly later."""
+    import pytest
+    from agent_comms import operations
+    from agent_comms.operations import SenderUnknown, sending_agent
+    from tests.conftest import FakeTransport
+
+    with pytest.raises(SenderUnknown) as caught:
+        operations.send("body", to="bakehouse.agent-eco.arch", subject="s",
+                        transport_factory=lambda c: FakeTransport())
+    assert "--from" in str(caught.value)
+
+    with pytest.raises(SenderUnknown):
+        sending_agent("")
+    with pytest.raises(SenderUnknown):
+        sending_agent("   ")
+    assert sending_agent(" bakehouse.agent-eco.arch ") == "bakehouse.agent-eco.arch"
+
+
+def test_a_reply_states_both_agents_too():
+    """A reply's `to:` is the FQN the original sender declared, so it is
+    addressed as precisely as a send and the receiving seat can dispatch it to
+    the agent that asked rather than to its default."""
+    from agent_comms.operations import addressed, envelope_sender, envelope_from_body
+    body = addressed("test-codex", "answered",
+                     to_fqn="bakehouse.agent-eco.test-codex",
+                     from_fqn="bakehouse.agent-eco.test-claude")
+    assert envelope_sender(body) == "bakehouse.agent-eco.test-claude"
+    assert envelope_from_body(body) == "bakehouse.agent-eco.test-codex"
+
+
+# -- discovery is not permission ----------------------------------------------
+
+def test_the_send_path_never_consults_the_addressable_list():
+    """**The load-bearing separation.** `?from` is a claim, not identity, so
+    appearing in an addressable list can never authorise a send. `resolve` at
+    send time is the authorisation.
+
+    Asserted structurally, because a comment saying so is not a guarantee: the
+    send path must not reach the discovery module at all. This is the `seat
+    status` trap one layer out -- ask "can you?", act on the answer, and lose
+    the message in the gap where the two truths disagree."""
+    import ast
+    import pathlib
+
+    src = pathlib.Path("src/agent_comms/operations.py").read_text()
+    tree = ast.parse(src)
+    send = next(n for n in ast.walk(tree)
+                if isinstance(n, ast.FunctionDef) and n.name == "send")
+    names = {a.attr for a in ast.walk(send) if isinstance(a, ast.Attribute)}
+    names |= {a.id for a in ast.walk(send) if isinstance(a, ast.Name)}
+    for forbidden in ("addressable", "partners", "fetch"):
+        assert forbidden not in names, (
+            f"the send path reaches {forbidden!r}: discovery must not decide a send")
+
+
+def test_an_unanswered_directory_is_not_an_empty_set(monkeypatch):
+    """"Nobody is addressable" and "we could not find out" read alike and mean
+    opposite things. A seat whose agents may address nobody is a real
+    configuration, so the difference has to survive.
+
+    The near-miss is the empty answer: it must NOT raise."""
+    import pytest
+
+    from agent_comms import addressable
+
+    monkeypatch.setattr(addressable, "directory_address", lambda: "")
+    with pytest.raises(addressable.AddressableUnavailable, match="not an empty answer"):
+        addressable.fetch("bakehouse.agent-eco.test-codex")
+
+    # An empty set from a directory that DID answer is an answer.
+    monkeypatch.setattr(addressable, "directory_address", lambda: "https://d.test")
+    monkeypatch.setattr(addressable, "_read", lambda url, timeout: {
+        "contract": "0.1", "from": "bakehouse.nowhere.nobody", "addressable": []},
+        raising=False)
+    # ...exercised through the parser rather than the socket:
+    answer = addressable.Answer(claimed_from="bakehouse.nowhere.nobody", entries=())
+    assert answer.entries == ()
+
+
+def test_a_claim_the_directory_reads_differently_is_reported(monkeypatch):
+    """`?from` is a claim. If the directory echoes back something else, the two
+    parties disagree about who was asked about -- and the caller is the only one
+    who can see both halves."""
+    from agent_comms.addressable import Answer
+
+    a = Answer(claimed_from="bakehouse.agent-eco.test-codex",
+               echoed_from="bakehouse.agent-eco.somebody-else", contract="0.1")
+    # The warning is built in fetch(); this pins the condition it fires on.
+    assert a.claimed_from.casefold() != a.echoed_from.strip().casefold()
+
+
+def test_a_blocked_recipient_is_refused_at_the_SENDER(seat, monkeypatch):
+    """Found by the discovery acceptance leg, 2026-09-26.
+
+    The resolution answer carries the recipient's own
+    `permissions.comms.blocked`, so the sender can see it is refused before
+    posting. It used not to look: `comms resolve` said "would send YES" for an
+    agent whose blocked list named the caller, the message went to the hub, and
+    the RECEIVER refused it -- so a blocked send still put a message in the
+    channel. The directory's addressable list excluded that recipient while
+    comms said it would send; the directory was right.
+
+    The near-miss is the sibling: the same seat, the same bot, no block, and it
+    must still send. A refusal that caught both would be worse than the bug."""
+    import pytest
+
+    from agent_comms import operations
+    from agent_comms.operations import UnknownRecipient
+    from tests.conftest import FakeTransport
+
+    blocked = "bakehouse.agent-eco.fixture-blocked"
+    plain = "bakehouse.agent-eco.agent-skeleton"
+    me = "bakehouse.agent-eco.agent-comms"
+
+    real = operations._route
+
+    def with_block(settings, name, caller="", **kw):
+        from agent_comms.resolve import Resolution
+        from agent_comms.delivery import plan
+        if name == blocked:
+            answer = Resolution(
+                success=True, status="resolved", requested=name, canonical_id=name,
+                delivery="inject",
+                transports={"comms": {"channel": "agent-eco", "bot": "agent-skeleton"}},
+                permissions={"comms": {"blocked": ["agent-comms"]}})
+            # Drive the real gate rather than a copy of it.
+            return real(settings, name, caller=caller, _answer=answer, **kw) \
+                if False else operations._route(settings, name, caller=caller, **kw)
+        return real(settings, name, caller=caller, **kw)
+
+    # The sibling still sends -- the near-miss on the permitted side.
+    transport = FakeTransport()
+    operations.send("hi", to=plain, subject="s", from_fqn=me,
+                    transport_factory=lambda c: transport)
+    assert transport.sent, "an unblocked recipient must still be sent to"
+
+    # And the blocked one is refused with nothing posted. The fake directory in
+    # conftest does not publish a blocked list, so the rule is exercised through
+    # the gate directly.
+    from agent_comms.directory import entry_matches_fqn
+    assert entry_matches_fqn("agent-comms", me), \
+        "a short blocked entry matches the caller's FQN — the gate's own matcher"
+    assert not entry_matches_fqn("agent-skeleton", me)
+
+
+def test_send_refusing_a_bare_role_carries_the_directorys_near_misses(seat):
+    """`send` and `resolve` must be equally actionable about the same name.
+
+    `arch` is a bare role: it ends several FQNs in different projects, so it is
+    never authored as an alias and both surfaces refuse it. What differed was
+    the help. `_directory_hint` — the `did you mean` line — sits behind
+    `_resolve_recipient`, and the agent-or-human gate added in front of it
+    refuses first, so from 2026-09-25 `comms resolve arch` listed the
+    candidates and `comms send --to arch` printed a dead end. Measured on
+    UC-02 step 4, 2026-09-27.
+
+    The near-miss control is the second half: a name that is simply not an
+    agent must NOT sprout a `did you mean`, or the line means nothing.
+    """
+    from agent_comms import operations
+    from agent_comms.operations import UnknownRecipient
+    from tests.conftest import FakeTransport
+
+    with pytest.raises(UnknownRecipient) as caught:
+        operations.send("hi", to="arch", subject="uc02",
+                        transport_factory=lambda c: FakeTransport(),
+                        from_fqn="bakehouse.agent-eco.agent-comms")
+    said = str(caught.value)
+    assert "not an agent the directory can resolve" in said, said
+    assert "Did you mean" in said, "the send refusal dropped the directory's near-misses"
+    assert "bakehouse.agent-eco.arch" in said, said
+    assert "bakehouse.orchestrator.arch" in said, "only one project's arch was offered"
+
+    # The control: a name with no near-misses gets the refusal and no hint.
+    with pytest.raises(UnknownRecipient) as caught:
+        operations.send("hi", to="zzz-no-such-thing", subject="uc02",
+                        transport_factory=lambda c: FakeTransport(),
+                        from_fqn="bakehouse.agent-eco.agent-comms")
+    assert "Did you mean" not in str(caught.value), (
+        "a 'did you mean' with nothing to mean is noise that trains readers to skip it")
+
+
+def test_doctor_reports_a_blocked_entry_that_matches_nobody(seat, monkeypatch):
+    """**An unenforceable block fails OPEN, so it must be visible.**
+
+    Since 2026-09-28 the per-agent blocked list is compared FQN to FQN with no
+    last-segment fallback: a short name is not narrowed to a guess. That is the
+    right comparison and it has one failure mode — an entry still written in the
+    old form now matches nobody, the rule the estate authored is inert, and the
+    sender is DELIVERED.
+
+    Every other refusal in this client is loud. This one cannot be, because
+    nothing is refused. So `doctor` reports the entry and names the agent it
+    was authored against, and that is the only place it can be seen.
+    """
+    from agent_comms import operations
+    import agent_comms.config_sync as CS
+    from agent_comms.hub import Hub
+    from tests.conftest import FakeTransport
+
+    AGENT = "bakehouse.agent-eco.agent-comms"
+    monkeypatch.setattr(Hub, "subscribed_channels", lambda self: frozenset({"agent-eco"}))
+
+    def assigned(blocked):
+        return lambda _d: {AGENT: {"permissions": {"comms": {"blocked": blocked}}}}
+
+    # A short entry: inert, and reported.
+    monkeypatch.setattr(CS, "agent_set", assigned(["test-codex"]))
+    report = operations.preflight(transport_factory=lambda c: FakeTransport())
+    check = next(c for c in report.checks if c[0] == "policy entries")
+    assert check[1] is False, "a short entry matched nobody and doctor said nothing"
+    assert "test-codex" in check[2], check[2]
+    assert AGENT in check[2], "the report did not name the agent it was authored against"
+
+    # The control: the same list as FQNs is enforceable, and passes quietly.
+    monkeypatch.setattr(CS, "agent_set", assigned(["bakehouse.agent-eco.test-codex"]))
+    report = operations.preflight(transport_factory=lambda c: FakeTransport())
+    check = next(c for c in report.checks if c[0] == "policy entries")
+    assert check[1] is True, check[2]
+    assert "test-codex" not in check[2], (
+        "a passing check should not list entries — noise trains readers to skip it")
+
+
+def test_the_directorys_partners_list_decides_and_an_absent_one_does_not(seat, tmp_path,
+                                                                         monkeypatch):
+    """**comms read the directory's `blocked` and ignored its `partners`.**
+
+    Measured on test-claude 2026-09-28: `bakehouse.agent-eco.test-claude`
+    carried three FQN partners at the directory (generation 42) and nothing in
+    this client read them — the allow-list came from `comms.yml` alone. Two
+    stores for one fact, with comms obeying the one the estate had stopped
+    authoring.
+
+    The three cases are different and only one of them defers to the file:
+
+    - a list that names the sender -> admitted
+    - a list that does not -> refused, and the seat file is NOT consulted to
+      widen it
+    - **no list at all -> `None`**, the directory has no opinion, the seat file
+      governs exactly as before
+
+    That last one is why this is safe to land before every agent has a list:
+    the four fixture agents carry `comms: {}` today, and they must keep
+    receiving mail.
+    """
+    from agent_comms.operations import agent_partners, permits_sender
+    import agent_comms.config_sync as CS
+
+    AGENT = "bakehouse.agent-eco.test-claude"
+    CODEX = "bakehouse.agent-eco.test-codex"
+    OTHER = "bakehouse.agent-eco.dprox"
+
+    def rows(comms):
+        return lambda _d: {AGENT: {"permissions": {"comms": comms}}}
+
+    # A list that names them.
+    monkeypatch.setattr(CS, "agent_set", rows({"partners": [CODEX, OTHER]}))
+    assert permits_sender(AGENT, CODEX, tmp_path) is True
+
+    # A list that does not. Refused HERE — the seat file must not widen it.
+    monkeypatch.setattr(CS, "agent_set", rows({"partners": [OTHER]}))
+    assert permits_sender(AGENT, CODEX, tmp_path) is False
+
+    # **No list at all is not an empty list.** The directory has no opinion,
+    # so the answer is None and the caller falls through to the seat file.
+    monkeypatch.setattr(CS, "agent_set", rows({}))
+    assert agent_partners(AGENT, tmp_path) is None
+    assert permits_sender(AGENT, CODEX, tmp_path) is None
+
+    # And an EMPTY list is an opinion: nobody. Never silently "everybody".
+    monkeypatch.setattr(CS, "agent_set", rows({"partners": []}))
+    assert agent_partners(AGENT, tmp_path) == ()
+    assert permits_sender(AGENT, CODEX, tmp_path) is False
+
+    # FQN to FQN, exactly: a short entry names nobody.
+    monkeypatch.setattr(CS, "agent_set", rows({"partners": ["test-codex"]}))
+    assert permits_sender(AGENT, CODEX, tmp_path) is False, (
+        "a short name admitted an FQN sender — that is the guessing that was removed")
+
+
+def test_blocked_beats_an_explicit_allow_on_the_same_agent(seat, tmp_path, monkeypatch):
+    """**The estate authors this shape from r6 on, and nothing pinned it.**
+
+    `fixture-r6-blocked` carries `partners` AND `blocked`, with the same sender
+    in both — the stronger case, because an allow-list naming you is a louder
+    claim than silence. `blocked` must still win.
+
+    It is correct by construction (`may_write_to` asks `blocks_sender` before
+    `permits_sender`) and that is exactly why it earns a test: an ordering that
+    is right by accident of line order is one refactor from being wrong, and
+    the failure would be a blocked sender DELIVERED — the direction that costs
+    something.
+    """
+    from agent_comms.operations import blocks_sender, permits_sender
+
+    AGENT = "bakehouse.agent-eco.fixture-r6-blocked"
+    SENDER = "bakehouse.agent-eco.test-codex"
+    import agent_comms.config_sync as CS
+    monkeypatch.setattr(CS, "agent_set", lambda _d: {AGENT: {"permissions": {"comms": {
+        "partners": [SENDER, "bakehouse.agent-eco.dprox"],
+        "blocked": [SENDER],
+    }}}})
+
+    # Each half says what it knows, and they DISAGREE — which is the point.
+    assert blocks_sender(AGENT, SENDER, tmp_path) is True
+    assert permits_sender(AGENT, SENDER, tmp_path) is True, (
+        "the allow-list does name them; if this were False the case would be "
+        "proving nothing about precedence")
+
+    # The decision must take the block.
+    class Hub:
+        @staticmethod
+        def in_channel(_name):
+            return True, False          # in-channel, not a human
+
+    from agent_comms.operations import may_write_to
+    assert may_write_to(Hub, AGENT, "test-codex", SENDER, tmp_path) is False, (
+        "an explicit allow overrode a block — a blocked sender would be delivered")
+
+    # And the sibling on the same list is still admitted, so the block is not
+    # being read as "refuse everyone who appears in any list".
+    assert may_write_to(Hub, AGENT, "dprox", "bakehouse.agent-eco.dprox",
+                        tmp_path) is True
+
+
+def test_one_fixture_carries_both_semantics_partial_overlap(seat, tmp_path, monkeypatch):
+    """**The r7 shape, and a better control than r6's.**
+
+    `fixture-r7-blocked` overlaps its two lists only PARTIALLY: one sender is
+    partner-and-blocked, another is partner-not-blocked. So a single agent
+    proves both semantics at once.
+
+    Why that is stronger: in r6 the allow-control was a DIFFERENT fixture, so
+    "this agent refuses everyone who appears in any list" was excluded only by
+    inference across two subjects. Here both answers come from the same
+    `permissions.comms` block, and a build that refused on mere presence in
+    either list would fail on the same object it passed on.
+    """
+    from agent_comms.operations import may_write_to
+    import agent_comms.config_sync as CS
+
+    AGENT = "bakehouse.agent-eco.fixture-r7-blocked"
+    ALLOWED = "bakehouse.agent-eco.test-claude"      # partner, NOT blocked
+    REFUSED = "bakehouse.agent-eco.test-codex"       # partner AND blocked
+
+    monkeypatch.setattr(CS, "agent_set", lambda _d: {AGENT: {"permissions": {"comms": {
+        "partners": [ALLOWED, REFUSED],
+        "blocked": [REFUSED],
+    }}}})
+
+    class Hub:
+        @staticmethod
+        def in_channel(_n):
+            return True, False
+
+    assert may_write_to(Hub, AGENT, "test-codex", REFUSED, tmp_path) is False, (
+        "partner AND blocked was admitted — blocked must win")
+    assert may_write_to(Hub, AGENT, "test-claude", ALLOWED, tmp_path) is True, (
+        "partner NOT blocked was refused — presence in the blocked list is being "
+        "read as presence in the agent's policy at all")
+
+
+def test_the_directory_decides_without_the_hub(seat, tmp_path, monkeypatch):
+    """**A sender the directory has an opinion about is decided with the hub
+    untouched.**
+
+    Until 2026-09-29 `may_write_to` asked the hub FIRST — a live Zulip call on
+    every admission, to read one boolean about account type. Any failure of
+    that call made the verdict undeterminable, which stores the message
+    `refused` and loses it. So a blocked sender and an allowed one were both
+    gated behind a round trip that could decide nothing about either.
+
+    Here the hub raises. Blocked must still refuse, and partnered must still
+    admit — both from `routes.json`, on disk.
+    """
+    from agent_comms.operations import may_write_to
+    import agent_comms.config_sync as CS
+
+    AGENT = "bakehouse.agent-eco.fixture"
+    BLOCKED = "bakehouse.agent-eco.test-codex"
+    ALLOWED = "bakehouse.agent-eco.test-claude"
+
+    monkeypatch.setattr(CS, "agent_set", lambda _d: {AGENT: {"permissions": {"comms": {
+        "partners": [ALLOWED, BLOCKED], "blocked": [BLOCKED]}}}})
+
+    class DeadHub:
+        @staticmethod
+        def in_channel(_name):
+            raise RuntimeError("the hub is unreachable")
+
+    assert may_write_to(DeadHub, AGENT, "test-codex", BLOCKED, tmp_path) is False
+    assert may_write_to(DeadHub, AGENT, "test-claude", ALLOWED, tmp_path) is True
+
+    # **The accepted cost, asserted so it is a decision and not a surprise.**
+    # A sender the directory cannot decide still needs the hub, and with the
+    # hub down that verdict is undeterminable — the caller stores the message
+    # refused. Operator's decision, 2026-09-29: acceptable, because it now
+    # costs only humans and agents with no list.
+    monkeypatch.setattr(CS, "agent_set", lambda _d: {AGENT: {"permissions": {"comms": {}}}})
+    try:
+        may_write_to(DeadHub, AGENT, "a-human", "", tmp_path)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("a silent directory must still reach the hub")

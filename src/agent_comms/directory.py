@@ -60,7 +60,46 @@ def short_name(name: str) -> str:
     `arch-shadow`, and `bakehouse.arc-web.arch` must not match
     `bakehouse.labs.arch`.
     """
-    return name.strip().casefold().rsplit(".", 1)[-1]
+    return name.strip().casefold().rsplit(".", 1)[-1]  # gate-exempt: KNOWN DEBT, not accepted. Decomposes an FQN to match the SHORT names the estate writes in comms.yml partners/blocked. It is the seat-level permission matcher, and the answer is that comms should read a VERDICT instead: the directory already evaluates permission per caller (its /v0/addressable?from= excludes a blocked pair). Tracked with the finding that /v0/resolve answers `resolved` for a pair /v0/addressable excludes -- when resolve answers not-permitted, this whole matcher goes
+
+
+def entry_matches_fqn(entry: str, fqn: str, own_project: str = "") -> bool:
+    """Does an authored partner/blocked entry name this FQN?
+
+    The estate writes SHORT names in these lists (`test-codex`) while
+    addressing is by FQN (`bakehouse.agent-eco.test-codex`), so both spellings
+    have to be read -- but they mean different things and must not be conflated:
+
+    - **A qualified entry matches that FQN and nothing else.** Expanding it to
+      its last segment would make `bakehouse.arc-web.arch` admit
+      `bakehouse.labs.arch`, which is the cross-project trap. Caught by
+      `test_a_short_name_never_matches_across_projects` the moment I did it.
+    - **A short entry means "this project's X"**, so it matches on the agent
+      segment and only within THIS SEAT's project. `own_project` is that
+      project. Without it a short entry matched any project with an agent of
+      that name -- `test-codex` admitted `bakehouse.blocks.test-codex` --
+      because `same_project` returns True whenever either side is unqualified
+      and `Directory` never knew which project it was in. Found by this
+      audit's own test, not in the field.
+
+    The sender's FQN is never respelled. Guessing a spelling on that side is
+    what needed a rule both tight enough to keep `blocks-arch` from matching
+    `arch` and wide enough to catch `agent-eco-test-codex` against
+    `test-codex` -- and no such rule exists.
+    """
+    folded = entry.strip().casefold()
+    target = fqn.strip().casefold()
+    if folded.count(".") == 2:
+        return folded == target
+    if folded != short_name(target):
+        return False
+    if not own_project:
+        # We do not know our project, so we cannot scope the entry. Match, as
+        # before, rather than refuse mail over a fact we simply lack -- and the
+        # loader supplies it on every real path.
+        return True
+    parts = target.split(".")  # gate-exempt: KNOWN DEBT, not accepted. Decomposes an FQN to match the SHORT names the estate writes in comms.yml partners/blocked. It is the seat-level permission matcher, and the answer is that comms should read a VERDICT instead: the directory already evaluates permission per caller (its /v0/addressable?from= excludes a blocked pair). Tracked with the finding that /v0/resolve answers `resolved` for a pair /v0/addressable excludes -- when resolve answers not-permitted, this whole matcher goes
+    return len(parts) < 3 or parts[1] == own_project.strip().casefold()
 
 
 def same_project(a: str, b: str) -> bool:
@@ -70,7 +109,7 @@ def same_project(a: str, b: str) -> bool:
     short name in a partner list means. An alias never spans a project
     (estate-addressing-model §7), so neither may a permission.
     """
-    parts_a, parts_b = a.strip().casefold().split("."), b.strip().casefold().split(".")
+    parts_a, parts_b = a.strip().casefold().split("."), b.strip().casefold().split(".")  # gate-exempt: KNOWN DEBT, not accepted. Decomposes an FQN to match the SHORT names the estate writes in comms.yml partners/blocked. It is the seat-level permission matcher, and the answer is that comms should read a VERDICT instead: the directory already evaluates permission per caller (its /v0/addressable?from= excludes a blocked pair). Tracked with the finding that /v0/resolve answers `resolved` for a pair /v0/addressable excludes -- when resolve answers not-permitted, this whole matcher goes
     if len(parts_a) < 3 or len(parts_b) < 3:
         return True
     return parts_a[:2] == parts_b[:2]
@@ -88,6 +127,11 @@ class Directory:
     blocked: tuple[str, ...] = ()
     #: Where it came from, for `comms doctor`. Empty when running on the default.
     source: str = ""
+    #: This seat's own project, which is what a SHORT entry in `partners` or
+    #: `blocked` is scoped to. Empty means unknown, and an unknown scope
+    #: matches rather than refuses -- mail must not be refused over a fact we
+    #: simply lack. Every real path supplies it.
+    own_project: str = ""
     warnings: list[str] = field(default_factory=list)
 
     @property
@@ -103,21 +147,37 @@ class Directory:
         """
         folded = name.strip().casefold()
         short = short_name(name)
+        # **An FQN is `estate.project.agent` -- three segments.** A hub display
+        # name has none, and telling them apart matters: for an FQN the last
+        # segment is the agent and `same_project` means something; for a
+        # display name there is no project to compare and the whole string is
+        # all there is.
+        is_fqn = folded.count(".") == 2 and all(folded.split("."))  # gate-exempt: SHAPE VALIDATION only — asks whether a string is FQN-shaped, and infers no fact from the parts
 
         # `blocked` wins over everything, including an explicit allow. It is the
         # estate's stop button and must not be argued with by ordering rules.
-        # Matched on both spellings for the same reason `partners` is.
-        if short in {short_name(b) for b in self.blocked}:
+        if is_fqn:
+            if any(entry_matches_fqn(b, folded, self.own_project) for b in self.blocked):
+                return False
+        elif short in {short_name(b) for b in self.blocked}:
             return False
         if is_human:
             return True
 
-        # Both spellings, last segment only — never a prefix or substring test.
         for partner in self.partners:
-            if folded == partner.strip().casefold():
-                return True
-            if short == short_name(partner) and same_project(name, partner):
-                return True
+            if is_fqn:
+                if entry_matches_fqn(partner, folded, self.own_project):
+                    return True
+            else:
+                # LEGACY, FOR RETIREMENT (operations.LEGACY_SENDER_MATCHING):
+                # a sender that states no FQN, compared on its hub display
+                # name. Every seat is one of these until it upgrades. Delete
+                # this branch when none is left; an absent FQN becomes a
+                # refusal, not a fallback.
+                if folded == partner.strip().casefold():
+                    return True
+                if short == short_name(partner) and same_project(name, partner):
+                    return True
         return self.project and in_project
 
     def refusal(self, name: str, *, in_project: bool) -> str:
@@ -159,7 +219,7 @@ class Directory:
 _KEY = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*)$")
 
 
-def load(state_dir: Path | None = None) -> Directory:
+def load(state_dir: Path | None = None, own_project: str = "") -> Directory:
     """Read the directory, or return the default if there is none.
 
     Parsed by hand, like the seat's own manifests: three flat keys, a bool and
@@ -170,7 +230,7 @@ def load(state_dir: Path | None = None) -> Directory:
     root = state_dir or Path.home() / ".comms"
     path = Path(root) / "comms.yml"
     if not path.exists():
-        return Directory()
+        return Directory(own_project=own_project, )
 
     try:
         text = path.read_text(encoding="utf-8")
@@ -186,7 +246,7 @@ def load(state_dir: Path | None = None) -> Directory:
         line = raw.split("#", 1)[0].rstrip()
         if not line.strip():
             continue
-        if pending and line.lstrip().startswith("-"):
+        if pending and line.lstrip().startswith("-"):  # gate-exempt: YAML list syntax, not an identifier
             found.setdefault(pending, [])
             value = line.lstrip()[1:].strip().strip("'\"")
             if value:
@@ -207,7 +267,7 @@ def load(state_dir: Path | None = None) -> Directory:
                     f"{path}: project must be true or false, got {value!r}."
                 )
         elif key in ("partners", "blocked"):
-            if value.startswith("["):
+            if value.startswith("["):  # gate-exempt: inline-list syntax, not an identifier
                 inner = value.strip().lstrip("[").rstrip("]")
                 found[key] = [v.strip().strip("'\"") for v in inner.split(",") if v.strip()]
             elif value:

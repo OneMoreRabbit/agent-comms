@@ -229,3 +229,347 @@ def test_the_permalink_is_stored_not_discarded(q):
                   permalink="https://hub/#narrow/channel/5-agent-eco/topic/t/near/1")
     row = q.db.execute("SELECT permalink FROM messages WHERE id=?", (m,)).fetchone()
     assert row["permalink"].endswith("/near/1")
+
+
+# -- the envelope address: one bot, several agents ---------------------------
+
+def test_the_addressed_fqn_is_read_from_the_topic():
+    """One bot is one SEAT's mailbox, so the agent cannot ride on the mention.
+    The topic prefix is what --to named, and that is the envelope address."""
+    from agent_comms.operations import addressed_agent
+    mine = {"bakehouse.agent-eco.test-claude-another1",
+            "bakehouse.agent-eco.test-claude-new001"}
+    assert addressed_agent("bakehouse.agent-eco.test-claude-another1: uc01", mine) == \
+        "bakehouse.agent-eco.test-claude-another1"
+    # A bare seat name is NOT an agent address — this is what keeps seat-name
+    # addressing working exactly as it did at 1.0.
+    assert addressed_agent("test-claude: uc01", mine) == ""
+    assert addressed_agent("", mine) == ""
+    assert addressed_agent("no colon here", mine) == ""
+    # Shape is three segments. Two or four is not an FQN, and a guess here
+    # would be the prefix-matching trap the estate has already paid for.
+    assert addressed_agent("agent-eco.test-claude: x", mine) == ""
+    assert addressed_agent("a.b.c.d: x", mine) == ""
+
+
+def test_a_reply_in_someone_elses_topic_is_not_an_envelope_address():
+    """THE REPLY TRAP. A reply stays in the topic it answers, so the prefix
+    names whoever the THREAD was opened to — not whoever this message is for.
+
+    Measured 2026-09-25: test-claude's agent replied to test-codex in topic
+    `bakehouse.agent-eco.test-claude-another1: uc01-another1`. test-codex read
+    that as its envelope address and its seat answered `unknown-agent` —
+    'assigned to another seat'. The reply sat queued and undelivered."""
+    from agent_comms.operations import addressed_agent
+    theirs = "bakehouse.agent-eco.test-claude-another1"
+    # On test-codex, which serves none of test-claude's agents:
+    assert addressed_agent(f"{theirs}: uc01-another1",
+                           {"bakehouse.agent-eco.test-codex-dave"}) == ""
+    # Fails safe: nothing assigned yet means no --agent, so the seat's default
+    # answers. Never worse than 1.0.
+    assert addressed_agent(f"{theirs}: uc01-another1", set()) == ""
+
+
+def test_the_envelope_address_survives_the_store(tmp_path):
+    """It is no use reading the FQN if it is dropped on the way to the seat."""
+    from agent_comms.store import Mention
+    from agent_comms.queue import MessageStore
+    q = MessageStore(tmp_path / "comms.db")
+    m = Mention(id=9001, sender="test-codex", channel="seat-testing",
+                topic="bakehouse.agent-eco.test-claude-another1: uc01",
+                agent="bakehouse.agent-eco.test-claude-another1",
+                content="body", timestamp=1758800000, permalink="")
+    q.append(m)
+    row = q.db.execute("SELECT agent FROM messages WHERE hub_id='9001'").fetchone()
+    assert row["agent"] == "bakehouse.agent-eco.test-claude-another1"
+    assert q.all()[-1].agent == "bakehouse.agent-eco.test-claude-another1"
+
+
+def test_the_seat_is_told_which_agent(monkeypatch):
+    """THE WIRING. Without this the seat delivers to its DEFAULT agent and says
+    `delivered` — a silent delivery to the wrong recipient. Measured on
+    test-claude 2026-09-25 before this was connected."""
+    from agent_comms import wake as W
+    seen = {}
+
+    def fake_deliver(body, timeout=30, agent=None):
+        seen["agent"] = agent
+        from agent_comms.seat import Delivery
+        return Delivery(success=True, status="delivered", message="typed in")
+
+    monkeypatch.setattr(W.seat_app, "deliver", fake_deliver)
+    W.wake({"id": 1, "sender": "s", "content": "x", "topic": "t",
+            "agent": "bakehouse.agent-eco.test-claude-another1",
+            "timestamp": 1758800000, "permalink": "", "channel": "seat-testing"})
+    assert seen["agent"] == "bakehouse.agent-eco.test-claude-another1"
+
+    # Addressed to the seat: no --agent, so the seat's default answers.
+    W.wake({"id": 2, "sender": "s", "content": "x", "topic": "t", "agent": "",
+            "timestamp": 1758800000, "permalink": "", "channel": "seat-testing"})
+    assert seen["agent"] is None
+
+
+# -- same-seat addressing: one bot, sibling agents ---------------------------
+
+def test_the_sender_writes_an_explicit_envelope():
+    from agent_comms.operations import addressed, envelope_from_body
+    out = addressed("test-claude", "hello", to_fqn="bakehouse.agent-eco.test-claude-another1")
+    assert out.startswith("@**test-claude** →`bakehouse.agent-eco.test-claude-another1` ")
+    assert envelope_from_body(out) == "bakehouse.agent-eco.test-claude-another1"
+    # Unaddressed sends are unchanged — no marker, no behaviour change.
+    assert addressed("test-claude", "hello") == "@**test-claude** hello"
+    assert envelope_from_body("@**test-claude** hello") == ""
+
+
+def test_our_own_post_is_kept_only_when_it_addresses_one_of_our_agents():
+    """SAME-SEAT ADDRESSING. The FQN is the agent and the bot is the seat, so an
+    agent addressing a sibling posts through this very bot and the message
+    comes straight back. Dropping every self-post made that impossible.
+
+    But an agent REPLYING in its own thread has a topic naming itself, and
+    accepting that would hand the agent its own words back forever. A send
+    carries the marker; a reply does not — which is the distinction the topic
+    cannot make."""
+    from agent_comms.operations import addressed_to_seat, addressed
+    from agent_comms.config import Settings, Identity
+
+    settings = Settings(identity=Identity(project="agent-eco", seat="test-claude"),
+                        channel="seat-testing", role="component")
+    me = "test-claude-bot@example.com"
+    sibling = "bakehouse.agent-eco.test-claude-another1"
+
+    serves = {sibling, "bakehouse.agent-eco.test-claude-new001"}
+
+    addressed_to_sibling = {"sender_email": me, "subject": f"{sibling}: x",
+                            "content": addressed("test-claude", "hi", to_fqn=sibling)}
+    reason = addressed_to_seat(settings, addressed_to_sibling, [], me, serves)
+    assert reason and sibling in reason, \
+        "kept, and the line names WHICH agent it was for (gate 9)"
+
+    # A reply from that same agent, in its own topic, carries NO marker.
+    our_own_reply = {"sender_email": me, "subject": f"{sibling}: x",
+                     "content": "@**test-codex** thanks, noted"}
+    assert addressed_to_seat(settings, our_own_reply, [], me, serves) is None
+
+    # **THE GAP THIS TEST USED TO HAVE.** It checked marker-present against
+    # marker-absent and never a marker naming SOMEONE ELSE'S agent — so it
+    # passed while the code admitted every message this seat sent to anyone.
+    # Measured on test-codex 2026-09-25: a message it had sent to another
+    # seat's agent came back through its own daemon as "addressed to an agent
+    # on this seat" and was delivered to its own main.
+    theirs = "bakehouse.agent-eco.test-codex-dave"
+    to_another_seat = {"sender_email": me, "subject": f"{theirs}: x",
+                       "content": addressed("test-codex", "hi", to_fqn=theirs)}
+    assert addressed_to_seat(settings, to_another_seat, [], me, serves) is None, \
+        "our own post to ANOTHER seat's agent is not ours to store"
+
+    # And with nothing assigned, no self-post is ours: fails safe.
+    assert addressed_to_seat(settings, addressed_to_sibling, [], me, set()) is None
+
+
+def test_the_marker_beats_the_topic_and_a_reply_cannot_forge_one():
+    from agent_comms.operations import addressed_agent, addressed
+    mine = {"bakehouse.agent-eco.test-claude-another1",
+            "bakehouse.agent-eco.test-claude-new001"}
+    body = addressed("test-claude", "hi", to_fqn="bakehouse.agent-eco.test-claude-new001")
+    # Topic says another1, the marker says new001 — the marker is the address.
+    assert addressed_agent("bakehouse.agent-eco.test-claude-another1: x", mine, body) == \
+        "bakehouse.agent-eco.test-claude-new001"
+    # A marker naming an agent we do not serve is not ours to claim.
+    foreign = addressed("test-claude", "hi", to_fqn="bakehouse.agent-eco.test-codex-dave")
+    assert addressed_agent("whatever: x", mine, foreign) == ""
+
+
+def test_the_attempt_bound_is_enforced_on_the_path_the_daemon_USES(tmp_path, monkeypatch):
+    """UC-05, which failed live. The retry loop called a shim that added one to
+    the counter and enforced nothing, so `max_attempts` governed no live path:
+    a message on test-codex reached its EIGHTH attempt against a cap of three.
+
+    The bound now lives in one place and is applied in the same transaction as
+    the attempt. This drives the REAL path -- `attempt_by_hub_id`, by hub id,
+    as the daemon calls it -- because a test against the store's private API
+    is what let the gap live."""
+    from agent_comms.queue import MessageStore, QUEUED, ABANDONED
+    from agent_comms.store import Mention
+    q = MessageStore(tmp_path / "comms.db", max_attempts=3)
+    q.append(Mention(id=4242, sender="test-codex", channel="seat-testing",
+                     topic="t", content="body", timestamp=1758800000, permalink=""))
+    assert q.state_of(q._find(4242)["id"]) == QUEUED
+
+    counts = [q.attempt_by_hub_id(4242, "no-session") for _ in range(3)]
+    assert counts == [1, 2, 3], counts
+    assert q.state_of(q._find(4242)["id"]) == ABANDONED, \
+        "three attempts against a cap of three must abandon, not keep counting"
+
+    # And there is exactly ONE bound, not a second one somewhere else.
+    import agent_comms.operations as O
+    assert not hasattr(O, "MAX_DELIVERY_ATTEMPTS"), \
+        "a second definition of the bound is how the first came to govern nothing"
+
+
+def test_hold_is_honoured_at_the_RECEIVING_end(tmp_path, monkeypatch):
+    """UC-04's hold leg, which failed live. `permitted_to_send` is the SENDER's
+    gate and refuses `none`; `hold` is a receiving decision and the receive
+    path read no delivery mode at all, so it was honoured nowhere.
+
+    It looked honoured on test-claude only because the held agent happened to
+    have no session — a check passing for the wrong reason."""
+    from agent_comms import wake as W
+    import agent_comms.config_sync as CS
+    held_agent = "bakehouse.agent-eco.test-claude-bongo"
+    monkeypatch.setattr(CS, "agent_set", lambda _d: {
+        held_agent: {"delivery": "hold"},
+        "bakehouse.agent-eco.test-claude-new001": {"delivery": "inject"}})
+
+    assert W.holds(held_agent, tmp_path) is True
+    assert W.holds("bakehouse.agent-eco.test-claude-new001", tmp_path) is False
+    # Unknown agent, unknown mode, no set: inject. A mode we cannot read must
+    # never silently withhold mail.
+    assert W.holds("bakehouse.agent-eco.nobody", tmp_path) is False
+    assert W.holds("", tmp_path) is False
+
+
+def test_a_held_message_is_never_handed_to_the_seat(monkeypatch):
+    from agent_comms import wake as W
+    calls = []
+    monkeypatch.setattr(W.seat_app, "deliver",
+                        lambda *a, **k: calls.append(k.get("agent")))
+    monkeypatch.setattr(W, "holds", lambda agent, state_dir=None: True)
+    import pytest
+    with pytest.raises(W.Held):
+        W.wake({"id": 1, "sender": "s", "content": "x", "topic": "t",
+                "agent": "bakehouse.agent-eco.test-claude-bongo",
+                "timestamp": 1758800000, "permalink": "", "channel": "seat-testing"})
+    assert calls == [], "a held message must never reach the seat"
+
+
+def test_the_envelope_states_both_ends_as_FQNs():
+    """Policy compares FQN to FQN. The recipient's FQN was already in the
+    marker; the sender's is there now because a hub display name cannot be
+    turned into one -- the directory answers canonical_id: null for both
+    spellings of a bot, the answer being not-registered rather than unknown."""
+    from agent_comms.operations import addressed, envelope_from_body, envelope_sender
+    out = addressed("test-claude", "hi",
+                    to_fqn="bakehouse.agent-eco.test-claude-another1",
+                    from_fqn="bakehouse.agent-eco.test-codex")
+    assert envelope_sender(out) == "bakehouse.agent-eco.test-codex"
+    assert envelope_from_body(out) == "bakehouse.agent-eco.test-claude-another1"
+
+    # A to-only marker still parses, and states no sender.
+    old = addressed("test-claude", "hi", to_fqn="bakehouse.agent-eco.test-claude-another1")
+    assert envelope_from_body(old) == "bakehouse.agent-eco.test-claude-another1"
+    assert envelope_sender(old) == ""
+
+    # An unmarked message states neither.
+    assert envelope_sender("@**test-claude** hello") == ""
+    assert envelope_from_body("@**test-claude** hello") == ""
+
+
+def test_the_reason_line_names_which_agent_it_was_for():
+    """Write-time gate 9. `reached me by: addressed to an agent on this seat`
+    does not say WHICH agent, so the recipient cannot tell whether it is the
+    recipient.
+
+    Reported by a live agent on test-claude 2026-09-25: it read the unnamed
+    line as "some other agent on my seat", inferred the addressee shared its
+    seat, and declined to act. It reasoned correctly from a label that did not
+    name its subject."""
+    from agent_comms.operations import addressed_to_seat, addressed
+    from agent_comms.config import Settings, Identity
+
+    settings = Settings(identity=Identity(project="agent-eco", seat="test-claude"),
+                        channel="seat-testing", role="component")
+    me = "test-claude-bot@example.com"
+    sibling = "bakehouse.agent-eco.test-claude-another1"
+    msg = {"sender_email": me, "subject": f"{sibling}: x",
+           "content": addressed("test-claude", "hi", to_fqn=sibling)}
+    reason = addressed_to_seat(settings, msg, [], me, {sibling})
+    assert sibling in reason, "the line must name the agent it was addressed to"
+    # And the near-miss: an unnamed line reads the same whoever it was for,
+    # which is the property gate 9 forbids.
+    assert reason != "addressed to an agent on this seat"
+
+
+def test_the_senders_fqn_survives_the_store(tmp_path):
+    """A reply's `to:` is the FQN the original sender declared, so losing it in
+    the store loses the address.
+
+    Measured on the seats 2026-09-26: `sender_fqn` was computed on arrival and
+    never persisted, so anything reading from the store got an empty value and
+    a reply went out with `from` and no `to`."""
+    from agent_comms.queue import MessageStore
+    from agent_comms.store import Mention
+    q = MessageStore(tmp_path / "comms.db")
+    q.append(Mention(id=7001, sender="test-codex", channel="seat-testing", topic="t",
+                     content="x", timestamp=1758800000, permalink="",
+                     sender_fqn="bakehouse.agent-eco.test-codex"))
+    assert q.all()[-1].sender_fqn == "bakehouse.agent-eco.test-codex"
+
+
+def test_a_column_added_to_SCHEMA_reaches_an_EXISTING_database(tmp_path):
+    """`CREATE TABLE IF NOT EXISTS` is a no-op once the table is there, so a
+    column added to SCHEMA exists on a fresh seat and is absent on every
+    deployed one. The near-miss is a database created BEFORE the column: it
+    must gain it, or the same code sees two different shapes depending on how
+    long the seat has been running."""
+    import sqlite3
+    from agent_comms.queue import MessageStore
+
+    path = tmp_path / "old.db"
+    # A store as it existed before the column was added.
+    db = sqlite3.connect(path)
+    db.executescript("""
+        CREATE TABLE messages (
+            id INTEGER PRIMARY KEY, seq INTEGER NOT NULL, hub_id TEXT UNIQUE,
+            sender TEXT NOT NULL, agent TEXT NOT NULL DEFAULT '',
+            subject TEXT NOT NULL DEFAULT '', body TEXT NOT NULL,
+            received_at TEXT NOT NULL, state TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0, permalink TEXT NOT NULL DEFAULT '',
+            channel TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT 'mentioned',
+            read_at TEXT, retired_reason TEXT NOT NULL DEFAULT '',
+            received_at_epoch INTEGER NOT NULL DEFAULT 0);
+    """)
+    db.commit()
+    before = {r[1] for r in db.execute("PRAGMA table_info(messages)")}
+    db.close()
+    assert "sender_fqn" not in before
+
+    MessageStore(path)          # opening it must migrate
+    db = sqlite3.connect(path)
+    after = {r[1] for r in db.execute("PRAGMA table_info(messages)")}
+    db.close()
+    assert "sender_fqn" in after, "an existing database must gain the column"
+
+
+def test_a_held_message_reaches_HELD_and_then_RETRIEVED(tmp_path, monkeypatch):
+    """UC-04 fact 2's second half, which could not have passed.
+
+    `HELD` was in the schema and the transition map from the start, three places
+    read it, and **nothing ever wrote it** -- so a `delivery: hold` message sat
+    in QUEUED, from which RETRIEVED is unreachable, and the age bound expired it
+    however faithfully the agent had read it.
+
+    RETRIEVED is not DELIVERED on purpose: nothing was put in front of anyone,
+    the agent came and asked."""
+    from agent_comms.queue import MessageStore, HELD, RETRIEVED, QUEUED
+    from agent_comms.store import Mention
+    q = MessageStore(tmp_path / "comms.db")
+
+    m = Mention(id=8801, sender="test-codex", channel="seat-testing", topic="t",
+                content="held one", timestamp=1758800000, permalink="",
+                agent="bakehouse.agent-eco.fixture-hold")
+    q.append(m, held=True)
+    rid = q._find(8801)["id"]
+    assert q.state_of(rid) == HELD, "a hold agent's mail lands in HELD, not QUEUED"
+
+    # The near-miss: an ordinary message must NOT land in HELD.
+    q.append(Mention(id=8802, sender="test-codex", channel="seat-testing", topic="t",
+                     content="ordinary", timestamp=1758800000, permalink="",
+                     agent="bakehouse.agent-eco.fixture-plain"))
+    assert q.state_of(q._find(8802)["id"]) == QUEUED
+
+    q.mark_read(8801)
+    assert q.state_of(rid) == RETRIEVED, "reading a held message IS its delivery"
+    # And reading an ordinary queued message does not move it.
+    q.mark_read(8802)
+    assert q.state_of(q._find(8802)["id"]) == QUEUED
