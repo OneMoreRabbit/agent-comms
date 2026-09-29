@@ -1859,3 +1859,79 @@ def test_a_seat_with_no_channel_JOINS_when_one_is_assigned(seat, monkeypatch):
     assert joined[0] == "", "a seat with no assignments must start with no channel"
     assert "agent-eco" in joined, (
         f"the daemon never joined the channel it was assigned: {joined}")
+
+
+def test_doctor_tells_the_truth_about_a_deaf_seat(seat, monkeypatch):
+    """**UC-13.** A seat with no channel cannot receive. `doctor` said otherwise
+    in all three places that matter, measured on test-claude 2026-09-29:
+
+    - `deliverable` — *"yes: a message sent now would reach the agent"*. False,
+      and it is catalogue 0.58 in the one check whose own question that is: the
+      seat was deaf and it could not go red.
+    - `subscription` — **PASS**, *"subscribed to ''"*. It asserted a
+      subscription that cannot exist.
+    - `reachable channels` — FAIL blaming *GRANT WITHOUT SUBSCRIPTION* for a
+      channel named nothing, remedy *"ask the orchestrator to replay
+      provisioning"*. Wrong cause, and the remedy sends a person to another
+      component for a drift that does not exist (gate 10).
+
+    Together they are worse than silence: an operator who follows them leaves
+    the seat deaf with a plausible explanation attached.
+
+    **Both states on one build**, because a version that fails `deliverable`
+    always has only moved the false answer to the other side.
+    """
+    import json
+
+    from agent_comms import operations
+    from agent_comms.config import load_settings
+    from agent_comms.hub import Hub
+    from agent_comms.seat import SeatState
+    from tests.conftest import FakeTransport
+
+    monkeypatch.setattr(Hub, "subscribed_channels",
+                        lambda self: frozenset({"agent-eco", "seat-testing"}))
+    # The seat's runtime is healthy throughout — the point is that a healthy
+    # session does not make a channel-less seat deliverable.
+    monkeypatch.setattr("agent_comms.operations.seat_state_now",
+                        lambda: SeatState(answer="yes", reason="a session is up",
+                                          runtime="claude", sessions=1,
+                                          version="2.7.1", contract="2.5-draft"))
+
+    routes = seat / ".comms" / "routes.json"
+    held = routes.read_text()
+
+    def check(name, report):
+        return next(c for c in report.checks if c[0] == name)
+
+    # -- DEAF: no assignments, so no channel ------------------------------
+    routes.write_text(json.dumps({"routes": []}))
+    assert not (load_settings().channel or "").strip(), "fixture is not deaf"
+    deaf = operations.preflight(transport_factory=lambda c: FakeTransport())
+
+    ok, why = check("deliverable", deaf)[1], check("deliverable", deaf)[2]
+    assert ok is False, "deliverable said a message would reach the agent on a deaf seat"
+    assert "no channel" in why, why
+
+    ok, why = check("subscription", deaf)[1], check("subscription", deaf)[2]
+    assert ok is False, "subscription passed on an empty channel name"
+    assert "replay provisioning" in why, (
+        "it must say NOT to ask orch — that is the wrong turn this fixes")
+
+    # `reachable channels` must not invent a drift. Either it is absent (nothing
+    # to check) or it does not claim grant-without-subscription.
+    reach = [c for c in deaf.checks if c[0] == "reachable channels"]
+    assert not any("GRANT WITHOUT SUBSCRIPTION" in c[2] for c in reach), (
+        "estate drift was reported for a channel named nothing")
+
+    # **The later checks still ran** — a failing subscription here must not
+    # return early, or the deliverable finding is hidden.
+    assert "deliverable" in [c[0] for c in deaf.checks]
+
+    # -- ASSIGNED: the same build must go quiet ---------------------------
+    routes.write_text(held)
+    fine = operations.preflight(transport_factory=lambda c: FakeTransport())
+    assert check("deliverable", fine)[1] is True, check("deliverable", fine)[2]
+    assert check("subscription", fine)[1] is True, check("subscription", fine)[2]
+    for _n, _ok, why in fine.checks:
+        assert "no channel" not in why, f"deaf-state wording leaked into a healthy seat: {why}"

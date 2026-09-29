@@ -237,12 +237,36 @@ def preflight(
     report.add("identity", True, f"expected bot '{settings.identity.bot_name}'")
     report.warnings.extend(identity_notices)
 
-    try:
-        hub.verify_subscription()
-        report.add("subscription", True, f"subscribed to '{settings.channel}'")
-    except CommsError as exc:
-        report.add("subscription", False, str(exc))
-        return report
+    # **"Subscribed to ''" is not a pass.** `verify_subscription` returns early
+    # when there is no channel, because a seat with no assignments has nothing
+    # to be subscribed TO and must be allowed to idle -- but reporting that as
+    # a subscription is asserting one that cannot exist. Measured on
+    # test-claude 2026-09-29: a deaf seat read `PASS subscription — subscribed
+    # to ''`.
+    if not (settings.channel or "").strip():
+        report.add(
+            "subscription", False,
+            "this seat has no channel, so it is subscribed to nothing and can "
+            "receive nothing. That is the correct and temporary state of a seat "
+            "the estate has not assigned any agents to yet: the channel comes "
+            "from the agents' own `transports.comms`, and the daemon joins on "
+            "its next refresh once one is assigned. Nothing to fix here — ask "
+            "for an assignment, and do NOT ask the orchestrator to replay "
+            "provisioning, which reconciles subscriptions and would find "
+            "nothing wrong.")
+        # **Deliberately NOT an early return.** A genuine subscription error
+        # stops the run below, because every check after it asks the hub. This
+        # case is different: there is nothing wrong with the hub, and the
+        # checks that follow carry the rest of the picture -- in particular
+        # `deliverable`, which is the one a person actually reads to answer
+        # "can this seat receive". Returning here would hide it.
+    else:
+        try:
+            hub.verify_subscription()
+            report.add("subscription", True, f"subscribed to '{settings.channel}'")
+        except CommsError as exc:
+            report.add("subscription", False, str(exc))
+            return report
 
     # Every channel the directory says we must reach, checked against the ones
     # this bot actually holds. A transports record naming a channel we are not
@@ -429,11 +453,29 @@ def preflight(
     # `seat status` is ADVISORY (contract §3) and this is the only place this
     # client may use it: a health check for a person, never a pre-check before
     # delivering. Delivery asks `seat msg` and reads its answer, full stop.
-    try:
-        sess = seat_state_now()
-        report.add("deliverable", sess.ok, sess.summary())
-    except SeatUnavailable as exc:
-        report.add("deliverable", False, str(exc))
+    # **The one check whose question is "would a message reach the agent" must
+    # not answer YES when none could.**
+    #
+    # `seat_state_now()` asks the SEAT whether a session is there, and on a
+    # deaf seat the answer is a truthful yes -- a session is running. But comms
+    # has no channel to receive on, so nothing reaches it. Measured on
+    # test-claude 2026-09-29: `PASS deliverable — yes: a message sent now would
+    # reach the agent`, on a seat that could not receive at all. That is
+    # catalogue 0.58 in the check the question belongs to: green because it
+    # could not go red.
+    if not (settings.channel or "").strip():
+        report.add(
+            "deliverable", False,
+            "no: this seat has no channel, so a message sent now would reach "
+            "nobody however healthy the session is. The seat's own runtime may "
+            "be fine -- this is comms having nowhere to listen, not the agent "
+            "being absent.")
+    else:
+        try:
+            sess = seat_state_now()
+            report.add("deliverable", sess.ok, sess.summary())
+        except SeatUnavailable as exc:
+            report.add("deliverable", False, str(exc))
 
     # Who may talk to this seat. Reported because "no directory installed" is a
     # real state — the orchestrator installs the file with comms, so its absence
@@ -591,7 +633,12 @@ def _transport_channels(settings: Settings) -> set[str]:
     has been fetched yet, which is a note rather than a failure — there is
     genuinely nothing to check.
     """
-    channels = {settings.channel.strip().casefold()}
+    # **An absent channel is not a channel named ''.** A seat with no
+    # assignments has none, and including it made `reachable channels` report
+    # GRANT WITHOUT SUBSCRIPTION for a channel called nothing, then send the
+    # reader to orch to replay provisioning for a drift that did not exist.
+    # Measured on test-claude 2026-09-29.
+    channels = {c for c in {settings.channel.strip().casefold()} if c}
     records = config_sync.load(settings.state_dir).get("routes") or []
     for record in records:
         name = ((record or {}).get("transports") or {}).get("comms", {}).get("channel")
