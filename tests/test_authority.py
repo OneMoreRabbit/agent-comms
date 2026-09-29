@@ -1002,3 +1002,48 @@ def test_the_directorys_partners_list_decides_and_an_absent_one_does_not(seat, t
     monkeypatch.setattr(CS, "agent_set", rows({"partners": ["test-codex"]}))
     assert permits_sender(AGENT, CODEX, tmp_path) is False, (
         "a short name admitted an FQN sender — that is the guessing that was removed")
+
+
+def test_blocked_beats_an_explicit_allow_on_the_same_agent(seat, tmp_path, monkeypatch):
+    """**The estate authors this shape from r6 on, and nothing pinned it.**
+
+    `fixture-r6-blocked` carries `partners` AND `blocked`, with the same sender
+    in both — the stronger case, because an allow-list naming you is a louder
+    claim than silence. `blocked` must still win.
+
+    It is correct by construction (`may_write_to` asks `blocks_sender` before
+    `permits_sender`) and that is exactly why it earns a test: an ordering that
+    is right by accident of line order is one refactor from being wrong, and
+    the failure would be a blocked sender DELIVERED — the direction that costs
+    something.
+    """
+    from agent_comms.operations import blocks_sender, permits_sender
+
+    AGENT = "bakehouse.agent-eco.fixture-r6-blocked"
+    SENDER = "bakehouse.agent-eco.test-codex"
+    import agent_comms.config_sync as CS
+    monkeypatch.setattr(CS, "agent_set", lambda _d: {AGENT: {"permissions": {"comms": {
+        "partners": [SENDER, "bakehouse.agent-eco.dprox"],
+        "blocked": [SENDER],
+    }}}})
+
+    # Each half says what it knows, and they DISAGREE — which is the point.
+    assert blocks_sender(AGENT, SENDER, tmp_path) is True
+    assert permits_sender(AGENT, SENDER, tmp_path) is True, (
+        "the allow-list does name them; if this were False the case would be "
+        "proving nothing about precedence")
+
+    # The decision must take the block.
+    class Hub:
+        @staticmethod
+        def in_channel(_name):
+            return True, False          # in-channel, not a human
+
+    from agent_comms.operations import may_write_to
+    assert may_write_to(Hub, AGENT, "test-codex", SENDER, tmp_path) is False, (
+        "an explicit allow overrode a block — a blocked sender would be delivered")
+
+    # And the sibling on the same list is still admitted, so the block is not
+    # being read as "refuse everyone who appears in any list".
+    assert may_write_to(Hub, AGENT, "dprox", "bakehouse.agent-eco.dprox",
+                        tmp_path) is True
