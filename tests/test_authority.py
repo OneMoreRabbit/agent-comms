@@ -1084,3 +1084,48 @@ def test_one_fixture_carries_both_semantics_partial_overlap(seat, tmp_path, monk
     assert may_write_to(Hub, AGENT, "test-claude", ALLOWED, tmp_path) is True, (
         "partner NOT blocked was refused — presence in the blocked list is being "
         "read as presence in the agent's policy at all")
+
+
+def test_the_directory_decides_without_the_hub(seat, tmp_path, monkeypatch):
+    """**A sender the directory has an opinion about is decided with the hub
+    untouched.**
+
+    Until 2026-09-29 `may_write_to` asked the hub FIRST — a live Zulip call on
+    every admission, to read one boolean about account type. Any failure of
+    that call made the verdict undeterminable, which stores the message
+    `refused` and loses it. So a blocked sender and an allowed one were both
+    gated behind a round trip that could decide nothing about either.
+
+    Here the hub raises. Blocked must still refuse, and partnered must still
+    admit — both from `routes.json`, on disk.
+    """
+    from agent_comms.operations import may_write_to
+    import agent_comms.config_sync as CS
+
+    AGENT = "bakehouse.agent-eco.fixture"
+    BLOCKED = "bakehouse.agent-eco.test-codex"
+    ALLOWED = "bakehouse.agent-eco.test-claude"
+
+    monkeypatch.setattr(CS, "agent_set", lambda _d: {AGENT: {"permissions": {"comms": {
+        "partners": [ALLOWED, BLOCKED], "blocked": [BLOCKED]}}}})
+
+    class DeadHub:
+        @staticmethod
+        def in_channel(_name):
+            raise RuntimeError("the hub is unreachable")
+
+    assert may_write_to(DeadHub, AGENT, "test-codex", BLOCKED, tmp_path) is False
+    assert may_write_to(DeadHub, AGENT, "test-claude", ALLOWED, tmp_path) is True
+
+    # **The accepted cost, asserted so it is a decision and not a surprise.**
+    # A sender the directory cannot decide still needs the hub, and with the
+    # hub down that verdict is undeterminable — the caller stores the message
+    # refused. Operator's decision, 2026-09-29: acceptable, because it now
+    # costs only humans and agents with no list.
+    monkeypatch.setattr(CS, "agent_set", lambda _d: {AGENT: {"permissions": {"comms": {}}}})
+    try:
+        may_write_to(DeadHub, AGENT, "a-human", "", tmp_path)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("a silent directory must still reach the hub")

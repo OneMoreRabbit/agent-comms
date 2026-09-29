@@ -880,14 +880,38 @@ def may_write_to(hub: Hub, agent: str, sender: str, sender_fqn: str, state_dir) 
     widens nothing that was not already the estate's no-file default — and for
     any agent the directory speaks for, step 3 is narrower than the file was.
     """
-    in_project, is_human = hub.in_channel(sender)
-    if is_human:
-        return True
+    # **The directory answers first, because the directory holds the policy.**
+    #
+    # This asked the hub FIRST until 2026-09-29 — a live Zulip call on every
+    # admission, to read one boolean about account type — and any failure of
+    # that call made the verdict undeterminable, which stores the message
+    # `refused` and loses it. So a blocked sender and an allowed one were both
+    # gated behind a network round trip that could decide nothing about either.
+    #
+    # Both directory checks read `routes.json` from disk. No network. A sender
+    # the directory has an opinion about is now decided with the hub untouched.
     if agent and sender_fqn and blocks_sender(agent, sender_fqn, state_dir):
         return False
     admitted = permits_sender(agent, sender_fqn, state_dir)
     if admitted is not None:
         return admitted
+
+    # **Only now the hub, and only for what the directory cannot express.**
+    #
+    # A human has no FQN, so no directory list can name them: `blocks_sender`
+    # and `permits_sender` both decline on an absent `sender_fqn`, which is
+    # why moving them ahead of this does not start governing humans. The
+    # channel fallback below is for an agent the directory states nothing
+    # about — which, since every agent carries an authored partners list, is
+    # now rare.
+    #
+    # **Accepted cost, operator's decision 2026-09-29:** if the hub is
+    # unreachable at this point the verdict is undeterminable and the message
+    # is lost. That now costs only senders the directory could not decide —
+    # humans, and agents with no list — instead of every sender.
+    in_project, is_human = hub.in_channel(sender)
+    if is_human:
+        return True
     return in_project
 
 
