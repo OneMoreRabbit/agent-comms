@@ -1047,3 +1047,40 @@ def test_blocked_beats_an_explicit_allow_on_the_same_agent(seat, tmp_path, monke
     # being read as "refuse everyone who appears in any list".
     assert may_write_to(Hub, AGENT, "dprox", "bakehouse.agent-eco.dprox",
                         tmp_path) is True
+
+
+def test_one_fixture_carries_both_semantics_partial_overlap(seat, tmp_path, monkeypatch):
+    """**The r7 shape, and a better control than r6's.**
+
+    `fixture-r7-blocked` overlaps its two lists only PARTIALLY: one sender is
+    partner-and-blocked, another is partner-not-blocked. So a single agent
+    proves both semantics at once.
+
+    Why that is stronger: in r6 the allow-control was a DIFFERENT fixture, so
+    "this agent refuses everyone who appears in any list" was excluded only by
+    inference across two subjects. Here both answers come from the same
+    `permissions.comms` block, and a build that refused on mere presence in
+    either list would fail on the same object it passed on.
+    """
+    from agent_comms.operations import may_write_to
+    import agent_comms.config_sync as CS
+
+    AGENT = "bakehouse.agent-eco.fixture-r7-blocked"
+    ALLOWED = "bakehouse.agent-eco.test-claude"      # partner, NOT blocked
+    REFUSED = "bakehouse.agent-eco.test-codex"       # partner AND blocked
+
+    monkeypatch.setattr(CS, "agent_set", lambda _d: {AGENT: {"permissions": {"comms": {
+        "partners": [ALLOWED, REFUSED],
+        "blocked": [REFUSED],
+    }}}})
+
+    class Hub:
+        @staticmethod
+        def in_channel(_n):
+            return True, False
+
+    assert may_write_to(Hub, AGENT, "test-codex", REFUSED, tmp_path) is False, (
+        "partner AND blocked was admitted — blocked must win")
+    assert may_write_to(Hub, AGENT, "test-claude", ALLOWED, tmp_path) is True, (
+        "partner NOT blocked was refused — presence in the blocked list is being "
+        "read as presence in the agent's policy at all")
