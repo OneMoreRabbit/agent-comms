@@ -194,7 +194,7 @@ def _posts_from(transport_cls, *, events, iterations=1):
 
     class T(transport_cls):
         def call_endpoint(self, url, method="GET", request=None):
-            if url == "messages":
+            if url == "messages" and method == "POST":
                 posted.append(request)
             return super().call_endpoint(url, method, request)
 

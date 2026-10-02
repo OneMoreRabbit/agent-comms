@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import gc
+import os
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -37,10 +39,44 @@ def test_the_attempt_and_the_mark_land_together(q):
     q.move(m, QUEUED, "permitted")
     q.record_attempt(m, delivered=True, detail="typed in")
 
-    row = q.db.execute("SELECT state, attempts FROM messages WHERE id=?", (m,)).fetchone()
+    with q.connection() as db:
+        row = db.execute("SELECT state, attempts FROM messages WHERE id=?", (m,)).fetchone()
     assert (row["state"], row["attempts"]) == (DELIVERED, 1)
     marked = [r for r in q.history(m) if r["became"] == DELIVERED]
     assert len(marked) == 1 and marked[0]["attempt"] == 1
+
+
+def test_every_operation_closes_its_sqlite_connection(q):
+    """A sqlite connection context commits; it does not close.
+
+    The released daemon relied on cyclic GC and accumulated DB/WAL/SHM file
+    descriptors after every poll and wake. Hold GC off here so that regression
+    is deterministic instead of depending on when Python happens to collect.
+    """
+    target = str(q.path)
+
+    def open_descriptors():
+        found = []
+        for name in os.listdir("/proc/self/fd"):
+            try:
+                linked = os.readlink(f"/proc/self/fd/{name}")
+            except OSError:
+                continue
+            if target in linked:
+                found.append(linked)
+        return found
+
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        for i in range(20):
+            q.receive(hub_id=str(i), sender="arch", body="x")
+            q.counts()
+            assert open_descriptors() == []
+    finally:
+        if was_enabled:
+            gc.enable()
+        gc.collect()
 
 
 def test_a_failed_wake_never_re_queues_a_delivered_message(q):
@@ -52,7 +88,8 @@ def test_a_failed_wake_never_re_queues_a_delivered_message(q):
     q.record_wake(m, "failed", "notify_command exited 5: agent-not-awake")
 
     assert q.state_of(m) == DELIVERED
-    assert q.db.execute("SELECT COUNT(*) c FROM wakes").fetchone()["c"] == 1
+    with q.connection() as db:
+        assert db.execute("SELECT COUNT(*) c FROM wakes").fetchone()["c"] == 1
 
 
 def test_three_attempts_and_it_is_abandoned_not_retried_forever(q):
@@ -118,7 +155,8 @@ def test_retired_is_not_deleted(q):
     q.retire()
 
     assert q.state_of(m) == EXPIRED
-    assert q.db.execute("SELECT body FROM messages WHERE id=?", (m,)).fetchone()["body"] == "x"
+    with q.connection() as db:
+        assert db.execute("SELECT body FROM messages WHERE id=?", (m,)).fetchone()["body"] == "x"
     assert len(q.history(m)) >= 3
 
 
@@ -157,8 +195,9 @@ def test_the_same_hub_message_is_stored_once(q):
 
 def test_seq_is_monotonic_and_local(q):
     ids = [q.receive(hub_id=str(i), sender="arch", body="x") for i in range(3)]
-    seqs = [q.db.execute("SELECT seq FROM messages WHERE id=?", (m,)).fetchone()["seq"]
-            for m in ids]
+    with q.connection() as db:
+        seqs = [db.execute("SELECT seq FROM messages WHERE id=?", (m,)).fetchone()["seq"]
+                for m in ids]
     assert seqs == sorted(seqs) and len(set(seqs)) == 3
 
 
@@ -180,7 +219,9 @@ def test_a_broken_seat_does_not_burn_the_attempt_budget(q):
                          consumes_attempt=False)
 
     assert q.state_of(m) == QUEUED, "a broken seat abandoned the message"
-    assert q.db.execute("SELECT attempts FROM messages WHERE id=?", (m,)).fetchone()["attempts"] == 0
+    with q.connection() as db:
+        assert db.execute(
+            "SELECT attempts FROM messages WHERE id=?", (m,)).fetchone()["attempts"] == 0
     assert m in [r["id"] for r in q.due()], "the message is not waiting for the fix"
 
 
@@ -227,7 +268,8 @@ def test_the_permalink_is_stored_not_discarded(q):
     """
     m = q.receive(hub_id="1", sender="arch", body="x",
                   permalink="https://hub/#narrow/channel/5-agent-eco/topic/t/near/1")
-    row = q.db.execute("SELECT permalink FROM messages WHERE id=?", (m,)).fetchone()
+    with q.connection() as db:
+        row = db.execute("SELECT permalink FROM messages WHERE id=?", (m,)).fetchone()
     assert row["permalink"].endswith("/near/1")
 
 
@@ -280,7 +322,8 @@ def test_the_envelope_address_survives_the_store(tmp_path):
                 agent="bakehouse.agent-eco.test-claude-another1",
                 content="body", timestamp=1758800000, permalink="")
     q.append(m)
-    row = q.db.execute("SELECT agent FROM messages WHERE hub_id='9001'").fetchone()
+    with q.connection() as db:
+        row = db.execute("SELECT agent FROM messages WHERE hub_id='9001'").fetchone()
     assert row["agent"] == "bakehouse.agent-eco.test-claude-another1"
     assert q.all()[-1].agent == "bakehouse.agent-eco.test-claude-another1"
 

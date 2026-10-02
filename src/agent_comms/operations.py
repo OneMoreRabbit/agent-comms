@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import atexit
 import json
+import sqlite3
+import traceback
 from datetime import datetime, timezone
 import re
 import signal
@@ -502,15 +504,19 @@ def preflight(
         else:
             report.add("directory", True,
                        "no agents assigned yet, so there is no policy to state")
-        refused = [m for m in Store(settings.state_dir).all() if not m.authorised]
+        refused = [m for m in message_store(settings.state_dir).all() if not m.authorised]
         if refused:
             # The stored flag records the rule in force when the message arrived,
             # so re-check the senders against the directory as it stands now.
             # Otherwise this note reports a seat as blocked when the only thing
             # that changed is the rule — which is how a stale flag becomes a
             # false accusation.
-            senders = {m.sender for m in refused}
-            still = sorted(n for n in senders if not is_permitted(directory, hub, n))
+            senders = {m.sender_fqn or m.sender for m in refused}
+            still = sorted({
+                m.sender_fqn or m.sender for m in refused
+                if not may_write_to(hub, m.agent, m.sender, m.sender_fqn,
+                                    settings.state_dir)
+            })
             note = f"{len(refused)} stored message(s) were refused as not permitted"
             if still:
                 note += f"; still refused today: {', '.join(still)}"
@@ -596,6 +602,14 @@ def preflight(
     # nothing". A note would be true and would change nobody's behaviour.
     report.add("wake trigger", bool(settings.notify_command or settings.wake),
                _wake_summary(settings))
+
+    last_wake = message_store(settings.state_dir).last_wake(successful=True)
+    report.add(
+        "wake history", True,
+        (f"last successful wake {last_wake['at']}: {last_wake['outcome']}"
+         if last_wake else
+         "never recorded — this can mean no message has arrived since wake tracking was installed"),
+    )
 
     report.warnings.extend(registration.warnings)
     report.notes.extend(registration.notes)
@@ -1725,14 +1739,18 @@ def wake_agent(
         # `hold`: accepted and stored, never injected. The agent asks for it
         # with `comms inbox`. Not a failure, so nothing is retried and no
         # attempt is consumed; the message simply stays queued and readable.
+        store.record_wake_by_hub_id(mid, "held", str(held))
         store.record("info", f"held: {held}")
         return Woken(Woken.HELD, f"held: {held}")
     except WakeError as exc:
         # The seat could not be invoked at all — a different fault from anything
         # the seat reports. The message stays ours and stays queued.
+        store.record_wake_by_hub_id(mid, "failed", str(exc))
         store.record("warn", f"delivery could not be attempted for {mid}: {exc}")
         _announce_held(settings, store, mention, str(exc), transport_factory)
         return Woken(Woken.QUEUED, f"queued: {exc}")
+
+    store.record_wake_by_hub_id(mid, result.status, result.summary())
 
     if result.success:
         store.mark_delivered(mid) if mid is not None else None
@@ -1864,11 +1882,14 @@ def _tell_agent_once(settings, store, text, transport_factory) -> None:
     woken has a louder problem that `doctor` already reports.
     """
     try:
-        wake({"id": 0, "sender": "agent-comms", "channel": settings.channel,
-              "topic": "retired mail", "content": text, "timestamp": int(time.time()),
-              "permalink": "", "read": False, "reason": "summary",
-              "delivered": False, "attempts": 0, "authorised": True, "retired": ""})
-    except (WakeError, Exception):  # noqa: BLE001 — a courtesy must not break a pass
+        result = wake({"id": 0, "sender": "agent-comms", "channel": settings.channel,
+                       "topic": "retired mail", "content": text,
+                       "timestamp": int(time.time()), "permalink": "", "read": False,
+                       "reason": "summary", "delivered": False, "attempts": 0,
+                       "authorised": True, "retired": ""})
+        store.record_wake(None, result.status, result.summary())
+    except (WakeError, Exception) as exc:  # noqa: BLE001 — a courtesy must not break a pass
+        store.record_wake(None, "failed", str(exc))
         store.record("warn", "could not deliver the retirement summary")
 
 
@@ -1922,15 +1943,29 @@ def retry_undelivered(
             # message that burned attempts would be abandoned for obeying its
             # own declared mode. It stays queued and readable; the age bound
             # still applies, so it cannot wait forever.
+            store.record_wake_by_hub_id(mention.id, "held", str(held))
             store.record("info", f"held: {held}")
             continue
-        except WakeError:
+        except WakeError as exc:
+            store.record_wake_by_hub_id(mention.id, "failed", str(exc))
             break  # the seat is not reachable at all; nothing else will land either
+        store.record_wake_by_hub_id(mention.id, result.status, result.summary())
         # **The bound is applied HERE, in the same transaction as the attempt.**
         # This used to call a shim that added 1 to the counter and enforced
         # nothing, so `max_attempts` governed no live path at all.
         try:
-            attempts = store.attempt_by_hub_id(mention.id, result.summary())
+            if result.success:
+                # One accepted handoff is one attempt. The old path first
+                # recorded it as a failed attempt and then marked delivery,
+                # incrementing the counter twice and shortening the retry
+                # budget for later messages.
+                store.mark_delivered(mention.id)
+                attempts = 0  # inspected only on the failure path below
+            elif getattr(result, "at_capacity", False):
+                attempts = store.attempt_by_hub_id(
+                    mention.id, result.summary(), consumes_attempt=False)
+            else:
+                attempts = store.attempt_by_hub_id(mention.id, result.summary())
         except ForwardOnly as refused:
             # **Another pass got there first, and that is not this pass's
             # problem.** Two passes overlap whenever `comms daemon --once` runs
@@ -1967,7 +2002,6 @@ def retry_undelivered(
                 # `record_attempt` has already moved it to `abandoned`, in the
                 # same transaction as the attempt. Nothing to do here but stop.
             break
-        store.mark_delivered(mention.id)
         landed += 1
 
     if landed:
@@ -2096,7 +2130,7 @@ def _tell_sender(
 
 
 def detach_daemon(log_path: str | None = None, **kw) -> int:
-    """Start the daemon in the background, detached from this shell.
+    """Start a supervised daemon in the background, detached from this shell.
 
     A double fork with `setsid` between: the first fork lets this command
     return, `setsid` puts the daemon in its own session so it has no controlling
@@ -2105,11 +2139,15 @@ def detach_daemon(log_path: str | None = None, **kw) -> int:
     tmux session, no longer takes the daemon with it**, which is how this seat's
     daemon has died more than once.
 
-    It is deliberately not a supervisor. Nothing restarts this process, and
-    saying so plainly is better than a half-restarter that hides the gap.
+    The detached process is the supervisor. A recoverable daemon crash is
+    logged and restarted with bounded backoff; an invalid configuration still
+    fails loudly rather than looping forever.
     """
     settings = load_settings(**kw)
-    store = message_store(settings.state_dir)
+    # The parent must not touch SQLite before forking. sqlite connections are
+    # process-local; inheriting one into a detached child is undefined and was
+    # observed as open DB/WAL/SHM descriptors in every released daemon.
+    store = Store(settings.state_dir)
     store.ensure()
 
     state = store.daemon_state()
@@ -2144,13 +2182,21 @@ def detach_daemon(log_path: str | None = None, **kw) -> int:
     os.dup2(devnull, 0)
     os.dup2(handle, 1)
     os.dup2(handle, 2)
+    os.close(devnull)
+    os.close(handle)
     os.chdir("/")
 
     try:
-        run_daemon(**kw)
+        supervise_daemon(**kw)
+    except (SystemExit, KeyboardInterrupt):
+        # SIGTERM is the normal `comms daemon --stop` path. The signal handler
+        # raises SystemExit so atexit can record the stop; it is not a crash and
+        # must not leave a traceback or a fatal warning behind.
+        os._exit(0)
     except BaseException as exc:  # noqa: BLE001 - last line before the process ends
         try:
-            store.record("warn", f"detached daemon exited: {type(exc).__name__}: {exc}")
+            traceback.print_exc()
+            store.record("warn", f"detached daemon exited: {_exception_detail(exc)}")
         finally:
             os._exit(1)
     os._exit(0)
@@ -2222,18 +2268,15 @@ def stop_daemon(timeout: float = 10.0, **kw) -> tuple[bool, int | None]:
 
 
 def restart_daemon(log_path: str | None = None, timeout: float = 10.0, **kw) -> tuple[bool, int]:
-    """Stop the running daemon, if any, then start a detached one.
+    """Stop the running daemon, if any, then start a supervised detached one.
 
     Returns `(replaced, pid)` — `replaced` says whether something was actually
     stopped, so the caller can tell "restarted" from "there was nothing running,
     so I started one".
 
-    **This is not supervision**, and naming it `restart` does not make it so.
-    It is an operator action: something has to run it. Nothing here notices a
-    dead daemon or brings it back, which remains the deployer's to solve (see
-    the daemon-supervision need with ansible-platform). What it does fix is the
-    two-step by hand, where the second step was forgotten and the seat sat with
-    no daemon at all — the exact five-hour outage of 2026-09-10.
+    The detached process supervises recoverable daemon crashes. A host-side
+    service is still required to start it after a container or host restart;
+    nothing inside this process can survive its container disappearing.
 
     The replacement is always **detached**, never re-hosted the way the old one
     was. A daemon started under tmux, systemd or a bare shell is hosted by
@@ -2260,6 +2303,18 @@ UNFIXABLE_BY_RESTART = (
     ConflictingWakeTriggers,
     DaemonAlreadyRunning,
 )
+
+
+def _exception_detail(exc: BaseException) -> str:
+    """One useful line for events.log; the full traceback goes to daemon.out."""
+    detail = f"{type(exc).__name__}: {exc}"
+    if isinstance(exc, sqlite3.Error):
+        code = getattr(exc, "sqlite_errorcode", None)
+        name = getattr(exc, "sqlite_errorname", None)
+        extras = [str(value) for value in (name, code) if value is not None]
+        if extras:
+            detail += f" [SQLite {' / '.join(extras)}]"
+    return detail
 
 
 def supervise_daemon(
@@ -2307,7 +2362,9 @@ def supervise_daemon(
         except KeyboardInterrupt:
             raise
         except Exception as exc:  # noqa: BLE001 — anything else is worth retrying
-            store.record("warn", f"daemon exited ({type(exc).__name__}: {exc}); supervisor restarting")
+            traceback.print_exc()
+            store.record("warn", f"daemon exited ({_exception_detail(exc)}); "
+                         "supervisor restarting")
         else:
             store.record("warn", "daemon returned; supervisor restarting")
 
@@ -2423,6 +2480,7 @@ def run_daemon(
     last_backstop = time.monotonic()
     last_config = 0.0
     gap_recovery = False
+    startup_recovery = True
     while max_iterations is None or iterations < max_iterations:
         iterations += 1
         try:
@@ -2455,10 +2513,11 @@ def run_daemon(
             # sits outside the guard around `get_events`. Unguarded, a single
             # transport hiccup would end the daemon, which is the silent-death
             # class this client exists to refuse; 0.40.2 introduced it and this
-            # closes it. An undetermined permission **holds**: stored, visible,
-            # not delivered, and not bounced — the same rule as the seat's own
-            # `undetermined` verdict, because an answer nobody could get is not
-            # a "no", it is a "not now".
+            # closes it. An undetermined permission is stored, not delivered
+            # and not bounced. The current state machine records it as refused;
+            # say that truthfully rather than claiming a hold state that was
+            # never written. The operator has deferred changing this edge-case
+            # state machine.
             undetermined = False
 
             def _permitted(name: str) -> bool:
@@ -2493,7 +2552,8 @@ def run_daemon(
                     store.record(
                         "warn",
                         f"could not determine whether {name!r} may message this seat "
-                        f"({exc}); holding the message rather than refusing it.",
+                        f"({exc}); storing the message as refused and not delivering it. "
+                        "No refusal notice was sent because the policy answer was unavailable.",
                     )
                     return False
 
@@ -2502,7 +2562,7 @@ def run_daemon(
                 permitted=_permitted,
             )
             if mention is None:
-                return
+                return False
             # The addressed agent's declared mode decides the arrival state:
             # `hold` lands in HELD, which is the only state RETRIEVED can be
             # reached from. Read once here rather than at every delivery pass.
@@ -2519,13 +2579,14 @@ def run_daemon(
                 # sender is told once, so nothing is silent and a wrong
                 # directory is recoverable.
                 if undetermined:
-                    return  # held, already logged; no bounce for a non-answer
+                    return True  # stored as refused, already logged; no bounce
                 _refuse_sender(settings, store, mention, hub,
                                bounced, transport_factory)
-                return
+                return True
             _notify(settings, store, mention)
             if on_mention is not None:
                 on_mention(mention)
+            return True
 
         for event in events:
             handle_event(event)
@@ -2533,9 +2594,11 @@ def run_daemon(
         # The doorbell rang, but the queue is not the record. Anything that
         # arrived while it was down is in channel history and nowhere else, so
         # read forward from the last message actually handled.
-        if gap_recovery:
+        if startup_recovery or gap_recovery:
+            reason = "startup" if startup_recovery else "queue was replaced"
+            startup_recovery = False
             gap_recovery = False
-            _catch_up(hub, store, handle_event, "queue was replaced")
+            _catch_up(hub, store, handle_event, reason)
 
         # Check the doorstep regardless. Two failures hide from the queue alone:
         # a connection that hangs without erroring, and a queue replaced between
@@ -2712,12 +2775,12 @@ def _catch_up(hub: Hub, store: Store, handle, reason: str) -> int:
     except Exception as exc:  # noqa: BLE001 - the queue path still works
         store.record("warn", f"{reason}: could not read channel history to catch up ({exc})")
         return 0
-    for msg in missed:
-        handle(_event_from_message(msg))
-    store.record("info" if missed else "info",
-                 f"{reason}: backfilled {len(missed)} message(s) from channel history "
+    recovered = sum(bool(handle(_event_from_message(msg))) for msg in missed)
+    store.record("info",
+                 f"{reason}: backfilled {recovered} addressed message(s) from "
+                 f"{len(missed)} history row(s) "
                  f"after id {since}")
-    return len(missed)
+    return recovered
 
 
 def _register(hub: Hub, store: Store) -> Registration:
@@ -2941,6 +3004,7 @@ def stats(**kw) -> dict:
         counts[_state_of(m)] = counts.get(_state_of(m), 0) + 1
     waiting = [m for m in rows if _state_of(m) == "queued"]
     daemon = store.daemon_state()
+    last_wake = store.last_wake(successful=True)
     return {
         "seat": settings.identity.seat,
         "stored": len(rows),
@@ -2951,6 +3015,8 @@ def stats(**kw) -> dict:
         "oldest_undelivered": min((m.when for m in waiting), default=""),
         "daemon": daemon.summary(),
         "daemon_running": daemon.running,
+        "last_successful_wake": last_wake["at"] if last_wake else "",
+        "last_successful_wake_outcome": last_wake["outcome"] if last_wake else "never",
     }
 
 
@@ -3119,11 +3185,12 @@ def requeue(message_id: int, reason: str, **kw) -> str:
     row = store._find(message_id)
     if row is None:
         return f"no message {message_id} on this seat."
-    store.db.execute(
-        "UPDATE messages SET state=?, attempts=0, retired_reason='' WHERE id=?",
-        (QUEUED, row["id"]))
-    store._log(row["id"], row["state"], QUEUED, f"requeued by hand: {reason}",
-               rule="operator")
+    with store.connection() as db:
+        db.execute(
+            "UPDATE messages SET state=?, attempts=0, retired_reason='' WHERE id=?",
+            (QUEUED, row["id"]))
+        store._log(row["id"], row["state"], QUEUED, f"requeued by hand: {reason}",
+                   rule="operator", db=db)
     store.record("info", f"requeued {message_id} by hand: {reason}")
     # **Say the word `trace` says.** `row['state']` is the raw column, and a
     # hand retirement is stored as EXPIRED with a reason beside it -- so this

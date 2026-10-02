@@ -271,10 +271,35 @@ def test_doctor_reports_every_check_not_just_the_first(running_daemon, monkeypat
                      # place it can be seen.
                      "policy entries",
                      "event queue", "deliverable", "directory", "seat build", "daemon",
-                     "wake trigger"]
+                     "wake trigger", "wake history"]
     assert report.ok
     assert report.warnings == []
     assert any("Honoured" in n for n in report.notes)
+
+
+def test_doctor_rechecks_a_refused_message_without_crashing(running_daemon, monkeypatch):
+    """The released branch called an undefined name whenever refusals existed."""
+    import time
+
+    from agent_comms.store import Mention
+
+    store = operations.message_store(running_daemon.root)
+    store.append(Mention(
+        id=9876, sender="agent-eco-arch", sender_fqn="bakehouse.agent-eco.arch",
+        agent="bakehouse.agent-eco.agent-comms", channel="agent-eco", topic="t",
+        content="x", timestamp=int(time.time()), permalink="", authorised=False))
+    monkeypatch.setattr(
+        "agent_comms.operations.seat_state_now",
+        lambda: __import__("agent_comms.seat", fromlist=["x"]).SeatState(
+            answer="yes", reason="a message sent now would reach the agent",
+            runtime="claude", sessions=1, version="2.9.0", contract="2.9-draft"))
+    monkeypatch.setattr("agent_comms.operations.may_write_to",
+                        lambda *args, **kwargs: False)
+
+    report = operations.preflight(transport_factory=lambda c: FakeTransport())
+
+    assert any("still refused today: bakehouse.agent-eco.arch" in n
+               for n in report.notes)
 
 
 # -- attribution: the bot must be who the vault thinks it is -----------------
@@ -559,7 +584,7 @@ def test_someone_else_in_our_topic_still_reaches_us(seat):
 
 # -- the permission check must not be able to kill the daemon -----------------
 
-def test_a_hub_failure_in_the_permission_check_holds_rather_than_killing(seat):
+def test_a_hub_failure_in_the_permission_check_is_logged_truthfully(seat):
     """0.40.2 introduced this and it is the class this client exists to refuse.
 
     The permission check asks the hub, and the loop it runs in sits outside the
@@ -583,10 +608,12 @@ def test_a_hub_failure_in_the_permission_check_holds_rather_than_killing(seat):
                                    max_iterations=1, on_mention=notified.append)
 
     assert stored == 1, "the daemon survived and stored the message"
-    assert notified == [], "held: an undetermined permission is not a yes"
+    assert notified == [], "an undetermined permission is not a yes"
+    assert operations.inbox()[0].state == "refused"
     log = (seat / ".comms" / "events.log").read_text()
     assert "could not determine whether" in log
-    assert "holding the message rather than refusing it" in log
+    assert "storing the message as refused" in log
+    assert "No refusal notice was sent" in log
 
 
 def test_an_undetermined_permission_does_not_bounce(seat):
@@ -813,6 +840,20 @@ def test_supervise_records_each_restart(seat, monkeypatch):
     assert "supervisor restarting" in events
 
 
+def test_supervise_prints_the_traceback_and_sqlite_diagnostic(seat, monkeypatch, capsys):
+    """The released daemon reduced a fatal SQLite error to three opaque words."""
+    import sqlite3
+
+    monkeypatch.setattr(
+        operations, "run_daemon",
+        lambda **kw: (_ for _ in ()).throw(sqlite3.OperationalError("disk I/O error")))
+    operations.supervise_daemon(max_restarts=0, backoff_start=0)
+
+    assert "Traceback (most recent call last)" in capsys.readouterr().err
+    events = (seat / ".comms" / "events.log").read_text()
+    assert "OperationalError: disk I/O error" in events
+
+
 def test_supervise_backs_off_and_resets_after_a_long_run(seat, monkeypatch):
     """Fast repeated failures slow down; a daemon that ran for ages then died
     starts again promptly — those are different events."""
@@ -836,8 +877,9 @@ def test_supervise_conflicts_with_the_other_daemon_flags(seat):
 
 # -- the queue is a doorbell; history is the record (0.52.2) -------------------
 
-def _history_msg(mid, ts, topic="agent-comms: from history", sender="agent-eco-arch"):
-    return {"id": mid, "sender_full_name": sender, "display_recipient": "agent-eco",
+def _history_msg(mid, ts, topic="agent-comms: from history", sender="agent-eco-arch",
+                 channel="agent-eco"):
+    return {"id": mid, "sender_full_name": sender, "display_recipient": channel,
             "subject": topic, "content": "body", "timestamp": ts, "stream_id": 7,
             "flags": ["mentioned"]}
 
@@ -886,7 +928,6 @@ def test_a_lost_queue_no_longer_loses_messages(seat):
 
     store = operations.message_store(seat / ".comms")
     transport = HistoryTransport(
-        history=[_history_msg(601, 10), _history_msg(602, 11)],
         event_batches=[{"result": "success", "events": [
             {"id": 1, "type": "message", "flags": ["mentioned"],
              "message": _history_msg(600, 9)}]}],
@@ -895,12 +936,45 @@ def test_a_lost_queue_no_longer_loses_messages(seat):
     assert store.last_message_id() == 600
 
     # Now the queue is collected; the daemon re-registers and backfills.
+    transport.history = [_history_msg(601, 10), _history_msg(602, 11)]
     transport.event_batches = [QueueGapError("queue gone."),
                                {"result": "success", "events": []}]
     operations.run_daemon(transport_factory=lambda c: transport, max_iterations=2)
     ids = {m.id for m in store.all()}
     assert {601, 602} <= ids, "messages sent while the queue was dead were lost"
-    assert "backfilled 2 message(s)" in (seat / ".comms" / "events.log").read_text()
+    assert "backfilled 2 addressed message(s)" in (
+        seat / ".comms" / "events.log").read_text()
+
+
+def test_restart_backfills_a_cross_project_message_before_waiting_for_backstop(seat):
+    """Arch lost two mentions sent while its daemon was dead.
+
+    The released recovery was periodic rather than startup work and narrowed
+    history to the home channel, while the live queue receives every channel
+    the bot holds. A cross-project mention therefore stayed absent forever.
+    """
+    store = operations.message_store(seat / ".comms")
+    first = HistoryTransport(event_batches=[{"result": "success", "events": [
+        {"id": 1, "type": "message", "flags": ["mentioned"],
+         "message": _history_msg(610, 9)},
+    ]}])
+    operations.run_daemon(transport_factory=lambda c: first, max_iterations=1)
+    assert store.last_message_id() == 610
+
+    missed = _history_msg(611, 10, channel="estate-manage")
+    missed["flags"] = ["mentioned"]
+    restarted = HistoryTransport(
+        history=[missed],
+        event_batches=[{"result": "success", "events": []}],
+    )
+    operations.run_daemon(transport_factory=lambda c: restarted, max_iterations=1)
+
+    assert 611 in {m.id for m in store.all()}
+    assert restarted.history_calls, "restart never read durable history"
+    assert "narrow" not in restarted.history_calls[0], \
+        "a home-channel narrow cannot recover cross-project mentions"
+    assert "startup: backfilled 1 addressed message(s)" in (
+        seat / ".comms" / "events.log").read_text()
 
 
 def test_the_anchor_message_is_not_handled_twice(seat):
@@ -944,7 +1018,19 @@ def test_the_backstop_catches_a_queue_that_stopped_delivering(seat, monkeypatch)
 
     store = operations.message_store(seat / ".comms")
     old = _time.time() - 600  # comfortably past MISSED_AFTER_SECS
-    transport = HistoryTransport(
+    class AppearsAfterStartup(HistoryTransport):
+        """Startup checks see nothing; the later backstop sees the message."""
+
+        empty_reads = 2
+
+        def call_endpoint(self, url, method="GET", request=None):
+            if url == "messages" and method == "GET" and self.empty_reads:
+                self.empty_reads -= 1
+                self.history_calls.append(request)
+                return {"result": "success", "messages": []}
+            return super().call_endpoint(url, method, request)
+
+    transport = AppearsAfterStartup(
         history=[_history_msg(901, old)],
         event_batches=[{"result": "success", "events": [
             {"id": 1, "type": "message", "flags": ["mentioned"],

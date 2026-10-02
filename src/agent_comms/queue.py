@@ -19,6 +19,7 @@ This is the part the September flood was about. Every rule here was bought:
 from __future__ import annotations
 
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -136,7 +137,7 @@ class Retirement:
 
 
 class Queue:
-    """The store. One connection, WAL, so the daemon and the CLI can share it."""
+    """The store. Short-lived SQLite connections, shared safely through WAL."""
 
     def __init__(self, path: Path, *, max_attempts: int = DEFAULT_MAX_ATTEMPTS,
                  max_age: timedelta = DEFAULT_MAX_AGE,
@@ -146,7 +147,7 @@ class Queue:
         self.max_age = max_age
         self.max_per_pass = max_per_pass
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self._open() as db:
+        with self.connection() as db:
             db.executescript(SCHEMA)
             # **A column added to SCHEMA does not reach an existing database.**
             # `CREATE TABLE IF NOT EXISTS` is a no-op once the table is there,
@@ -181,15 +182,21 @@ class Queue:
         db.execute("PRAGMA foreign_keys=ON")
         return db
 
-    @property
-    def db(self) -> sqlite3.Connection:
-        """Compatibility for call sites that reach for `.db` directly.
+    @contextmanager
+    def connection(self):
+        """Yield one transaction and close its connection on every path.
 
-        Each access is its own connection and is closed by garbage collection.
-        Anything doing more than one statement should use `_open()` in a
-        `with` block so the whole unit shares one.
+        A sqlite connection's context manager commits or rolls back; it does
+        not close the connection. Relying on cyclic garbage collection left
+        several database, WAL and SHM descriptors open in long-lived daemons.
+        Closing here makes the stated per-operation lifetime true.
         """
-        return self._open()
+        db = self._open()
+        try:
+            with db:
+                yield db
+        finally:
+            db.close()
 
     # -- writing ------------------------------------------------------------
 
@@ -202,22 +209,27 @@ class Queue:
         in, which is the only ordering we can vouch for.
         """
         now = received_at or _now()
-        cur = self.db.execute(
-            "INSERT OR IGNORE INTO messages"
-            " (seq, hub_id, sender, agent, sender_fqn, subject, body, received_at,"
-            "  state, permalink)"
-            " VALUES ((SELECT COALESCE(MAX(seq),0)+1 FROM messages),?,?,?,?,?,?,?,?,?)",
-            (hub_id, sender, agent, sender_fqn, subject, body, now, RECEIVED, permalink))
-        if cur.rowcount == 0:
-            return int(self.db.execute(
-                "SELECT id FROM messages WHERE hub_id=?", (hub_id,)).fetchone()["id"])
-        message = int(cur.lastrowid)
-        self._log(message, "", RECEIVED, "arrived from the hub")
-        return message
+        with self.connection() as db:
+            cur = db.execute(
+                "INSERT OR IGNORE INTO messages"
+                " (seq, hub_id, sender, agent, sender_fqn, subject, body, received_at,"
+                "  state, permalink)"
+                " VALUES ((SELECT COALESCE(MAX(seq),0)+1 FROM messages),?,?,?,?,?,?,?,?,?)",
+                (hub_id, sender, agent, sender_fqn, subject, body, now, RECEIVED, permalink))
+            if cur.rowcount == 0:
+                return int(db.execute(
+                    "SELECT id FROM messages WHERE hub_id=?", (hub_id,)).fetchone()["id"])
+            message = int(cur.lastrowid)
+            self._log(message, "", RECEIVED, "arrived from the hub", db=db)
+            return message
 
     def _log(self, message: int, was: str, became: str, cause: str,
              rule: str = "", attempt: int | None = None, db=None) -> None:
-        (db or self.db).execute(
+        if db is None:
+            with self.connection() as conn:
+                self._log(message, was, became, cause, rule, attempt, db=conn)
+            return
+        db.execute(
             "INSERT INTO transitions (message, at, was, became, cause, rule, attempt)"
             " VALUES (?,?,?,?,?,?,?)", (message, _now(), was, became, cause, rule, attempt))
 
@@ -231,8 +243,11 @@ class Queue:
         price of per-operation connections and is paid here rather than by
         every caller.
         """
-        conn = db or self.db
-        row = conn.execute("SELECT state FROM messages WHERE id=?", (message,)).fetchone()
+        if db is None:
+            with self.connection() as conn:
+                self.move(message, to, cause, rule=rule, attempt=attempt, db=conn)
+            return
+        row = db.execute("SELECT state FROM messages WHERE id=?", (message,)).fetchone()
         if row is None:
             raise ForwardOnly(f"no message {message}")
         was = row["state"]
@@ -241,8 +256,8 @@ class Queue:
                 f"message {message} is `{was}` and cannot become `{to}`. States only move "
                 "forward — a store that moves backwards cannot be trusted as evidence, "
                 "and this store is what the last incident was reconstructed from.")
-        conn.execute("UPDATE messages SET state=? WHERE id=?", (to, message))
-        self._log(message, was, to, cause, rule, attempt, db=conn)
+        db.execute("UPDATE messages SET state=? WHERE id=?", (to, message))
+        self._log(message, was, to, cause, rule, attempt, db=db)
 
     def record_attempt(self, message: int, *, delivered: bool, detail: str,
                        consumes_attempt: bool = True) -> int:
@@ -256,8 +271,11 @@ class Queue:
         Returns the attempt count after this one, so a caller can see the bound
         it has reached without asking again and getting a second answer.
         """
-        with self._open() as db:                        # one unit of work
-            db.execute("BEGIN")
+        with self.connection() as db:                   # one unit of work
+            # Acquire the write lock before reading. Two retry passes can select
+            # the same row; a deferred transaction lets both read and makes one
+            # fail only when it later tries to write.
+            db.execute("BEGIN IMMEDIATE")
             row = db.execute(
                 "SELECT state, attempts FROM messages WHERE id=?", (message,)).fetchone()
             if row is None:
@@ -298,8 +316,33 @@ class Queue:
         A failed wake must never re-queue a delivered message — that conflation
         is what seeded 62 permanently-unmarked records from four bad moments.
         """
-        self.db.execute("INSERT INTO wakes (message, at, outcome, detail) VALUES (?,?,?,?)",
-                        (message, _now(), outcome, detail))
+        with self.connection() as db:
+            db.execute("INSERT INTO wakes (message, at, outcome, detail) VALUES (?,?,?,?)",
+                       (message, _now(), outcome, detail))
+
+    def record_wake_by_hub_id(self, hub_id: int | None, outcome: str,
+                              detail: str = "") -> None:
+        """Record a handoff result for a hub message, when it is still stored.
+
+        The wake table refers to the local row id. Delivery code deals in hub
+        ids, so resolving the id belongs at this boundary. A diagnostic must
+        never break delivery merely because a concurrent pass already retired
+        or migrated the row; in that case the wake remains useful without a
+        foreign-key link.
+        """
+        message = None
+        if hub_id is not None:
+            row = self._find(hub_id)
+            message = int(row["id"]) if row is not None else None
+        self.record_wake(message, outcome, detail)
+
+    def last_wake(self, *, successful: bool = False) -> sqlite3.Row | None:
+        """The latest recorded seat handoff, optionally only an accepted one."""
+        where = "WHERE outcome IN ('delivered','queued')" if successful else ""
+        with self.connection() as db:
+            return db.execute(
+                f"SELECT message, at, outcome, detail FROM wakes {where} ORDER BY id DESC LIMIT 1"
+            ).fetchone()
 
     # -- reading ------------------------------------------------------------
 
@@ -321,15 +364,17 @@ class Queue:
           backlog never arrives as a hundred live turns. The rest stay queued
           and the agent is told once that they exist.
         """
-        rows = self.db.execute(
-            "SELECT * FROM messages WHERE state=? ORDER BY seq DESC LIMIT ?",
-            (QUEUED, self.max_per_pass)).fetchall()
+        with self.connection() as db:
+            rows = db.execute(
+                "SELECT * FROM messages WHERE state=? ORDER BY seq DESC LIMIT ?",
+                (QUEUED, self.max_per_pass)).fetchall()
         return [r for r in rows if not self._too_old(r["received_at"])]
 
     def backlog(self) -> int:
         """How many are queued beyond what this pass will take."""
-        total = self.db.execute(
-            "SELECT COUNT(*) c FROM messages WHERE state=?", (QUEUED,)).fetchone()["c"]
+        with self.connection() as db:
+            total = db.execute(
+                "SELECT COUNT(*) c FROM messages WHERE state=?", (QUEUED,)).fetchone()["c"]
         return max(0, int(total) - self.max_per_pass)
 
     def retire(self) -> Retirement:
@@ -340,35 +385,40 @@ class Queue:
         stale message must not reach a session even once — demands it.
         """
         out = Retirement()
-        rows = self.db.execute(
-            "SELECT id, received_at, state FROM messages WHERE state IN (?,?,?)",
-            (RECEIVED, QUEUED, HELD)).fetchall()
-        for row in rows:
-            if not self._too_old(row["received_at"]):
-                continue
-            self.move(row["id"], EXPIRED,
-                      f"older than {self.max_age}", rule="max_age")
-            out.expired += 1
-            out.oldest = min(out.oldest or row["received_at"], row["received_at"])
-        abandoned = self.db.execute(
-            "SELECT id, received_at FROM messages WHERE state=?", (ABANDONED,)).fetchall()
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = db.execute(
+                "SELECT id, received_at, state FROM messages WHERE state IN (?,?,?)",
+                (RECEIVED, QUEUED, HELD)).fetchall()
+            for row in rows:
+                if not self._too_old(row["received_at"]):
+                    continue
+                self.move(row["id"], EXPIRED,
+                          f"older than {self.max_age}", rule="max_age", db=db)
+                out.expired += 1
+                out.oldest = min(out.oldest or row["received_at"], row["received_at"])
+            abandoned = db.execute(
+                "SELECT id, received_at FROM messages WHERE state=?", (ABANDONED,)).fetchall()
         out.abandoned = len(abandoned)
         for row in abandoned:
             out.oldest = min(out.oldest or row["received_at"], row["received_at"])
         return out
 
     def state_of(self, message: int) -> str:
-        return str(self.db.execute(
-            "SELECT state FROM messages WHERE id=?", (message,)).fetchone()["state"])
+        with self.connection() as db:
+            return str(db.execute(
+                "SELECT state FROM messages WHERE id=?", (message,)).fetchone()["state"])
 
     def history(self, message: int) -> list[sqlite3.Row]:
-        return self.db.execute(
-            "SELECT * FROM transitions WHERE message=? ORDER BY id", (message,)).fetchall()
+        with self.connection() as db:
+            return db.execute(
+                "SELECT * FROM transitions WHERE message=? ORDER BY id", (message,)).fetchall()
 
     def counts(self) -> dict[str, int]:
         """For `comms stats --json`: counts by state, for the estate to poll."""
-        return {r["state"]: int(r["n"]) for r in self.db.execute(
-            "SELECT state, COUNT(*) n FROM messages GROUP BY state")}
+        with self.connection() as db:
+            return {r["state"]: int(r["n"]) for r in db.execute(
+                "SELECT state, COUNT(*) n FROM messages GROUP BY state")}
 
 
 # -- the daemon's store, SQLite underneath -----------------------------------
@@ -418,7 +468,8 @@ class MessageStore(Queue):
         return self._side().load_position()
 
     def last_message_id(self) -> int:
-        row = self.db.execute("SELECT MAX(CAST(hub_id AS INTEGER)) m FROM messages").fetchone()
+        with self.connection() as db:
+            row = db.execute("SELECT MAX(CAST(hub_id AS INTEGER)) m FROM messages").fetchone()
         return int(row["m"] or 0)
 
     def record(self, level, message):
@@ -466,7 +517,8 @@ class MessageStore(Queue):
         )
 
     def _rows(self):
-        return self.db.execute("SELECT * FROM messages ORDER BY seq").fetchall()
+        with self.connection() as db:
+            return db.execute("SELECT * FROM messages ORDER BY seq").fetchall()
 
     def append(self, mention, held: bool = False) -> None:
         """Store one arrival. Idempotent on the hub id, as `receive` is.
@@ -489,8 +541,9 @@ class MessageStore(Queue):
                            permalink=mention.permalink,
                            received_at=datetime.fromtimestamp(
                                mention.timestamp, tz=timezone.utc).isoformat(timespec="seconds"))
-        self.db.execute("UPDATE messages SET channel=?, reason=?, received_at_epoch=? WHERE id=?",
-                        (mention.channel, mention.reason, mention.timestamp, mid))
+        with self.connection() as db:
+            db.execute("UPDATE messages SET channel=?, reason=?, received_at_epoch=? WHERE id=?",
+                       (mention.channel, mention.reason, mention.timestamp, mid))
         if self.state_of(mid) != RECEIVED:
             return
         if not mention.authorised:
@@ -499,8 +552,9 @@ class MessageStore(Queue):
             # Arrives already retired — an import, or a caller that has decided.
             # Honour it rather than queueing something nobody intends to deliver.
             self.move(mid, EXPIRED, mention.retired, rule="retired")
-            self.db.execute("UPDATE messages SET retired_reason=? WHERE id=?",
-                            (mention.retired, mid))
+            with self.connection() as db:
+                db.execute("UPDATE messages SET retired_reason=? WHERE id=?",
+                           (mention.retired, mid))
         elif held:
             self.move(mid, HELD, "delivery: hold — the agent asks for it", rule="delivery")
         elif mention.delivered:
@@ -519,10 +573,12 @@ class MessageStore(Queue):
         return [m for m in self.all() if not m.delivered]
 
     def _find(self, hub_id: int):
-        return self.db.execute("SELECT * FROM messages WHERE hub_id=?",
-                               (str(hub_id),)).fetchone()
+        with self.connection() as db:
+            return db.execute("SELECT * FROM messages WHERE hub_id=?",
+                              (str(hub_id),)).fetchone()
 
-    def attempt_by_hub_id(self, hub_id: int, detail: str) -> int:
+    def attempt_by_hub_id(self, hub_id: int, detail: str, *,
+                          consumes_attempt: bool = True) -> int:
         """Record a failed attempt for a HUB id, and return the count after it.
 
         `MessageStore` speaks hub ids to its callers and row ids to the store,
@@ -536,7 +592,8 @@ class MessageStore(Queue):
         row = self._find(hub_id)
         if row is None:
             return 0
-        return self.record_attempt(row["id"], delivered=False, detail=detail)
+        return self.record_attempt(row["id"], delivered=False, detail=detail,
+                                   consumes_attempt=consumes_attempt)
 
     def mark_delivered(self, message_id: int) -> bool:
         row = self._find(message_id)
@@ -560,7 +617,8 @@ class MessageStore(Queue):
         row = self._find(message_id)
         if row is None:
             return False
-        self.db.execute("UPDATE messages SET read_at=? WHERE id=?", (_now(), row["id"]))
+        with self.connection() as db:
+            db.execute("UPDATE messages SET read_at=? WHERE id=?", (_now(), row["id"]))
         if row["state"] == HELD:
             self.move(row["id"], RETRIEVED, "the agent asked for it", rule="delivery")
         return True
@@ -571,6 +629,6 @@ class MessageStore(Queue):
             return False
         if row["state"] in (RECEIVED, QUEUED, HELD):
             self.move(row["id"], EXPIRED, reason, rule="retired")
-        self.db.execute("UPDATE messages SET retired_reason=? WHERE id=?", (reason, row["id"]))
+        with self.connection() as db:
+            db.execute("UPDATE messages SET retired_reason=? WHERE id=?", (reason, row["id"]))
         return True
-

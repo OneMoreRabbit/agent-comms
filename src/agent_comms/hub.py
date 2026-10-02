@@ -435,7 +435,7 @@ class Hub:
         return sorted(by_name.get(n, n) for n in self.channel_roster())
 
     def messages_after(self, message_id: int, limit: int = 200) -> list[dict]:
-        """Every message in this channel after `message_id`, oldest first.
+        """Up to `limit` visible messages after `message_id`, oldest first.
 
         **The durable half of receiving.** An event queue is a doorbell: Zulip
         discards it after a period of inactivity and there is no id-based
@@ -453,6 +453,11 @@ class Hub:
         seat, event id 44 and message id 1292 at the same moment — and confusing
         them would anchor a backfill twelve hundred messages into the past.
         """
+        # No channel narrow. The event queue is deliberately un-narrowed and a
+        # bot can receive mentions in every channel it is subscribed to. The
+        # old history query named only this seat's home channel, so a restart
+        # could never recover cross-project mentions even though the live queue
+        # would have delivered them.
         result = self._t.call_endpoint(
             url="messages",
             method="GET",
@@ -460,14 +465,18 @@ class Hub:
                 "anchor": message_id,
                 "num_before": 0,
                 "num_after": limit,
-                "narrow": json.dumps([{"operator": "channel", "operand": self._settings.channel}]),
                 "apply_markdown": "false",
             },
         )
-        messages = result.get("messages") or []
-        # `anchor` is inclusive, so the anchor message itself comes back. Drop it:
-        # we have already handled it, and re-handling would re-notify the agent.
-        return [m for m in messages if m.get("id", 0) > message_id]
+        # `anchor` is inclusive. One bounded read keeps startup recovery
+        # simple; an outage with more than `limit` visible messages may leave a
+        # later gap, which is an explicit operational bound rather than an
+        # unbounded startup scan.
+        return sorted(
+            [m for m in (result.get("messages") or [])
+             if int(m.get("id", 0)) > message_id],
+            key=lambda m: int(m.get("id", 0)),
+        )
 
 
     def send(self, channel: str, topic: str, content: str) -> dict:

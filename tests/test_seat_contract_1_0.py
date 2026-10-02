@@ -143,6 +143,23 @@ def test_a_failed_attempt_at_exit_10_is_retried(monkeypatch):
     assert seat_app.deliver("body").retryable
 
 
+def test_codex_capacity_refusal_is_identified_narrowly(monkeypatch):
+    """Seat 2.9-draft has no status word for this yet, so pin its exact response.
+
+    A different Codex failure must retain the ordinary attempt bound.
+    """
+    prefix = seat_app.CODEX_QUEUE_FULL_PREFIX
+    fake_seat(monkeypatch, {
+        "success": False, "status": "failed", "runtime": "codex",
+        "message": prefix + "thread-1: 3 pending (maximum 3); message was not handed off."
+    }, code=10)
+    assert seat_app.deliver("body").at_capacity
+
+    other = Delivery(False, "failed", "codex would not take the message: bad thread",
+                     "codex", exit_code=10)
+    assert not other.at_capacity
+
+
 # -- the limits the contract states ------------------------------------------
 
 def test_an_oversized_body_fails_and_is_never_truncated(monkeypatch):
@@ -296,6 +313,35 @@ def test_a_permanently_failing_message_stops_being_retried(seat, monkeypatch):
     events = (seat / ".comms" / "events.log").read_text()
     assert "no longer being retried" in events
     assert "still" in events and "comms inbox" in events, "and it must say where it went"
+
+
+def test_a_full_codex_queue_does_not_consume_delivery_attempts(seat, monkeypatch):
+    """Capacity is backpressure, not three failed deliveries.
+
+    Keep a live Comms message and try it again after Codex drains. The normal
+    age and per-pass bounds still govern how long and how many remain live.
+    """
+    from agent_comms.store import Mention
+
+    store = operations.message_store(seat / ".comms")
+    store.append(Mention(id=31, sender="agent-eco-arch", channel="agent-eco", topic="t",
+                         content="x", timestamp=NOW, permalink="", reason="mentioned"))
+    full = seat_app.CODEX_QUEUE_FULL_PREFIX + (
+        "thread-1: 3 pending (maximum 3); message was not handed off. "
+        "Retry after pending messages are consumed.")
+    fake_seat(monkeypatch, {"success": False, "status": "failed",
+                            "runtime": "codex", "message": full}, code=10)
+
+    for _ in range(5):
+        assert operations.retry_undelivered() == 0
+    waiting = store.undelivered()
+    assert [m.id for m in waiting] == [31]
+    assert waiting[0].attempts == 0
+
+    fake_seat(monkeypatch, {"success": True, "status": "queued", "runtime": "codex",
+                            "message": "queued to codex conversation thread-1"}, code=0)
+    assert operations.retry_undelivered() == 1
+    assert store.undelivered() == []
 
 
 def test_a_pre_1_0_seat_is_refused_loudly(monkeypatch):
@@ -792,15 +838,15 @@ def test_a_message_settled_by_another_pass_does_not_stop_this_one(seat, monkeypa
                             "message": "typed into the claude session"}, code=0)
 
     # The first message is the one another pass already settled.
-    real = operations.MessageStore.attempt_by_hub_id
+    real = operations.MessageStore.mark_delivered
 
-    def racing(self, hub_id, detail):
+    def racing(self, hub_id):
         if hub_id == 700:
             raise ForwardOnly(f"message {hub_id} is `delivered` and cannot become "
                               "`abandoned`")
-        return real(self, hub_id, detail)
+        return real(self, hub_id)
 
-    monkeypatch.setattr(operations.MessageStore, "attempt_by_hub_id", racing)
+    monkeypatch.setattr(operations.MessageStore, "mark_delivered", racing)
 
     landed = operations.retry_undelivered(transport_factory=lambda c: FakeTransport())
 
@@ -810,6 +856,23 @@ def test_a_message_settled_by_another_pass_does_not_stop_this_one(seat, monkeypa
     # having delivered it. In the real race the winning pass delivered it, which
     # is exactly why the store refused to move it.
     assert [m.id for m in store.undelivered()] == [700]
+
+
+def test_a_successful_retry_consumes_exactly_one_attempt(seat, monkeypatch):
+    """A live-seat probe found one accepted handoff counted as two attempts."""
+    from agent_comms.store import Mention
+
+    store = operations.message_store(seat / ".comms")
+    store.append(Mention(id=702, sender="agent-eco-arch", channel="agent-eco",
+                         topic="t", content="x", timestamp=NOW, permalink="",
+                         reason="mentioned"))
+    fake_seat(monkeypatch, {"success": True, "status": "delivered",
+                            "message": "typed into the claude session"}, code=0)
+
+    assert operations.retry_undelivered() == 1
+    row = store._find(702)
+    assert row["state"] == "delivered"
+    assert row["attempts"] == 1
 
 
 def test_the_daemon_survives_anything_a_retry_pass_can_raise(seat, monkeypatch):

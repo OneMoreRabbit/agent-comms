@@ -37,6 +37,12 @@ CONFLICTED = "conflicted"         # exit 20 — several sessions could be it; it
 #: The seat's body limit (contract: 65536 bytes, never silently truncated).
 MAX_BODY_BYTES = 65536
 
+# Seat 2.9-draft introduced bounded Codex admission before it introduced a
+# distinct machine status for that refusal. This is the exact sentence emitted
+# by the deployed 2.9 helper. Keep the compatibility check narrow: other
+# `failed`/10 answers are real attempts and retain the normal attempt bound.
+CODEX_QUEUE_FULL_PREFIX = "codex would not take the message: Codex queue full for "
+
 #: Which outcomes are worth trying again, and which are not. This is the retry
 #: decision the operator ruled is ours: the queue is this client's, so the seat's
 #: exit status is an INPUT here, not merely a report for a human.
@@ -173,6 +179,21 @@ class Delivery:
         fix it.
         """
         return self.status in (BROKEN, CONFLICTED)
+
+    @property
+    def at_capacity(self) -> bool:
+        """The Codex conversation refused admission because its queue is full.
+
+        Nothing was handed off, so this does not consume a delivery attempt.
+        The message remains subject to the normal age and backlog bounds.
+
+        Seat 2.9-draft exposes this only in its response sentence. This one
+        deliberately pinned compatibility check can be removed when the Seat
+        contract publishes a distinct status or field.
+        """
+        return (not self.success and self.runtime == "codex" and
+                self.status == FAILED and self.exit_code == 10 and
+                self.message[:len(CODEX_QUEUE_FULL_PREFIX)] == CODEX_QUEUE_FULL_PREFIX)
 
     def summary(self) -> str:
         """One line for a log or a sender, in the seat's own words where it has them."""

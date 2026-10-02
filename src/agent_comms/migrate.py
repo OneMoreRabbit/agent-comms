@@ -89,10 +89,12 @@ def import_jsonl(source: Path, queue: Queue) -> Imported:
         # bound treats the whole imported history as ancient. That is the
         # epoch-1970 fixture trap (catalogue 0.55) arriving in production data
         # rather than in test data.
-        queue.db.execute(
-            "UPDATE messages SET received_at_epoch=?, channel=?, reason=? WHERE id=?",
-            (int(when) if isinstance(when, (int, float)) else 0,
-             str(old.get("channel") or ""), str(old.get("reason") or "mentioned"), message))
+        with queue.connection() as db:
+            db.execute(
+                "UPDATE messages SET received_at_epoch=?, channel=?, reason=? WHERE id=?",
+                (int(when) if isinstance(when, (int, float)) else 0,
+                 str(old.get("channel") or ""),
+                 str(old.get("reason") or "mentioned"), message))
 
         if queue.state_of(message) != RECEIVED:
             continue                                  # already imported
