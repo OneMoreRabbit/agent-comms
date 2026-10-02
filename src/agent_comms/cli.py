@@ -220,13 +220,13 @@ def wake(message_id: int | None) -> None:
 @main.command()
 @click.option("--once", is_flag=True, help="One poll cycle, then exit. For testing.")
 @click.option("--detach", is_flag=True,
-              help="Run in the background, surviving the shell that started it.")
+              help="Run supervised in the background, surviving the shell that started it.")
 @click.option("--supervise", is_flag=True,
               help="Run in the foreground and restart the daemon if it exits.")
 @click.option("--stop", is_flag=True,
               help="Stop this seat's daemon and wait until its lock is free.")
 @click.option("--restart", is_flag=True,
-              help="Stop it if running, then start a fresh detached one.")
+              help="Stop it if running, then start a fresh supervised background daemon.")
 @click.option("--log", type=click.Path(), default=None,
               help="Where a detached daemon's stdout/stderr go (default ~/.comms/daemon.out).")
 def daemon(once: bool, detach: bool, supervise: bool, stop: bool, restart: bool,
@@ -246,9 +246,9 @@ def daemon(once: bool, detach: bool, supervise: bool, stop: bool, restart: bool,
     (bad credential, comms disabled, two wake triggers) rather than crash-looping
     over the reason.
 
-    **--detach is not supervision, and neither is --restart.** Both survive the
-    shell that started them; neither survives a container restart or a kill.
-    --restart saves the operator a two-step by hand, no more.
+    **--detach and --restart supervise daemon crashes in the background.** They
+    survive the shell that started them, but not a container or host restart;
+    the host-side unit remains the durable first-start mechanism.
 
     The daemon --restart starts is always **detached**, whatever the old one ran
     under. How a daemon is hosted is declared by whoever starts it, so this does
@@ -277,7 +277,8 @@ def daemon(once: bool, detach: bool, supervise: bool, stop: bool, restart: bool,
     if restart:
         replaced, pid = operations.restart_daemon(log)
         was = "restarted" if replaced else "started (nothing was running)"
-        click.echo(f"daemon {was}, pid {pid}, detached. Check it with: comms status")
+        click.echo(f"daemon {was}, pid {pid}, supervised in the background. "
+                   "Check it with: comms status")
         return
 
     if supervise:
@@ -287,7 +288,8 @@ def daemon(once: bool, detach: bool, supervise: bool, stop: bool, restart: bool,
 
     if detach:
         pid = operations.detach_daemon(log)
-        click.echo(f"daemon detached, pid {pid}. Check it with: comms status")
+        click.echo(f"daemon supervised in the background, pid {pid}. "
+                   "Check it with: comms status")
         return
     stored = operations.run_daemon(max_iterations=1 if once else None)
     click.echo(f"stored {stored} mention(s)")

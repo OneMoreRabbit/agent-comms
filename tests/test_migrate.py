@@ -71,7 +71,8 @@ def test_a_delivered_message_carries_its_attempt(tmp_path):
     import_jsonl(src, q)
 
     assert q.state_of(1) == DELIVERED
-    assert q.db.execute("SELECT attempts FROM messages WHERE id=1").fetchone()["attempts"] == 1
+    with q.connection() as db:
+        assert db.execute("SELECT attempts FROM messages WHERE id=1").fetchone()["attempts"] == 1
 
 
 def test_running_it_twice_changes_nothing(tmp_path):
@@ -115,7 +116,8 @@ def test_the_import_carries_the_timestamp_and_channel(tmp_path):
     q = Queue(tmp_path / "comms.db")
     import_jsonl(src, q)
 
-    row = q.db.execute("SELECT received_at_epoch, channel FROM messages WHERE id=1").fetchone()
+    with q.connection() as db:
+        row = db.execute("SELECT received_at_epoch, channel FROM messages WHERE id=1").fetchone()
     assert row["received_at_epoch"] == 1_760_000_000
     assert row["channel"] == "agent-eco"
 

@@ -62,21 +62,29 @@ def my_slugs(explicit: str | None) -> list[str]:
     if explicit:
         return [s.strip() for s in explicit.split(",") if s.strip()]
     c = conf(REPO / ".atlas.conf")
-    slugs = [c["SLUG"]] if c.get("SLUG") else []
+    first = c.get("COMPONENT") or c.get("SLUG")
+    slugs = [first] if first else []
     # a seat holding N wired repos answers to all of them (launch-dir siblings, 1.21)
     launch = c.get("ATLAS_LAUNCH_DIR", "").replace("$HOME", str(HOME))
     if launch and Path(launch).is_dir():
         for d in Path(launch).iterdir():
-            s = conf(d / ".atlas.conf").get("SLUG")
+            sc = conf(d / ".atlas.conf")
+            s = sc.get("COMPONENT") or sc.get("SLUG")
             if s and s not in slugs:
                 slugs.append(s)
     # a both-hats seat is ALSO its vault's arch: answer to `arch` and `<project>-arch`
     # (1.27.5; ATLAS_PROJECT in .atlas.conf, else nothing project-specific is assumed)
+    pj = c.get("ATLAS_PROJECT", "").strip().lower()
+    # full contract addresses (ADR-0014, 1.30.3): <project>.component.<name> for each
+    # held component; the older bare and qualified forms stay accepted through the
+    # migration (the register carries both estates for a while).
+    if pj:
+        slugs += [f"{pj}.component.{s}" for s in list(slugs)]
     if c.get("ATLAS_ROLE", "").strip().lower() == "both":
         slugs.append("arch")
-        pj = c.get("ATLAS_PROJECT", "").strip().lower()
         if pj:
             slugs.append(f"{pj}-arch")
+            slugs.append(f"{pj}.arch")
     # Operator override (1.28.6, arc-platform v0.2): AUTHORITATIVE when present — it
     # REPLACES the derived list. It was additive-only, so it could widen a match but
     # never narrow one, and a seat told to fix a mis-match by setting it found the file
@@ -99,14 +107,19 @@ def token_for(url: str) -> str | None:
     m = re.match(r"https?://([^/]+)", url)
     if not m:
         return None
-    try:
-        out = subprocess.run(["git", "credential", "fill"], input=f"protocol=https\nhost={m.group(1)}\n\n",
-                             capture_output=True, text=True, timeout=10).stdout
-        for line in out.splitlines():
-            if line.startswith("password="):
-                return line[len("password="):]
-    except (OSError, subprocess.SubprocessError):
-        pass
+    hosts = [m.group(1)]
+    if m.group(1) == "api.github.com":
+        hosts.append("github.com")   # a seat holding only the base-host credential is
+                                     # normal (1.30.11): fall back rather than go tokenless
+    for host in hosts:
+        try:
+            out = subprocess.run(["git", "credential", "fill"], input=f"protocol=https\nhost={host}\n\n",
+                                 capture_output=True, text=True, timeout=10).stdout
+            for line in out.splitlines():
+                if line.startswith("password="):
+                    return line[len("password="):]
+        except (OSError, subprocess.SubprocessError):
+            pass
     return os.environ.get("GITHUB_TOKEN")
 
 
@@ -144,7 +157,12 @@ def refresh(explicit_slugs: str | None) -> int:
         # Never render a failed fetch as fresh (1.28.2, AgentEco): stamp the EXISTING file
         # so --show and the briefing say the data is stale and why, rather than serving an
         # hours-old "nothing open" as current. Continue degraded; declare it.
-        print(f"atlas-needs: refresh failed ({e}); keeping the existing file, marked stale",
+        hint = ""
+        if "404" in str(e) and not token_for(url):
+            hint = (" — NO CREDENTIAL resolved for this URL's host: to GitHub, a private "
+                    "file without a token IS a 404, so this likely means missing "
+                    "credential, not missing register (1.30.11)")
+        print(f"atlas-needs: refresh failed ({e}){hint}; keeping the existing file, marked stale",
               file=sys.stderr)
         if OUT.exists():
             body = OUT.read_text(encoding="utf-8")
