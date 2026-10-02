@@ -26,7 +26,7 @@ from typing import Callable, Collection
 from .config import Credential, Settings, load_credential, load_settings
 from .directory import Directory
 from .directory import load as load_directory
-from . import config_sync
+from . import addressable, config_sync
 from .errors import (
     ChannelNotReachable,
     CommsDisabled,
@@ -926,6 +926,11 @@ def may_write_to(hub: Hub, agent: str, sender: str, sender_fqn: str, state_dir) 
     in_project, is_human = hub.in_channel(sender)
     if is_human:
         return True
+    # An agent with an authored partners list accepts only canonical FQNs from
+    # that list. If a bot could not be resolved, channel membership must not
+    # widen the list by admitting its display name.
+    if agent_partners(agent, state_dir) is not None:
+        return False
     return in_project
 
 
@@ -1032,7 +1037,8 @@ def mention_from_event(
     event: dict,
     settings: Settings,
     own_email: str | None = None,
-    permitted: Callable[[str], bool] | None = None,
+    permitted: Callable[[str, str], bool] | None = None,
+    sender_resolver: Callable[[str, str], str] | None = None,
 ) -> Mention | None:
     """Turn a Zulip message event into a stored mention, or None if not for us."""
     if event.get("type") != "message":
@@ -1042,21 +1048,26 @@ def mention_from_event(
     reason = addressed_to_seat(settings, msg, event.get("flags") or [], own_email, serves)
     if reason is None:
         return None
+    agent = addressed_agent(msg.get("subject") or "", serves,
+                            body=msg.get("content") or "")
+    sender = msg.get("sender_full_name") or msg.get("sender_email", "unknown")
+    sender_fqn = envelope_sender(msg.get("content") or "")
+    if not sender_fqn and sender_resolver is not None:
+        sender_fqn = sender_resolver(sender, agent)
     return Mention(
         id=msg["id"],
-        sender=msg.get("sender_full_name") or msg.get("sender_email", "unknown"),
+        sender=sender,
         channel=msg.get("display_recipient") if isinstance(msg.get("display_recipient"), str) else "",
         topic=msg.get("subject") or "",
-        agent=addressed_agent(msg.get("subject") or "", serves,
-                              body=msg.get("content") or ""),
-        sender_fqn=envelope_sender(msg.get("content") or ""),
+        agent=agent,
+        sender_fqn=sender_fqn,
         content=msg.get("content") or "",
         timestamp=msg.get("timestamp", 0),
         permalink=_permalink(site, msg),
         reason=reason,
         authorised=(
             True if permitted is None
-            else permitted(msg.get("sender_full_name") or msg.get("sender_email", ""))
+            else permitted(sender, sender_fqn)
         ),
     )
 
@@ -1588,12 +1599,10 @@ def envelope_from_body(content: str) -> str:
 def envelope_sender(content: str) -> str:
     """The FQN the message came FROM, from the marker. Empty if unmarked.
 
-    **Policy compares FQN to FQN, never display names.** A hub bot name cannot
-    be turned into an FQN: the directory recognises `test-codex` and
-    `agent-eco-test-codex` alike and returns `canonical_id: null` for both,
-    because the answer is `not-registered` (known name, no announced slot).
-    So the only FQN for a sender is the one the sender states, and it states
-    it here.
+    **Policy compares FQN to FQN, never display names.** Current senders state
+    their FQN here. For older or malformed messages that omit it, the receive
+    path asks the directory's addressable surface for the exact bot-to-FQN
+    mapping before it applies policy.
 
     Matching display names instead is what this replaces, and it was a bypass
     twice over: `short_name` splits on dots, so a bot arriving as
@@ -2030,7 +2039,8 @@ def _refuse_sender(
     """
     store.record(
         "warn",
-        f"refused message {mention.id} from {mention.sender!r}: "
+        f"refused message {mention.id} from "
+        f"{(mention.sender_fqn or mention.sender)!r}: "
         f"{why_refused(mention, settings.state_dir)}",
     )
     key = mention.sender.strip().casefold()
@@ -2520,7 +2530,7 @@ def run_daemon(
             # state machine.
             undetermined = False
 
-            def _permitted(name: str) -> bool:
+            def _permitted(name: str, sender_fqn: str) -> bool:
                 nonlocal undetermined
                 # **This seat is always permitted to address its own agents.**
                 # A sibling message never crosses a trust boundary: it is this
@@ -2540,8 +2550,6 @@ def run_daemon(
                     (event.get("message") or {}).get("subject") or "",
                     config_sync.agent_set(settings.state_dir),
                     body=(event.get("message") or {}).get("content") or "")
-                sender_fqn = envelope_sender(
-                    (event.get("message") or {}).get("content") or "")
                 try:
                     # **One decision, from the directory.** No seat file is
                     # consulted: comms 2.x carries none.
@@ -2557,9 +2565,23 @@ def run_daemon(
                     )
                     return False
 
+            def _sender_fqn(name: str, agent: str) -> str:
+                if agent_partners(agent, settings.state_dir) is None:
+                    return ""
+                try:
+                    return addressable.fqn_for_bot(name)
+                except Exception as exc:  # noqa: BLE001 - refuse, do not die
+                    store.record(
+                        "warn",
+                        f"could not resolve hub sender {name!r} to an agent FQN "
+                        f"({exc}); an authored partners list will refuse this bot",
+                    )
+                    return ""
+
             mention = mention_from_event(
                 credential.site, event, settings, credential.email,
                 permitted=_permitted,
+                sender_resolver=_sender_fqn,
             )
             if mention is None:
                 return False
