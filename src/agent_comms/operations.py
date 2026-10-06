@@ -787,9 +787,11 @@ class SenderUnknown(CommsError):
 
 
 def _is_full_fqn(value: str) -> bool:
-    """Whether *value* has the estate.project.agent FQN shape."""
-    parts = value.split(".")  # gate-exempt: SHAPE VALIDATION only; no identity is inferred
-    return len(parts) == 3 and all(parts)
+    """Whether *value* has the canonical estate.project.agent FQN syntax."""
+    # Directory contract 0.2: exactly three non-empty segments containing only
+    # lowercase letters, digits and hyphens. Shape validation only; no identity
+    # or route is inferred from any segment.
+    return re.fullmatch(r"[a-z0-9-]+(?:\.[a-z0-9-]+){2}", value) is not None
 
 
 def sending_agent(explicit: str, state_dir: Path) -> str:
@@ -1227,7 +1229,8 @@ def send(
 
     **The protocol is one line: both ends are FQNs, and the directory resolves
     them.** `--to` is required and carries the recipient AGENT's FQN — a bare
-    name resolves to `unknown` and is refused. The topic becomes
+    name is refused before lookup; an FQN-shaped alias is refused when its
+    canonical id differs. The topic becomes
     `<recipient>: <subject>` and the body is prefixed with a real mention of the
     recipient's seat bot, so both of the two routes a recipient matches on are
     covered without the sender knowing which.
@@ -1244,7 +1247,7 @@ def send(
     sender saying "this is an address", so there is nothing to infer. See
     `unreachable_mentions`.
 
-    The named seat is checked against the hub before anything is posted: it must
+    The named agent's route is checked against the hub before anything is posted: it must
     exist in the realm and be subscribed to this channel. A message to a seat
     that cannot be reached from here is refused loudly rather than posted into
     the void — which is the failure that started this, and which looks exactly
@@ -1261,7 +1264,14 @@ def send(
             "in the text reaches nobody."
         )
 
-    recipient = to.lstrip("@").strip("*").strip()
+    recipient = to.strip()
+    if not _is_full_fqn(recipient):
+        raise UnknownRecipient(
+            f"--to {recipient!r} is not a full agent FQN. Nothing was posted. "
+            "Address the recipient by its exact estate.project.agent FQN; aliases, "
+            "short names, hub bot names and mention syntax are not addresses, and "
+            "comms does not ask the directory to expand them."
+        )
     if not topic:
         if not subject:
             raise Unaddressed(
@@ -1273,85 +1283,33 @@ def send(
     credential = load_credential(settings.identity)
     hub = Hub(transport_factory(credential), settings, credential)
 
-    # **Resolve first, and only fall back to a seat name.** Until 2026-09-25
-    # this went straight to `_resolve_recipient`, a hub seat-name lookup, so
-    # R7/R10/R15 were built, tested, green and NOT CONNECTED: an FQN was
-    # refused as an unknown seat while `comms resolve` answered `resolved` for
-    # the same name in the same second. Found by running UC-02, not by reading
-    # the code — a suite that cannot fail on an unwired component is not
-    # evidence about wiring.
+    # **Resolve the exact FQN and never fall back to a name.** A bot is a seat's
+    # mailbox and an alias is directory convenience; neither is an address.
+    # `_route` also checks that the directory returned this exact canonical FQN,
+    # so an FQN-shaped alias cannot enter through the syntax gate above.
     routed = _route(settings, recipient, caller=sender)
-    if routed is not None:
-        # **The derived bot must be an account the hub actually has.**
-        # R15 derives `bot` from the FQN's agent segment, which assumes one hub
-        # identity PER AGENT. The deployed hub has one per SEAT. Measured
-        # 2026-09-25: `bakehouse.agent-eco.test-claude-new001` derives
-        # `test-claude-new001`, which is not an account, so the post mentioned
-        # nobody — posted, `sent` reported, read by no one. A successful
-        # delivery to the wrong audience, which is the thing nobody notices.
-        #
-        # So this checks before posting and refuses loudly. It does NOT guess a
-        # substitute: falling back to the seat's bot would deliver to the seat's
-        # default agent while the caller named a different one, which is the
-        # same silent-wrong-recipient failure wearing a helpful face.
-        # EXISTENCE, not reachability: a cross-project recipient's bot is
-        # legitimately outside this seat's channel, and `require_reachable`
-        # below is what judges the channel.
-        if not hub.in_realm(routed.bot):
-            raise UnknownRecipient(
-                f"'{recipient}' resolves to {routed.fqn}, whose declared transport "
-                f"names the hub identity '{routed.bot}' — and the hub has no such "
-                f"account.\n"
-                "  Nothing was posted. A message mentioning an account that does not "
-                "exist reaches nobody while reporting success.\n"
-                "  The bot comes from the directory's `transports.comms` block for "
-                "this agent, and nothing is derived from the FQN — derivation was "
-                "removed on 2026-09-25 because it named accounts that do not exist. "
-                "So either the hub account is missing, or the directory declares the "
-                "wrong bot for this agent.")
-        recipient, channel = routed.bot, channel or routed.channel
-    else:
-        # **A human has no FQN; a bot is not an address.**
-        #
-        # The directory could not resolve this name, so there is no FQN to
-        # address. Two very different cases hide behind that:
-        #
-        # - a **human**. Humans are not agents and never will be, so there is
-        #   nothing to resolve and the hub display name IS the address. The
-        #   message carries a `from:` and no `to:`, truthfully.
-        # - a **bot**. A bot is a SEAT's mailbox, not an agent, so addressing
-        #   one asks comms to deliver to a machine rather than to anybody. It
-        #   is refused: the agent on that seat is addressed by its FQN, and if
-        #   the directory does not know it, that is the fact to fix.
-        _, is_human = hub.in_channel(recipient)
-        if not is_human:
-            # **The near-misses belong here too.** This gate was added in front
-            # of `_resolve_recipient`, and `_directory_hint` — the "did you
-            # mean" that `comms resolve` prints — lives behind it. So from
-            # 2026-09-25 to 2026-09-27 the same name got an actionable answer
-            # from `resolve` and a dead end from `send`: two surfaces, one
-            # directory, different amounts of help at the moment it is needed.
-            # Measured on UC-02 step 4 (`--to arch`).
-            hint = _directory_hint(recipient, caller=sender)
-            raise UnknownRecipient(
-                f"'{recipient}' is not an agent the directory can resolve, and it is "
-                f"not a human.\n"
-                "  Nothing was posted. A message is from an agent to an agent; a bot "
-                "is a SEAT's mailbox, not an address, so delivering to one would "
-                "deliver to a machine rather than to anybody.\n"
-                "  Address the agent by its FQN (estate.project.agent). If the "
-                "directory does not know it, it has no announced slot yet — that is "
-                "the thing to fix, not the address to work around."
-                + (f"\n  {hint}" if hint else ""))
-        recipient = _resolve_recipient(settings, hub, recipient, caller=sender)
-        channel = channel or settings.channel
+    # **The declared bot must be an account the hub actually has.** Existence,
+    # not reachability: a cross-project recipient's bot may legitimately be
+    # outside this seat's home channel, and `require_reachable` judges the
+    # selected channel below.
+    if not hub.in_realm(routed.bot):
+        raise UnknownRecipient(
+            f"'{recipient}' resolves to {routed.fqn}, whose declared transport "
+            f"names the hub identity '{routed.bot}' — and the hub has no such "
+            f"account.\n"
+            "  Nothing was posted. A message mentioning an account that does not "
+            "exist reaches nobody while reporting success.\n"
+            "  The bot comes from the directory's `transports.comms` block for "
+            "this agent, and nothing is derived from the FQN. So either the hub "
+            "account is missing, or the directory declares the wrong bot.")
+    recipient, channel = routed.bot, channel or routed.channel
 
     require_reachable(hub, channel)
 
     warnings = _mention_warnings(hub, content, channel)
     response = hub.send(channel, topic,
                         addressed(recipient, content,
-                                  to_fqn=routed.fqn if routed is not None else "",
+                                  to_fqn=routed.fqn,
                                   from_fqn=sender))
     return Posted(response=response, warnings=warnings)
 
@@ -1367,24 +1325,21 @@ class Routed:
 
 
 def _route(settings: Settings, name: str, caller: str = "", **kw):
-    """Ask the directory where a name goes. `None` means 'not an estate name'.
+    """Ask the directory where an exact FQN goes, or refuse.
 
     Three things happen here that used not to happen at all:
 
-    1. **The name is resolved** against the directory (R7), so an FQN or an
-       authored alias addresses an AGENT rather than being mistaken for a seat.
+    1. **The FQN is resolved** against the directory (R7), and the returned
+       canonical id must be byte-for-byte the requested FQN. Aliases are not
+       accepted on `--to`, even when they happen to be FQN-shaped.
     2. **The delivery mode is honoured at send** (R10) — `none` refuses here,
        and a value outside `inject | hold | none` refuses with the value
        quoted. Comms is the only component that ever reads this field.
     3. **The transport is derived from the FQN** (R15) — project is the
        channel, agent is the bot — with a declared override taking precedence.
 
-    Returning `None` for a name the directory does not know is deliberate: a
-    bare seat name is still a legitimate address between seats, and this must
-    add a capability without removing one. But a name the directory REFUSES is
-    an error we raise, not a seat name to try next — falling through would turn
-    'you may not address that' into 'no such seat', which is the wrong-cause
-    class.
+    There is no fallback to a seat, bot, human or alias. Delivery is agent FQN
+    to agent FQN at both ends.
     """
     from .delivery import NotDeliverable, permitted_to_send, plan, transport_for
     from .resolve import Resolver
@@ -1402,13 +1357,18 @@ def _route(settings: Settings, name: str, caller: str = "", **kw):
             # seat", which is the wrong-cause class this change exists to fix.
             raise UnknownRecipient(
                 f"'{name}' is not permitted: {answer.message or 'no reason given'}")
-        # Anything else — `unknown` (not an estate name) or `not-registered`
-        # (known, no route yet) — means the DIRECTORY cannot route it, not that
-        # the message cannot be sent. A bare seat name is still a legitimate
-        # address between seats, and most estate agents have no announced slot
-        # today: refusing here would break every send that works now. Add a
-        # capability without removing one.
-        return None
+        raise UnknownRecipient(
+            f"--to {name!r} is not an exact routable agent FQN: "
+            f"{answer.message or answer.status}. Nothing was posted. Aliases, bot "
+            "names and short names are not addresses."
+        )
+
+    if answer.canonical_id != name:
+        raise UnknownRecipient(
+            f"--to {name!r} resolved to canonical FQN {answer.canonical_id!r}. "
+            "Nothing was posted. An alias is not an address; pass the exact "
+            "canonical estate.project.agent FQN."
+        )
 
     allowed, why = permitted_to_send(answer.delivery or "inject")
     if not allowed:
@@ -1614,8 +1574,8 @@ def envelope_sender(content: str) -> str:
     m = ENVELOPE.match((content or "").lstrip())
     claimed = (m.group(1) or "").strip() if m else ""
     # A legacy client could put its bot/display name in this slot. That is not
-    # an agent identity, so treat it exactly like an absent claim and let the
-    # receiver resolve the hub-vouched bot through the directory.
+    # an agent identity, so treat it exactly like an absent claim. The receive
+    # path ignores both forms and performs no bot-to-FQN lookup.
     return claimed if _is_full_fqn(claimed) else ""
 
 

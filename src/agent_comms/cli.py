@@ -149,8 +149,8 @@ def _say_sent(posted, word: str = "sent") -> None:
 @main.command()
 @click.option("--to", required=True,
               help="The FQN of the AGENT this message is for — "
-                   "estate.project.agent. A bare name is not an address: the "
-                   "directory answers `unknown` for it and the send is refused.")
+                   "estate.project.agent, exactly. Aliases, short names, bot "
+                   "names and mention syntax are refused before lookup.")
 @click.option("--subject", default=None, help="Subject; the topic becomes '<to>: <subject>'.")
 @click.option("--topic", default=None,
               help="Continue an existing topic instead of starting one. Still needs --to.")
@@ -170,10 +170,10 @@ def send(to: str, subject: str | None, topic: str | None, from_fqn: str,
     recipient's seat bot — both routes a recipient matches on, so it does not
     matter which.
 
-    **A bare name is not an address.** `--to agent-skeleton` resolves to
-    `unknown` at the directory and the send is refused rather than posted. The
-    directory is read, never pattern-matched: nothing here builds an identifier
-    out of parts or guesses among candidates.
+    **Only an exact FQN is an address.** `--to agent-skeleton`, aliases, bot
+    names and mention syntax are refused before directory lookup. Even an
+    FQN-shaped alias is refused when the directory returns a different canonical
+    id. Nothing here builds an identifier out of parts or guesses candidates.
 
     The body is never rewritten: a name typed in prose is prose, and addressing
     travels in the flag, not the text. It IS read for one thing — an explicit

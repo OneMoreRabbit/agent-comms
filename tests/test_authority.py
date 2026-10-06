@@ -331,25 +331,44 @@ def test_send_addresses_an_FQN_and_mentions_the_SEATS_bot(seat):
     )
 
 
-def test_zulip_syntax_in_to_is_accepted_and_normalised(seat):
+def test_zulip_syntax_in_to_is_refused_without_a_post(seat):
     from agent_comms import operations
+    from agent_comms.operations import UnknownRecipient
     from tests.conftest import FakeTransport
 
     transport = FakeTransport()
-    operations.send("hi", to="@**bakehouse.agent-eco.agent-skeleton**", subject="s",
-                    transport_factory=lambda c: transport, from_fqn="bakehouse.agent-eco.agent-comms")
-    assert transport.sent[-1]["content"].startswith("@**agent-skeleton** ")
+    with pytest.raises(UnknownRecipient, match="mention syntax"):
+        operations.send("hi", to="@**bakehouse.agent-eco.agent-skeleton**", subject="s",
+                        transport_factory=lambda c: transport,
+                        from_fqn="bakehouse.agent-eco.agent-comms")
+    assert transport.sent == []
 
 
-def test_the_recipient_is_matched_case_insensitively(seat):
-    """A seat should not have to know the hub's capitalisation; the mention must."""
+def test_an_fqn_shaped_alias_must_match_the_canonical_id_exactly(seat, monkeypatch):
+    """A syntactically valid alias is still not the exact canonical address."""
     from agent_comms import operations
+    from agent_comms.operations import UnknownRecipient
     from tests.conftest import FakeTransport
 
+    alias = "bakehouse.agent-eco.arch-alias"
+
+    def alias_answer(address, payload, timeout):
+        assert payload["target"] == alias
+        return 200, {
+            "kind": "resolution-result", "contract": "0.2", "success": True,
+            "status": "resolved", "requested": alias,
+            "canonical_id": "bakehouse.agent-eco.arch", "delivery": "inject",
+            "route_revision": 1,
+            "transports": {"comms": {"channel": "agent-eco", "bot": "agent-eco-arch"}},
+        }
+
+    monkeypatch.setattr("agent_comms.resolve._post", alias_answer)
     transport = FakeTransport()
-    operations.send("hi", to="Bakehouse.Agent-Eco.Agent-Skeleton", subject="s",
-                    transport_factory=lambda c: transport, from_fqn="bakehouse.agent-eco.agent-comms")
-    assert transport.sent[-1]["content"].startswith("@**agent-skeleton** ")
+    with pytest.raises(UnknownRecipient, match="resolved to canonical FQN"):
+        operations.send("hi", to=alias, subject="s",
+                        transport_factory=lambda c: transport,
+                        from_fqn="bakehouse.agent-eco.agent-comms")
+    assert transport.sent == []
 
 
 # -- the blocks failure: a message that reaches nobody ------------------------
@@ -439,7 +458,7 @@ def test_addressing_an_agent_on_our_own_seat_is_DELIVERY_not_a_refusal(seat):
     assert envelope_from_body(body) == "bakehouse.agent-eco.agent-comms"
 
     # The bot name is not an address.
-    with pytest.raises(UnknownRecipient, match="not an agent the directory can resolve"):
+    with pytest.raises(UnknownRecipient, match="not a full agent FQN"):
         operations.send("hi", to="agent-eco-agent-comms", subject="myself",
                         transport_factory=lambda c: FakeTransport(),
                         from_fqn="bakehouse.agent-eco.agent-comms")
@@ -896,41 +915,30 @@ def test_a_blocked_recipient_is_refused_at_the_SENDER(seat, monkeypatch):
     assert not entry_matches_fqn("agent-skeleton", me)
 
 
-def test_send_refusing_a_bare_role_carries_the_directorys_near_misses(seat):
-    """`send` and `resolve` must be equally actionable about the same name.
-
-    `arch` is a bare role: it ends several FQNs in different projects, so it is
-    never authored as an alias and both surfaces refuse it. What differed was
-    the help. `_directory_hint` — the `did you mean` line — sits behind
-    `_resolve_recipient`, and the agent-or-human gate added in front of it
-    refuses first, so from 2026-09-25 `comms resolve arch` listed the
-    candidates and `comms send --to arch` printed a dead end. Measured on
-    UC-02 step 4, 2026-09-27.
-
-    The near-miss control is the second half: a name that is simply not an
-    agent must NOT sprout a `did you mean`, or the line means nothing.
-    """
+@pytest.mark.parametrize("recipient", [
+    "arch",
+    "agent-skeleton",
+    "agent-eco-arch",
+    "@**bakehouse.agent-eco.arch**",
+])
+def test_send_refuses_every_non_fqn_before_directory_or_hub(
+        seat, monkeypatch, recipient):
+    """Aliases, short names, bot names and mention syntax stop at syntax gate."""
     from agent_comms import operations
     from agent_comms.operations import UnknownRecipient
     from tests.conftest import FakeTransport
 
-    with pytest.raises(UnknownRecipient) as caught:
-        operations.send("hi", to="arch", subject="uc02",
-                        transport_factory=lambda c: FakeTransport(),
+    monkeypatch.setattr(
+        "agent_comms.resolve._post",
+        lambda *a, **kw: pytest.fail("non-FQN --to reached the directory"),
+    )
+    transport = FakeTransport()
+    with pytest.raises(UnknownRecipient, match="not a full agent FQN") as caught:
+        operations.send("hi", to=recipient, subject="uc02",
+                        transport_factory=lambda c: transport,
                         from_fqn="bakehouse.agent-eco.agent-comms")
-    said = str(caught.value)
-    assert "not an agent the directory can resolve" in said, said
-    assert "Did you mean" in said, "the send refusal dropped the directory's near-misses"
-    assert "bakehouse.agent-eco.arch" in said, said
-    assert "bakehouse.orchestrator.arch" in said, "only one project's arch was offered"
-
-    # The control: a name with no near-misses gets the refusal and no hint.
-    with pytest.raises(UnknownRecipient) as caught:
-        operations.send("hi", to="zzz-no-such-thing", subject="uc02",
-                        transport_factory=lambda c: FakeTransport(),
-                        from_fqn="bakehouse.agent-eco.agent-comms")
-    assert "Did you mean" not in str(caught.value), (
-        "a 'did you mean' with nothing to mean is noise that trains readers to skip it")
+    assert "Nothing was posted" in str(caught.value)
+    assert transport.sent == []
 
 
 def test_doctor_reports_a_blocked_entry_that_matches_nobody(seat, monkeypatch):

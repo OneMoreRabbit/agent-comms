@@ -32,11 +32,8 @@ class FakeTransport:
             # In the realm, NOT in this seat's channel -- the reachability gate
             # needs a bot that exists and cannot be reached from here.
             "orch-arch",
-            # A HUMAN. The live hub has them and they are not agents: they have
-            # no FQN and never will, so they are addressed by hub name. Since
-            # 2026-09-26 that is the ONLY name-addressing comms still does --
-            # a bot the directory cannot resolve is refused, because a bot is a
-            # seat's mailbox and not an address.
+            # A HUMAN. Humans can post to the hub, but agent-originated comms
+            # delivery addresses agents by exact FQN at both ends.
             "Oliver Blakeman",
         ]
         self.channel_members = channel_members if channel_members is not None else [
@@ -196,8 +193,7 @@ def seat(tmp_path, monkeypatch):
         ]}), encoding="utf-8")
 
     # **A directory that answers.** Addressing is by FQN and resolution is the
-    # directory's job, so the suite must have one: without it every cross-seat
-    # send falls to the hub-name path, which since 2026-09-26 refuses a bot.
+    # directory's job, so the suite must have one. There is no hub-name fallback.
     (home / ".secrets" / "estate-directory-address").write_text(
         "https://directory.test", encoding="utf-8")
     (home / ".secrets" / "estate-directory-seat").write_text("t0ken", encoding="utf-8")
@@ -223,12 +219,12 @@ def seat(tmp_path, monkeypatch):
 
     def _directory(address, payload, timeout):
         target = payload.get("target", "")
-        folded = {k.casefold(): v for k, v in KNOWN.items()}
+        folded = {k.casefold(): (k, v) for k, v in KNOWN.items()}
         if target.strip().casefold() in folded:
-            channel, bot = folded[target.strip().casefold()]
+            canonical, (channel, bot) = folded[target.strip().casefold()]
             return 200, {"kind": "resolution-result", "contract": "0.2",
                          "success": True, "status": "resolved", "requested": target,
-                         "canonical_id": target, "delivery": "inject",
+                         "canonical_id": canonical, "delivery": "inject",
                          "route_revision": 1,
                          "transports": {"comms": {"channel": channel, "bot": bot}}}
         # The real directory answers a bare role with the FQNs that end in it
