@@ -714,17 +714,16 @@ def test_a_refusal_names_the_rule_that_fired_and_where_it_lives(tmp_path, monkey
             "a refusal pointed at the retired seat file: " + text)
 
 def test_every_message_states_the_sending_agent(seat):
-    """ONE RULE: `--from` is required on every message and has no default.
+    """`--from` is required and must be an agent assigned to this seat.
 
     A message is from an agent to an agent; the seat is only the delivery
     mechanism, mapped to a bot on the hub. comms runs on the seat and cannot
-    know which of its agents is asking, and a seat has no FQN to fall back on.
+    know which of its agents is asking, and it must not accept a bot name or
+    another seat's FQN as the caller's word alone.
 
-    An earlier version read "the one agent this seat serves" when there was
-    exactly one. That is right only while a seat serves one agent and silently
-    wrong the moment it serves two -- which is the shape the estate is moving
-    to. The near-miss is therefore the single-agent seat: it must STILL refuse,
-    because a rule that usually applies is the one that fails quietly later."""
+    The assignment cache is the seat's complete, last verified set. A failed
+    refresh deliberately leaves it in place, so this gate neither guesses from
+    a name nor needs a live directory call."""
     import pytest
     from agent_comms import operations
     from agent_comms.operations import SenderUnknown, sending_agent
@@ -735,11 +734,25 @@ def test_every_message_states_the_sending_agent(seat):
                         transport_factory=lambda c: FakeTransport())
     assert "--from" in str(caught.value)
 
+    state_dir = load_settings().state_dir
     with pytest.raises(SenderUnknown):
-        sending_agent("")
+        sending_agent("", state_dir)
     with pytest.raises(SenderUnknown):
-        sending_agent("   ")
-    assert sending_agent(" bakehouse.agent-eco.arch ") == "bakehouse.agent-eco.arch"
+        sending_agent("   ", state_dir)
+    assert sending_agent(" bakehouse.agent-eco.agent-comms ", state_dir) \
+        == "bakehouse.agent-eco.agent-comms"
+
+    # Both invalid claims are refused before a hub transport can post.
+    transport = FakeTransport()
+    for claimed in ("agent-eco-agent-comms", "bakehouse.agent-eco.arch"):
+        with pytest.raises(SenderUnknown) as refused:
+            operations.send(
+                "body", to="bakehouse.agent-eco.arch", subject="s",
+                from_fqn=claimed, transport_factory=lambda _c: transport,
+            )
+        assert claimed in str(refused.value)
+        assert "Nothing was posted" in str(refused.value)
+    assert transport.sent == []
 
 
 def test_a_reply_states_both_agents_too():
@@ -1049,16 +1062,40 @@ def test_inbound_bot_names_are_resolved_to_fqns_before_the_partners_check(
             "permissions": {"comms": {"partners": [allowed]}},
         },
     })
-    monkeypatch.setattr(addressable, "fetch", lambda **_kw: addressable.Answer(
-        claimed_from="",
-        entries=(
-            addressable.Entry(fqn=allowed, bot="arc-platform-platform"),
-            addressable.Entry(fqn=refused, bot="arc-platform-process"),
-        ),
-    ))
+    lookups = []
 
-    events = [_event(806, "arc-platform-platform", topic=f"{recipient}: allowed"),
-              _event(807, "arc-platform-process", topic=f"{recipient}: refused")]
+    def addressable_set(**_kw):
+        lookups.append(True)
+        return addressable.Answer(
+            claimed_from="",
+            entries=(
+                addressable.Entry(fqn=allowed, bot="arc-platform-platform"),
+                addressable.Entry(fqn=refused, bot="arc-platform-process"),
+            ),
+        )
+
+    monkeypatch.setattr(addressable, "fetch", addressable_set)
+
+    malformed = _event(806, "arc-platform-platform",
+                       topic=f"{recipient}: legacy allowed")
+    # The 2.8.2 defect: an old client put its bot name in the sender slot.
+    # That is not an FQN, so the receiver ignores the claim and maps the
+    # hub-vouched bot through the directory before applying policy.
+    malformed["message"]["content"] = (
+        f"@**agent-eco-agent-comms** `arc-platform-platform`→`{recipient}` "
+        "please do this"
+    )
+    correct = _event(807, "arc-platform-platform",
+                     topic=f"{recipient}: current allowed")
+    correct["message"]["content"] = (
+        f"@**agent-eco-agent-comms** `{allowed}`→`{recipient}` please do this"
+    )
+    undeclared = _event(809, "arc-platform-process",
+                        topic=f"{recipient}: refused")
+    undeclared["message"]["content"] = (
+        f"@**agent-eco-agent-comms** `{refused}`→`{recipient}` please do this"
+    )
+    events = [malformed, correct, undeclared]
     for event in events:
         event["flags"] = ["mentioned"]
     notified = []
@@ -1072,17 +1109,20 @@ def test_inbound_bot_names_are_resolved_to_fqns_before_the_partners_check(
     assert operations.run_daemon(
         transport_factory=lambda _c: transport, max_iterations=1,
         on_mention=notified.append,
-    ) == 2
+    ) == 3
 
     stored = {message.id: message for message in operations.inbox()}
     assert stored[806].sender_fqn == allowed
     assert stored[806].authorised is True
-    assert [message.id for message in notified] == [806]
-    assert stored[807].sender_fqn == refused
-    assert stored[807].authorised is False
+    assert stored[807].sender_fqn == allowed
+    assert stored[807].authorised is True
+    assert [message.id for message in notified] == [806, 807]
+    assert stored[809].sender_fqn == refused
+    assert stored[809].authorised is False
+    assert len(lookups) == 1, "only the malformed legacy header needs bot lookup"
     log = (seat / ".comms" / "events.log").read_text(encoding="utf-8")
-    assert f"refused message 807 from '{refused}'" in log
-    assert "refused message 807 from 'arc-platform-process'" not in log
+    assert f"refused message 809 from '{refused}'" in log
+    assert "refused message 809 from 'arc-platform-process'" not in log
 
 
 def test_a_bot_that_cannot_be_resolved_does_not_widen_an_fqn_partners_list(
@@ -1119,6 +1159,44 @@ def test_a_bot_that_cannot_be_resolved_does_not_widen_an_fqn_partners_list(
     assert message.sender_fqn == ""
     log = (seat / ".comms" / "events.log").read_text(encoding="utf-8")
     assert "could not resolve hub sender 'arc-platform-platform'" in log
+
+
+def test_a_bot_with_no_directory_mapping_is_visibly_refused(seat, monkeypatch):
+    """Zero mappings is a reason, not a silent empty sender identity."""
+    from agent_comms import config_sync
+
+    recipient = "bakehouse.agent-eco.agent-comms"
+    monkeypatch.setattr(config_sync, "agent_set", lambda _d: {
+        recipient: {
+            "transports": {"comms": {"channel": "agent-eco",
+                                        "bot": "agent-eco-agent-comms"}},
+            "permissions": {"comms": {
+                "partners": ["bakehouse.arc-platform.platform"],
+            }},
+        },
+    })
+    monkeypatch.setattr(
+        "agent_comms.operations.addressable.fqn_for_bot", lambda _name: "",
+    )
+    event = _event(810, "arc-platform-unknown",
+                   topic=f"{recipient}: unmapped legacy sender")
+    event["flags"] = ["mentioned"]
+    event["message"]["content"] = (
+        f"@**agent-eco-agent-comms** `arc-platform-unknown`→`{recipient}` body"
+    )
+    transport = FakeTransport(
+        event_batches=[{"result": "success", "events": [event]}],
+        realm=["agent-eco-agent-comms", "arc-platform-unknown"],
+        channel_members=["agent-eco-agent-comms", "arc-platform-unknown"],
+    )
+
+    operations.run_daemon(transport_factory=lambda _c: transport, max_iterations=1)
+
+    message = operations.inbox()[0]
+    assert message.authorised is False
+    assert message.sender_fqn == ""
+    log = (seat / ".comms" / "events.log").read_text(encoding="utf-8")
+    assert "hub sender 'arc-platform-unknown' does not map to any agent FQN" in log
 
 
 def test_blocked_beats_an_explicit_allow_on_the_same_agent(seat, tmp_path, monkeypatch):

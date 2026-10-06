@@ -503,6 +503,17 @@ def test_the_envelope_states_both_ends_as_FQNs():
     assert envelope_from_body(old) == "bakehouse.agent-eco.test-claude-another1"
     assert envelope_sender(old) == ""
 
+    # A legacy/malformed sender slot can contain the seat bot. A bot is not an
+    # FQN, so the receiver treats the claim as absent and resolves the hub's
+    # attributed sender instead.
+    malformed = addressed(
+        "test-claude", "hi",
+        to_fqn="bakehouse.agent-eco.test-claude-another1",
+        from_fqn="agent-eco-test-codex",
+    )
+    assert envelope_from_body(malformed) == "bakehouse.agent-eco.test-claude-another1"
+    assert envelope_sender(malformed) == ""
+
     # An unmarked message states neither.
     assert envelope_sender("@**test-claude** hello") == ""
     assert envelope_from_body("@**test-claude** hello") == ""

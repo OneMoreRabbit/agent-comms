@@ -795,19 +795,25 @@ LEGACY_SENDER_MATCHING = True
 
 
 class SenderUnknown(CommsError):
-    """This seat serves several agents, so who is sending is not knowable here.
+    """The claimed sender is not one of the agents this seat serves.
 
     A seat has no FQN. An FQN names an agent session, and a seat that serves
-    more than one has no single sender to put in `from:`. Picking one would be
-    inventing an identity, so the caller states it.
+    more than one has no single sender to put in `from:`. The caller states it,
+    and the seat's full assignment cache proves that the claim belongs here.
     """
 
     tag = "sender-unknown"
     exit_code = 1
 
 
-def sending_agent(explicit: str) -> str:
-    """The FQN of the agent sending a message. STATED, never supplied.
+def _is_full_fqn(value: str) -> bool:
+    """Whether *value* has the estate.project.agent FQN shape."""
+    parts = value.split(".")  # gate-exempt: SHAPE VALIDATION only; no identity is inferred
+    return len(parts) == 3 and all(parts)
+
+
+def sending_agent(explicit: str, state_dir: Path) -> str:
+    """The FQN of the agent sending a message. STATED and seat-proven.
 
     **One rule for every message: `--from` is required and has no default.**
     A message is from an agent to an agent; the seat is only the delivery
@@ -819,6 +825,11 @@ def sending_agent(explicit: str) -> str:
     one. That is correct exactly while a seat serves one agent and silently
     wrong the moment it serves two, which is the shape the estate is moving to.
     One rule that always applies beats one that usually does.
+
+    A statement is not enough: it must be an exact key in this seat's full
+    assignment cache. That cache is the last verified directory answer and is
+    deliberately retained when refresh fails, so an outage neither invents a
+    sender nor discards a sender the seat has already proved it serves.
     """
     fqn = (explicit or "").strip()
     if not fqn:
@@ -826,6 +837,14 @@ def sending_agent(explicit: str) -> str:
             "every message states the agent it is from: --from "
             "<estate.project.agent>. A message is from an agent to an agent, "
             "and comms cannot tell which agent on this seat is asking."
+        )
+    assigned = config_sync.agent_set(state_dir)
+    if fqn not in assigned:
+        served = ", ".join(sorted(assigned)) or "none"
+        raise SenderUnknown(
+            f"--from {fqn!r} is not an agent assigned to this seat. Nothing was "
+            "posted. --from must be one of the exact FQNs in this seat's full "
+            f"assignment cache; this seat serves: {served}."
         )
     return fqn
 
@@ -1255,6 +1274,7 @@ def send(
     like success.
     """
     settings = load_settings(**kw)
+    sender = sending_agent(from_fqn or "", settings.state_dir)
 
     if not to or not to.strip():
         raise Unaddressed(
@@ -1283,7 +1303,7 @@ def send(
     # the same name in the same second. Found by running UC-02, not by reading
     # the code — a suite that cannot fail on an unwired component is not
     # evidence about wiring.
-    routed = _route(settings, recipient, caller=sending_agent(from_fqn or ""))
+    routed = _route(settings, recipient, caller=sender)
     if routed is not None:
         # **The derived bot must be an account the hub actually has.**
         # R15 derives `bot` from the FQN's agent segment, which assumes one hub
@@ -1335,7 +1355,7 @@ def send(
             # from `resolve` and a dead end from `send`: two surfaces, one
             # directory, different amounts of help at the moment it is needed.
             # Measured on UC-02 step 4 (`--to arch`).
-            hint = _directory_hint(recipient, caller=sending_agent(from_fqn or ""))
+            hint = _directory_hint(recipient, caller=sender)
             raise UnknownRecipient(
                 f"'{recipient}' is not an agent the directory can resolve, and it is "
                 f"not a human.\n"
@@ -1346,8 +1366,7 @@ def send(
                 "directory does not know it, it has no announced slot yet — that is "
                 "the thing to fix, not the address to work around."
                 + (f"\n  {hint}" if hint else ""))
-        recipient = _resolve_recipient(settings, hub, recipient,
-                                       caller=sending_agent(from_fqn or ""))
+        recipient = _resolve_recipient(settings, hub, recipient, caller=sender)
         channel = channel or settings.channel
 
     require_reachable(hub, channel)
@@ -1356,7 +1375,7 @@ def send(
     response = hub.send(channel, topic,
                         addressed(recipient, content,
                                   to_fqn=routed.fqn if routed is not None else "",
-                                  from_fqn=sending_agent(from_fqn or "")))
+                                  from_fqn=sender))
     return Posted(response=response, warnings=warnings)
 
 
@@ -1615,7 +1634,11 @@ def envelope_sender(content: str) -> str:
     out of a conversation; it is not a security boundary and was never one.
     """
     m = ENVELOPE.match((content or "").lstrip())
-    return (m.group(1) or "").strip() if m else ""
+    claimed = (m.group(1) or "").strip() if m else ""
+    # A legacy client could put its bot/display name in this slot. That is not
+    # an agent identity, so treat it exactly like an absent claim and let the
+    # receiver resolve the hub-vouched bot through the directory.
+    return claimed if _is_full_fqn(claimed) else ""
 
 
 def addressed(sender: str, content: str, to_fqn: str = "", from_fqn: str = "") -> str:
@@ -1665,6 +1688,7 @@ def reply(
     state: that sender is on a build that predates the envelope.
     """
     settings = load_settings(**kw)
+    sender = sending_agent(from_fqn or "", settings.state_dir)
     store = message_store(settings.state_dir)
     target = next((m for m in store.all() if m.id == message_id), None)
     if target is None:
@@ -1676,7 +1700,7 @@ def reply(
     result = hub.send(channel, target.topic,
                       addressed(target.sender, content,
                                 to_fqn=getattr(target, "sender_fqn", "") or "",
-                                from_fqn=sending_agent(from_fqn or "")))
+                                from_fqn=sender))
     store.mark_read(message_id)
     return Posted(response=result, warnings=warnings)
 
@@ -2569,7 +2593,7 @@ def run_daemon(
                 if agent_partners(agent, settings.state_dir) is None:
                     return ""
                 try:
-                    return addressable.fqn_for_bot(name)
+                    resolved = addressable.fqn_for_bot(name)
                 except Exception as exc:  # noqa: BLE001 - refuse, do not die
                     store.record(
                         "warn",
@@ -2577,6 +2601,13 @@ def run_daemon(
                         f"({exc}); an authored partners list will refuse this bot",
                     )
                     return ""
+                if not resolved:
+                    store.record(
+                        "warn",
+                        f"hub sender {name!r} does not map to any agent FQN; "
+                        "an authored partners list will refuse this bot",
+                    )
+                return resolved
 
             mention = mention_from_event(
                 credential.site, event, settings, credential.email,
@@ -3121,7 +3152,7 @@ def resolve_name(name: str, from_fqn: str = "", **kw) -> list[str]:
     # **`resolve` states its agent too.** It prints a permission verdict, and
     # the directory decides permissions PER CALLER -- so asking as the wrong
     # agent prints the wrong verdict, confidently. Same rule as a send.
-    me = sending_agent(from_fqn or "")
+    me = sending_agent(from_fqn or "", settings.state_dir)
     answer = Resolver(local_agents=config_sync.agent_set(settings.state_dir)).resolve(
         name, caller=me)
 
