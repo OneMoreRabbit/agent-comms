@@ -233,7 +233,11 @@ def test_a_held_message_stays_queued_and_is_retried(seat, monkeypatch):
     transport = FakeTransport(event_batches=[{"result": "success", "events": [
         {"id": 1, "type": "message", "flags": ["mentioned"], "message": {
             "id": 500, "sender_full_name": "agent-eco-arch", "display_recipient": "agent-eco",
-            "subject": "agent-comms: q", "content": "?", "timestamp": NOW, "stream_id": 7}},
+            "subject": "agent-comms: q", "content": operations.addressed(
+                "agent-eco-agent-comms", "?",
+                to_fqn="bakehouse.agent-eco.agent-comms",
+                from_fqn="bakehouse.agent-eco.arch"),
+            "timestamp": NOW, "stream_id": 7}},
     ]}])
 
     # First the seat has nothing running, so it holds.

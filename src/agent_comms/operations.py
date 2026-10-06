@@ -757,10 +757,8 @@ def blocks_sender(agent: str, sender_fqn: str, state_dir) -> bool:
     spelled in a form this client cannot honour must be visible, not silently
     inert.
 
-    An unmarked sender states no FQN, so no per-agent block can name it: the
-    seat-level rules in `comms.yml` decide alone. That is a gap in what the
-    estate can express about older senders, not a silent bypass, and it closes
-    as senders carry the envelope.
+    An unmarked bot sender states no FQN and is ignored before policy is
+    evaluated. Humans have no FQN by design and remain on the hub-human path.
     """
     if not agent or not sender_fqn:
         return False
@@ -774,24 +772,6 @@ def blocks_sender(agent: str, sender_fqn: str, state_dir) -> bool:
     if not theirs:
         return False
     return any(str(entry).strip().casefold() == theirs for entry in blocked)
-
-
-#: **FOR RETIREMENT after the estate has migrated.** A sender that states no
-#: FQN in its envelope is compared on its hub display name instead.
-#:
-#: It is kept because every seat in the estate is one of those until it
-#: upgrades, and refusing them would stop estate comms dead. It is not a
-#: design: a display name names a SEAT, so it cannot name the agent that
-#: wrote, and matching on it needs a spelling rule simultaneously tight enough
-#: to keep `blocks-arch` from matching `arch` and wide enough to catch
-#: `agent-eco-test-codex` against `test-codex`. No such rule exists.
-#:
-#: **Retire when no seat in the estate sends without an envelope.** The check
-#: is `comms stats --json` reporting zero legacy senders across a full poll on
-#: every seat. Then delete this flag, the `sender` parameter below and the
-#: display-name branch in `Directory.permits`, and make an absent FQN a
-#: refusal. Tracked with arch on the navigator.
-LEGACY_SENDER_MATCHING = True
 
 
 class SenderUnknown(CommsError):
@@ -1057,7 +1037,6 @@ def mention_from_event(
     settings: Settings,
     own_email: str | None = None,
     permitted: Callable[[str, str], bool] | None = None,
-    sender_resolver: Callable[[str, str], str] | None = None,
 ) -> Mention | None:
     """Turn a Zulip message event into a stored mention, or None if not for us."""
     if event.get("type") != "message":
@@ -1071,8 +1050,6 @@ def mention_from_event(
                             body=msg.get("content") or "")
     sender = msg.get("sender_full_name") or msg.get("sender_email", "unknown")
     sender_fqn = envelope_sender(msg.get("content") or "")
-    if not sender_fqn and sender_resolver is not None:
-        sender_fqn = sender_resolver(sender, agent)
     return Mention(
         id=msg["id"],
         sender=sender,
@@ -1619,9 +1596,10 @@ def envelope_sender(content: str) -> str:
     """The FQN the message came FROM, from the marker. Empty if unmarked.
 
     **Policy compares FQN to FQN, never display names.** Current senders state
-    their FQN here. For older or malformed messages that omit it, the receive
-    path asks the directory's addressable surface for the exact bot-to-FQN
-    mapping before it applies policy.
+    their FQN here. A bot message that omits it or puts a non-FQN in this slot
+    is legacy and the receive path ignores it. It is not rescued from the bot
+    name: one bot can serve several agents, so the transport name cannot say
+    which agent wrote the message.
 
     Matching display names instead is what this replaces, and it was a bypass
     twice over: `short_name` splits on dots, so a bot arriving as
@@ -2553,9 +2531,31 @@ def run_daemon(
             # never written. The operator has deferred changing this edge-case
             # state machine.
             undetermined = False
+            legacy = False
 
             def _permitted(name: str, sender_fqn: str) -> bool:
-                nonlocal undetermined
+                nonlocal undetermined, legacy
+                # **Bot delivery is FQN-only.** A missing or malformed sender
+                # claim is legacy, not an invitation to derive an agent from
+                # the seat bot. Humans have no FQN by design and stay on their
+                # existing hub-human path.
+                if not sender_fqn:
+                    try:
+                        _in_channel, is_human = hub.in_channel(name)
+                    except Exception as exc:  # noqa: BLE001 - any hub failure
+                        undetermined = True
+                        store.record(
+                            "warn",
+                            f"could not determine whether {name!r} is a human hub "
+                            f"sender ({exc}); storing the message as refused and not "
+                            "delivering it. No refusal notice was sent because the "
+                            "policy answer was unavailable.",
+                        )
+                        return False
+                    if is_human:
+                        return True
+                    legacy = True
+                    return False
                 # **This seat is always permitted to address its own agents.**
                 # A sibling message never crosses a trust boundary: it is this
                 # seat's bot, this seat's agents, and this machine. The
@@ -2589,33 +2589,18 @@ def run_daemon(
                     )
                     return False
 
-            def _sender_fqn(name: str, agent: str) -> str:
-                if agent_partners(agent, settings.state_dir) is None:
-                    return ""
-                try:
-                    resolved = addressable.fqn_for_bot(name)
-                except Exception as exc:  # noqa: BLE001 - refuse, do not die
-                    store.record(
-                        "warn",
-                        f"could not resolve hub sender {name!r} to an agent FQN "
-                        f"({exc}); an authored partners list will refuse this bot",
-                    )
-                    return ""
-                if not resolved:
-                    store.record(
-                        "warn",
-                        f"hub sender {name!r} does not map to any agent FQN; "
-                        "an authored partners list will refuse this bot",
-                    )
-                return resolved
-
             mention = mention_from_event(
                 credential.site, event, settings, credential.email,
                 permitted=_permitted,
-                sender_resolver=_sender_fqn,
             )
             if mention is None:
                 return False
+            if legacy:
+                store.record(
+                    "info",
+                    f"ignored legacy message {mention.id}: no FQN sender",
+                )
+                return True
             # The addressed agent's declared mode decides the arrival state:
             # `hold` lands in HELD, which is the only state RETRIEVED can be
             # reached from. Read once here rather than at every delivery pass.

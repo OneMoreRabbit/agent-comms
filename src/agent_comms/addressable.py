@@ -143,24 +143,3 @@ def fetch(from_fqn: str = "", timeout: float = 10.0) -> Answer:
             f"asked as {answer.claimed_from!r} and the directory echoed "
             f"{answer.echoed_from!r} — it read the claim differently than it was made.")
     return answer
-
-
-def fqn_for_bot(bot: str, timeout: float = 10.0) -> str:
-    """Return the one registered FQN carried by a hub bot name.
-
-    This translates transport identity into the canonical name used by the
-    local partners policy. It does not grant permission: callers still check
-    the returned FQN against that policy. No match can be a human account, so
-    it is left empty for the hub to classify. More than one match is invalid
-    because a bot name alone cannot identify which agent sent the message.
-    """
-    name = (bot or "").strip().casefold()
-    if not name:
-        return ""
-    matches = sorted({entry.fqn for entry in fetch(timeout=timeout).entries
-                      if (entry.bot or "").strip().casefold() == name})
-    if len(matches) > 1:
-        raise AddressableUnavailable(
-            f"the directory maps hub bot {bot!r} to more than one agent: "
-            f"{', '.join(matches)}. The sender cannot be identified safely.")
-    return matches[0] if matches else ""

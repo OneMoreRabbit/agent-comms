@@ -28,10 +28,20 @@ from tests.conftest import FakeTransport
 
 
 def _event(msg_id, sender, topic="agent-comms: do a thing"):
+    sender_fqn = {
+        "agent-eco-arch": "bakehouse.agent-eco.arch",
+        "blocks-android": "bakehouse.blocks.android",
+        "arc-platform-platform": "bakehouse.arc-platform.platform",
+        "arc-platform-process": "bakehouse.arc-platform.process",
+    }.get(sender, "")
+    content = operations.addressed(
+        "agent-eco-agent-comms", "please do this",
+        to_fqn="bakehouse.agent-eco.agent-comms", from_fqn=sender_fqn,
+    ) if sender_fqn else "please do this"
     return {"id": msg_id, "type": "message", "flags": [], "message": {
         "id": msg_id, "sender_full_name": sender, "sender_email": f"{sender}@h",
         "display_recipient": "agent-eco", "subject": topic,
-        "content": "please do this", "timestamp": 1, "stream_id": 7, "type": "stream"}}
+        "content": content, "timestamp": 1, "stream_id": 7, "type": "stream"}}
 
 
 def _directory(seat_dir, text):
@@ -522,7 +532,11 @@ def test_reply_validates_the_body_too(seat):
     transport = FakeTransport(event_batches=[{"result": "success", "events": [
         {"id": 77, "type": "message", "flags": ["mentioned"], "message": {
             "id": 77, "sender_full_name": "agent-eco-arch", "display_recipient": "agent-eco",
-            "subject": "agent-comms: q", "content": "?", "timestamp": 1, "stream_id": 7}},
+            "subject": "agent-comms: q", "content": operations.addressed(
+                "agent-eco-agent-comms", "?",
+                to_fqn="bakehouse.agent-eco.agent-comms",
+                from_fqn="bakehouse.agent-eco.arch"),
+            "timestamp": 1, "stream_id": 7}},
     ]}])
     operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
     posted = operations.reply(77, "cc @**blocks-android**",
@@ -816,30 +830,6 @@ def test_an_unanswered_directory_is_not_an_empty_set(monkeypatch):
     assert answer.entries == ()
 
 
-def test_a_hub_bot_maps_to_one_fqn_or_none(monkeypatch):
-    """Transport identity is exact; a shared bot never picks an agent."""
-    from agent_comms import addressable
-
-    one = addressable.Answer(claimed_from="", entries=(
-        addressable.Entry(fqn="bakehouse.no-transport.agent", bot=None),
-        addressable.Entry(fqn="bakehouse.arc-platform.platform",
-                          bot="arc-platform-platform"),
-    ))
-    monkeypatch.setattr(addressable, "fetch", lambda **_kw: one)
-    assert addressable.fqn_for_bot("ARC-PLATFORM-PLATFORM") == \
-        "bakehouse.arc-platform.platform"
-    assert addressable.fqn_for_bot("a-human") == ""
-
-    shared = addressable.Answer(claimed_from="", entries=(
-        addressable.Entry(fqn="bakehouse.example.one", bot="shared-seat"),
-        addressable.Entry(fqn="bakehouse.example.two", bot="shared-seat"),
-    ))
-    monkeypatch.setattr(addressable, "fetch", lambda **_kw: shared)
-    with pytest.raises(addressable.AddressableUnavailable,
-                       match="more than one agent"):
-        addressable.fqn_for_bot("shared-seat")
-
-
 def test_a_claim_the_directory_reads_differently_is_reported(monkeypatch):
     """`?from` is a claim. If the directory echoes back something else, the two
     parties disagree about who was asked about -- and the caller is the only one
@@ -1041,14 +1031,14 @@ def test_the_directorys_partners_list_decides_and_an_absent_one_does_not(seat, t
         "a short name admitted an FQN sender — that is the guessing that was removed")
 
 
-def test_inbound_bot_names_are_resolved_to_fqns_before_the_partners_check(
+def test_inbound_delivery_requires_an_fqn_sender_but_humans_are_unaffected(
         seat, monkeypatch):
-    """A Zulip event attributes a post to a bot, while policy names agents.
+    """Bot delivery is FQN-only; a hub bot never supplies agent identity.
 
-    Released 2.8.1 compared those different forms. A declared partner was
-    therefore refused even though the refusal printed the matching FQN in the
-    list. The addressable surface supplies the transport-to-agent mapping;
-    permission still comes only from the addressed agent's partners list.
+    A malformed or absent sender header is legacy and ignored, even when the
+    bot belongs to a declared partner. A valid FQN still reaches the partners
+    check, while a human (who has no FQN by design) remains admitted through
+    the existing hub-human path.
     """
     from agent_comms import addressable, config_sync
 
@@ -1062,25 +1052,20 @@ def test_inbound_bot_names_are_resolved_to_fqns_before_the_partners_check(
             "permissions": {"comms": {"partners": [allowed]}},
         },
     })
-    lookups = []
+    monkeypatch.setattr(
+        addressable, "fetch",
+        lambda **_kw: (_ for _ in ()).throw(
+            AssertionError("the receive path must not resolve a bot name")),
+    )
 
-    def addressable_set(**_kw):
-        lookups.append(True)
-        return addressable.Answer(
-            claimed_from="",
-            entries=(
-                addressable.Entry(fqn=allowed, bot="arc-platform-platform"),
-                addressable.Entry(fqn=refused, bot="arc-platform-process"),
-            ),
-        )
-
-    monkeypatch.setattr(addressable, "fetch", addressable_set)
-
+    missing = _event(805, "arc-platform-platform",
+                     topic=f"{recipient}: missing sender")
+    missing["message"]["content"] = "please do this"
     malformed = _event(806, "arc-platform-platform",
                        topic=f"{recipient}: legacy allowed")
     # The 2.8.2 defect: an old client put its bot name in the sender slot.
-    # That is not an FQN, so the receiver ignores the claim and maps the
-    # hub-vouched bot through the directory before applying policy.
+    # That is not an FQN, so the receiver ignores the message without trying
+    # to turn the hub-vouched bot into an agent identity.
     malformed["message"]["content"] = (
         f"@**agent-eco-agent-comms** `arc-platform-platform`→`{recipient}` "
         "please do this"
@@ -1095,15 +1080,16 @@ def test_inbound_bot_names_are_resolved_to_fqns_before_the_partners_check(
     undeclared["message"]["content"] = (
         f"@**agent-eco-agent-comms** `{refused}`→`{recipient}` please do this"
     )
-    events = [malformed, correct, undeclared]
+    human = _event(811, "Oliver Blakeman", topic=f"{recipient}: human")
+    events = [missing, malformed, correct, undeclared, human]
     for event in events:
         event["flags"] = ["mentioned"]
     notified = []
     transport = FakeTransport(
         event_batches=[{"result": "success", "events": events}],
         realm=["agent-eco-agent-comms", "arc-platform-platform",
-               "arc-platform-process"],
-        channel_members=["agent-eco-agent-comms"],
+               "arc-platform-process", "Oliver Blakeman"],
+        channel_members=["agent-eco-agent-comms", "Oliver Blakeman"],
     )
 
     assert operations.run_daemon(
@@ -1112,91 +1098,20 @@ def test_inbound_bot_names_are_resolved_to_fqns_before_the_partners_check(
     ) == 3
 
     stored = {message.id: message for message in operations.inbox()}
-    assert stored[806].sender_fqn == allowed
-    assert stored[806].authorised is True
+    assert 805 not in stored, "a missing bot sender is ignored, not stored"
+    assert 806 not in stored, "a malformed bot sender is ignored, not stored"
     assert stored[807].sender_fqn == allowed
     assert stored[807].authorised is True
-    assert [message.id for message in notified] == [806, 807]
+    assert stored[811].sender_fqn == ""
+    assert stored[811].authorised is True
+    assert [message.id for message in notified] == [807, 811]
     assert stored[809].sender_fqn == refused
     assert stored[809].authorised is False
-    assert len(lookups) == 1, "only the malformed legacy header needs bot lookup"
     log = (seat / ".comms" / "events.log").read_text(encoding="utf-8")
+    assert log.count("ignored legacy message 805: no FQN sender") == 1
+    assert log.count("ignored legacy message 806: no FQN sender") == 1
     assert f"refused message 809 from '{refused}'" in log
     assert "refused message 809 from 'arc-platform-process'" not in log
-
-
-def test_a_bot_that_cannot_be_resolved_does_not_widen_an_fqn_partners_list(
-        seat, monkeypatch):
-    """Directory failure cannot turn an allow-list into channel admission."""
-    from agent_comms import config_sync
-
-    recipient = "bakehouse.agent-eco.agent-comms"
-    monkeypatch.setattr(config_sync, "agent_set", lambda _d: {
-        recipient: {
-            "transports": {"comms": {"channel": "agent-eco",
-                                        "bot": "agent-eco-agent-comms"}},
-            "permissions": {"comms": {
-                "partners": ["bakehouse.arc-platform.platform"],
-            }},
-        },
-    })
-    monkeypatch.setattr(
-        "agent_comms.operations.addressable.fqn_for_bot",
-        lambda _name: (_ for _ in ()).throw(RuntimeError("directory unavailable")),
-    )
-    event = _event(808, "arc-platform-platform", topic=f"{recipient}: unresolved")
-    event["flags"] = ["mentioned"]
-    transport = FakeTransport(
-        event_batches=[{"result": "success", "events": [event]}],
-        realm=["agent-eco-agent-comms", "arc-platform-platform"],
-        channel_members=["agent-eco-agent-comms", "arc-platform-platform"],
-    )
-
-    operations.run_daemon(transport_factory=lambda _c: transport, max_iterations=1)
-
-    message = operations.inbox()[0]
-    assert message.authorised is False
-    assert message.sender_fqn == ""
-    log = (seat / ".comms" / "events.log").read_text(encoding="utf-8")
-    assert "could not resolve hub sender 'arc-platform-platform'" in log
-
-
-def test_a_bot_with_no_directory_mapping_is_visibly_refused(seat, monkeypatch):
-    """Zero mappings is a reason, not a silent empty sender identity."""
-    from agent_comms import config_sync
-
-    recipient = "bakehouse.agent-eco.agent-comms"
-    monkeypatch.setattr(config_sync, "agent_set", lambda _d: {
-        recipient: {
-            "transports": {"comms": {"channel": "agent-eco",
-                                        "bot": "agent-eco-agent-comms"}},
-            "permissions": {"comms": {
-                "partners": ["bakehouse.arc-platform.platform"],
-            }},
-        },
-    })
-    monkeypatch.setattr(
-        "agent_comms.operations.addressable.fqn_for_bot", lambda _name: "",
-    )
-    event = _event(810, "arc-platform-unknown",
-                   topic=f"{recipient}: unmapped legacy sender")
-    event["flags"] = ["mentioned"]
-    event["message"]["content"] = (
-        f"@**agent-eco-agent-comms** `arc-platform-unknown`→`{recipient}` body"
-    )
-    transport = FakeTransport(
-        event_batches=[{"result": "success", "events": [event]}],
-        realm=["agent-eco-agent-comms", "arc-platform-unknown"],
-        channel_members=["agent-eco-agent-comms", "arc-platform-unknown"],
-    )
-
-    operations.run_daemon(transport_factory=lambda _c: transport, max_iterations=1)
-
-    message = operations.inbox()[0]
-    assert message.authorised is False
-    assert message.sender_fqn == ""
-    log = (seat / ".comms" / "events.log").read_text(encoding="utf-8")
-    assert "hub sender 'arc-platform-unknown' does not map to any agent FQN" in log
 
 
 def test_blocked_beats_an_explicit_allow_on_the_same_agent(seat, tmp_path, monkeypatch):

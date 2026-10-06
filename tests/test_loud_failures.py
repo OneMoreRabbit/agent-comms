@@ -379,7 +379,10 @@ def test_resume_does_not_discard_events(seat):
     transport = FakeTransport(event_batches=[{"result": "success", "events": [
         {"id": 43, "type": "message", "flags": ["mentioned"], "message": {
             "id": 401, "sender_full_name": "agent-eco-arch", "display_recipient": "agent-eco",
-            "subject": "t", "content": "must not be dropped",
+            "subject": "t", "content": operations.addressed(
+                "agent-eco-agent-comms", "must not be dropped",
+                to_fqn="bakehouse.agent-eco.agent-comms",
+                from_fqn="bakehouse.agent-eco.arch"),
             "timestamp": 1, "stream_id": 7}},
     ]}])
     stored = operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
@@ -403,7 +406,10 @@ def test_daemon_stores_only_mentions(seat):
     transport = FakeTransport(event_batches=[{"result": "success", "events": [
         {"id": 1, "type": "message", "flags": ["mentioned"], "message": {
             "id": 101, "sender_full_name": "agent-eco-arch", "display_recipient": "agent-eco",
-            "subject": "agent-comms: build it", "content": "please proceed",
+            "subject": "agent-comms: build it", "content": operations.addressed(
+                "agent-eco-agent-comms", "please proceed",
+                to_fqn="bakehouse.agent-eco.agent-comms",
+                from_fqn="bakehouse.agent-eco.arch"),
             "timestamp": 1756900000, "stream_id": 7}},
         {"id": 2, "type": "message", "flags": [], "message": {
             "id": 102, "sender_full_name": "someone", "display_recipient": "agent-eco",
@@ -425,7 +431,10 @@ def test_notify_command_receives_the_mention(seat, tmp_path):
     transport = FakeTransport(event_batches=[{"result": "success", "events": [
         {"id": 1, "type": "message", "flags": ["mentioned"], "message": {
             "id": 201, "sender_full_name": "agent-eco-arch", "display_recipient": "agent-eco",
-            "subject": "agent-comms: ping", "content": "hello",
+            "subject": "agent-comms: ping", "content": operations.addressed(
+                "agent-eco-agent-comms", "hello",
+                to_fqn="bakehouse.agent-eco.agent-comms",
+                from_fqn="bakehouse.agent-eco.arch"),
             "timestamp": 1756900000, "stream_id": 7}},
     ]}])
     operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
@@ -439,7 +448,11 @@ def test_failing_notify_command_is_recorded_not_swallowed(seat):
     transport = FakeTransport(event_batches=[{"result": "success", "events": [
         {"id": 1, "type": "message", "flags": ["mentioned"], "message": {
             "id": 202, "sender_full_name": "agent-eco-arch", "display_recipient": "agent-eco",
-            "subject": "t", "content": "c", "timestamp": 1, "stream_id": 7}},
+            "subject": "t", "content": operations.addressed(
+                "agent-eco-agent-comms", "c",
+                to_fqn="bakehouse.agent-eco.agent-comms",
+                from_fqn="bakehouse.agent-eco.arch"),
+            "timestamp": 1, "stream_id": 7}},
     ]}])
     operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
     assert "notify_command exited 7" in (seat / ".comms" / "events.log").read_text()
@@ -449,7 +462,10 @@ def test_reply_goes_to_the_mentions_own_topic(seat):
     transport = FakeTransport(event_batches=[{"result": "success", "events": [
         {"id": 1, "type": "message", "flags": ["mentioned"], "message": {
             "id": 301, "sender_full_name": "agent-eco-arch", "display_recipient": "agent-eco",
-            "subject": "agent-comms: a question", "content": "?",
+            "subject": "agent-comms: a question", "content": operations.addressed(
+                "agent-eco-agent-comms", "?",
+                to_fqn="bakehouse.agent-eco.agent-comms",
+                from_fqn="bakehouse.agent-eco.arch"),
             "timestamp": 1, "stream_id": 7}},
     ]}])
     operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
@@ -879,8 +895,13 @@ def test_supervise_conflicts_with_the_other_daemon_flags(seat):
 
 def _history_msg(mid, ts, topic="agent-comms: from history", sender="agent-eco-arch",
                  channel="agent-eco"):
+    content = operations.addressed(
+        "agent-eco-agent-comms", "body",
+        to_fqn="bakehouse.agent-eco.agent-comms",
+        from_fqn="bakehouse.agent-eco.arch",
+    )
     return {"id": mid, "sender_full_name": sender, "display_recipient": channel,
-            "subject": topic, "content": "body", "timestamp": ts, "stream_id": 7,
+            "subject": topic, "content": content, "timestamp": ts, "stream_id": 7,
             "flags": ["mentioned"]}
 
 
