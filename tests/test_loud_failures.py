@@ -2014,6 +2014,11 @@ def test_doctor_tells_the_truth_about_a_deaf_seat(seat, monkeypatch):
     # -- DEAF: no assignments, so no channel ------------------------------
     routes.write_text(json.dumps({"routes": []}))
     assert not (load_settings().channel or "").strip(), "fixture is not deaf"
+    from agent_comms.store import Mention
+    operations.message_store(seat).append(Mention(
+        id=9877, sender="old-sender", sender_fqn="bakehouse.old.sender",
+        agent="bakehouse.agent-eco.agent-comms", channel="agent-eco", topic="t",
+        content="old refusal", timestamp=NOW, permalink="", authorised=False))
     deaf = operations.preflight(transport_factory=lambda c: FakeTransport())
 
     ok, why = check("deliverable", deaf)[1], check("deliverable", deaf)[2]
@@ -2030,6 +2035,15 @@ def test_doctor_tells_the_truth_about_a_deaf_seat(seat, monkeypatch):
     reach = [c for c in deaf.checks if c[0] == "reachable channels"]
     assert not any("GRANT WITHOUT SUBSCRIPTION" in c[2] for c in reach), (
         "estate drift was reported for a channel named nothing")
+
+    # Historical refusals normally trigger a current per-channel permission
+    # check.  With no assigned channel there is no such question to ask: the
+    # channel fallback would call the hub with ``''`` and replace the true
+    # zero-assignment diagnosis with a second, wrong-cause directory failure.
+    directory = check("directory", deaf)
+    assert directory[1] is True, directory[2]
+    assert "this bot is not subscribed to channel ''" not in "\n".join(
+        c[2] for c in deaf.checks)
 
     # **The later checks still ran** — a failing subscription here must not
     # return early, or the deliverable finding is hidden.

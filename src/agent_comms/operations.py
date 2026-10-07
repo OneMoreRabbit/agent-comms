@@ -506,30 +506,44 @@ def preflight(
                        "no agents assigned yet, so there is no policy to state")
         refused = [m for m in message_store(settings.state_dir).all() if not m.authorised]
         if refused:
+            # A channel-less seat has no per-channel policy to ask.  The
+            # zero-assignment checks above already say why it cannot receive;
+            # calling ``may_write_to`` here would fall through to
+            # ``hub.in_channel`` and manufacture a second, misleading failure
+            # about channel ``''`` while reviewing historical refusals.
+            if not (settings.channel or "").strip():
+                report.notes.append(
+                    f"{len(refused)} stored message(s) were refused as not permitted. "
+                    "Their current per-channel policy is not rechecked because this "
+                    "seat has no channel assigned. All remain visible in `comms inbox`."
+                )
+                refused = []
+
             # The stored flag records the rule in force when the message arrived,
             # so re-check the senders against the directory as it stands now.
             # Otherwise this note reports a seat as blocked when the only thing
             # that changed is the rule — which is how a stale flag becomes a
             # false accusation.
-            senders = {m.sender_fqn or m.sender for m in refused}
-            still = sorted({
-                m.sender_fqn or m.sender for m in refused
-                if not may_write_to(hub, m.agent, m.sender, m.sender_fqn,
-                                    settings.state_dir)
-            })
-            note = f"{len(refused)} stored message(s) were refused as not permitted"
-            if still:
-                note += f"; still refused today: {', '.join(still)}"
-            if len(still) < len(senders):
-                was = sorted(senders - set(still))
-                note += (
-                    f". {', '.join(was)} would be permitted now — those were refused "
-                    "under an earlier rule, not by the current directory"
+            if refused:
+                senders = {m.sender_fqn or m.sender for m in refused}
+                still = sorted({
+                    m.sender_fqn or m.sender for m in refused
+                    if not may_write_to(hub, m.agent, m.sender, m.sender_fqn,
+                                        settings.state_dir)
+                })
+                note = f"{len(refused)} stored message(s) were refused as not permitted"
+                if still:
+                    note += f"; still refused today: {', '.join(still)}"
+                if len(still) < len(senders):
+                    was = sorted(senders - set(still))
+                    note += (
+                        f". {', '.join(was)} would be permitted now — those were refused "
+                        "under an earlier rule, not by the current directory"
+                    )
+                report.notes.append(
+                    note + ". All are stored and visible in `comms inbox`; if one should "
+                    "have arrived, the directory is what to fix."
                 )
-            report.notes.append(
-                note + ". All are stored and visible in `comms inbox`; if one should "
-                "have arrived, the directory is what to fix."
-            )
     except CommsError as exc:
         report.add("directory", False, str(exc))
 
