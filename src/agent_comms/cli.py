@@ -148,10 +148,11 @@ def _say_sent(posted, word: str = "sent") -> None:
 
 @main.command()
 @click.option("--to", required=True,
-              help="The FQN of the AGENT this message is for — "
-                   "estate.project.agent, exactly. Aliases, short names, bot "
-                   "names and mention syntax are refused before lookup.")
-@click.option("--subject", default=None, help="Subject; the topic becomes '<to>: <subject>'.")
+              help="The exact FQN of the AGENT this message is for, or an alias "
+                   "authored by the directory. The wire always carries the "
+                   "resolved canonical estate.project.agent FQN.")
+@click.option("--subject", default=None,
+              help="Subject; the topic becomes '<canonical FQN>: <subject>'.")
 @click.option("--topic", default=None,
               help="Continue an existing topic instead of starting one. Still needs --to.")
 @click.option("--from", "from_fqn", required=True, help="The FQN of the AGENT sending this — estate.project.agent. Required: a message is from an agent to an agent, and the seat is only the delivery mechanism, so comms cannot supply it.")
@@ -170,10 +171,11 @@ def send(to: str, subject: str | None, topic: str | None, from_fqn: str,
     recipient's seat bot — both routes a recipient matches on, so it does not
     matter which.
 
-    **Only an exact FQN is an address.** `--to agent-skeleton`, aliases, bot
-    names and mention syntax are refused before directory lookup. Even an
-    FQN-shaped alias is refused when the directory returns a different canonical
-    id. Nothing here builds an identifier out of parts or guesses candidates.
+    **The input is an exact FQN or a directory-authored alias.** The directory
+    must resolve it to one canonical FQN before anything is posted, and that FQN
+    is written into the envelope and new topic. Bot names, unauthored short
+    names, ambiguous aliases and unknown inputs are refused. Nothing here builds
+    an identifier out of parts or guesses candidates.
 
     The body is never rewritten: a name typed in prose is prose, and addressing
     travels in the flag, not the text. It IS read for one thing — an explicit

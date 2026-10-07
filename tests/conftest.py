@@ -211,6 +211,11 @@ def seat(tmp_path, monkeypatch):
         # grant-without-subscription shape the reachability gate exists for.
         "bakehouse.orchestrator.arch": ("orchestrator", "orch-arch"),
     }
+    ALIASES = {
+        # Authored by the directory for this caller's project. A bare role is
+        # never inferred: this row is why `arch` resolves.
+        "arch": "bakehouse.agent-eco.arch",
+    }
 
     #: Callers the fixture treats as real besides the KNOWN agents: this seat's
     #: own agents, which the directory knows even when the fake's KNOWN map is
@@ -220,6 +225,14 @@ def seat(tmp_path, monkeypatch):
     def _directory(address, payload, timeout):
         target = payload.get("target", "")
         folded = {k.casefold(): (k, v) for k, v in KNOWN.items()}
+        alias_target = ALIASES.get(target.strip())
+        if alias_target is not None:
+            channel, bot = KNOWN[alias_target]
+            return 200, {"kind": "resolution-result", "contract": "0.2",
+                         "success": True, "status": "resolved", "requested": target,
+                         "canonical_id": alias_target, "alias_used": target.strip(),
+                         "delivery": "inject", "route_revision": 1,
+                         "transports": {"comms": {"channel": channel, "bot": bot}}}
         if target.strip().casefold() in folded:
             canonical, (channel, bot) = folded[target.strip().casefold()]
             return 200, {"kind": "resolution-result", "contract": "0.2",

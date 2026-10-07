@@ -1233,13 +1233,13 @@ def send(
 ) -> dict:
     """Post to this seat's channel, addressed from one AGENT to another.
 
-    **The protocol is one line: both ends are FQNs, and the directory resolves
-    them.** `--to` is required and carries the recipient AGENT's FQN — a bare
-    name is refused before lookup; an FQN-shaped alias is refused when its
-    canonical id differs. The topic becomes
-    `<recipient>: <subject>` and the body is prefixed with a real mention of the
-    recipient's seat bot, so both of the two routes a recipient matches on are
-    covered without the sender knowing which.
+    **The protocol is one line: both ends on the wire are FQNs.** `--to` takes
+    either the exact recipient FQN or a directory-authored alias. Before posting,
+    the directory must resolve it to one canonical FQN; that FQN is written into
+    the envelope and new topic. Bot names, unauthored short names, ambiguous
+    aliases and unknown inputs are refused. The body is prefixed with a real
+    mention of the recipient's seat bot, so both of the routes a recipient
+    matches on are covered without the sender knowing which.
 
     **The body is never rewritten.** An earlier version scanned message text for
     `@name` and converted it, which is guesswork about prose — it has to decide
@@ -1278,29 +1278,22 @@ def send(
         )
 
     recipient = to.strip()
-    if not _is_full_fqn(recipient):
-        raise UnknownRecipient(
-            f"--to {recipient!r} is not a full agent FQN. Nothing was posted. "
-            "Address the recipient by its exact estate.project.agent FQN; aliases, "
-            "short names, hub bot names and mention syntax are not addresses, and "
-            "comms does not ask the directory to expand them."
-        )
     if not topic:
         if not subject:
             raise Unaddressed(
                 f"--to {recipient} needs a --subject, so the topic can be "
                 f"'{recipient}: <subject>'. Without one there is no topic to post under."
             )
-        topic = f"{recipient}: {subject}"
+
+    # **Resolve before any hub call.** The input is either the canonical FQN or
+    # a directory-authored alias. The directory must reduce both to one
+    # canonical FQN; bot names and unauthored/ambiguous short names do not.
+    routed = _route(settings, recipient, caller=sender)
+    if not topic:
+        topic = f"{routed.fqn}: {subject}"
 
     credential = load_credential(settings.identity)
     hub = Hub(transport_factory(credential), settings, credential)
-
-    # **Resolve the exact FQN and never fall back to a name.** A bot is a seat's
-    # mailbox and an alias is directory convenience; neither is an address.
-    # `_route` also checks that the directory returned this exact canonical FQN,
-    # so an FQN-shaped alias cannot enter through the syntax gate above.
-    routed = _route(settings, recipient, caller=sender)
     # **The declared bot must be an account the hub actually has.** Existence,
     # not reachability: a cross-project recipient's bot may legitimately be
     # outside this seat's home channel, and `require_reachable` judges the
@@ -1338,21 +1331,21 @@ class Routed:
 
 
 def _route(settings: Settings, name: str, caller: str = "", **kw):
-    """Ask the directory where an exact FQN goes, or refuse.
+    """Ask the directory to reduce an FQN or authored alias to one FQN.
 
     Three things happen here that used not to happen at all:
 
-    1. **The FQN is resolved** against the directory (R7), and the returned
-       canonical id must be byte-for-byte the requested FQN. Aliases are not
-       accepted on `--to`, even when they happen to be FQN-shaped.
+    1. **The input is resolved** against the directory (R7). An exact canonical
+       FQN passes; a different canonical id passes only when `alias_used` says
+       the directory authored that exact input as an alias.
     2. **The delivery mode is honoured at send** (R10) — `none` refuses here,
        and a value outside `inject | hold | none` refuses with the value
        quoted. Comms is the only component that ever reads this field.
     3. **The transport is derived from the FQN** (R15) — project is the
        channel, agent is the bot — with a declared override taking precedence.
 
-    There is no fallback to a seat, bot, human or alias. Delivery is agent FQN
-    to agent FQN at both ends.
+    There is no fallback to a seat, bot, human or inferred short name. Aliases
+    are input convenience only: delivery is agent FQN to agent FQN on the wire.
     """
     from .delivery import NotDeliverable, permitted_to_send, plan, transport_for
     from .resolve import Resolver
@@ -1369,18 +1362,25 @@ def _route(settings: Settings, name: str, caller: str = "", **kw):
             # through would turn "you may not address that" into "no such
             # seat", which is the wrong-cause class this change exists to fix.
             raise UnknownRecipient(
-                f"'{name}' is not permitted: {answer.message or 'no reason given'}")
+                f"'{name}' is not permitted: {answer.message or 'no reason given'}. "
+                "Nothing was posted.")
         raise UnknownRecipient(
-            f"--to {name!r} is not an exact routable agent FQN: "
-            f"{answer.message or answer.status}. Nothing was posted. Aliases, bot "
-            "names and short names are not addresses."
+            f"--to {name!r} could not be resolved to one canonical agent FQN: "
+            f"{answer.message or answer.status}. Nothing was posted. Pass an exact "
+            "FQN or an alias authored by the directory; bot names, unauthored short "
+            "names and ambiguous aliases are refused."
         )
 
-    if answer.canonical_id != name:
+    if not _is_full_fqn(answer.canonical_id):
         raise UnknownRecipient(
-            f"--to {name!r} resolved to canonical FQN {answer.canonical_id!r}. "
-            "Nothing was posted. An alias is not an address; pass the exact "
-            "canonical estate.project.agent FQN."
+            f"--to {name!r} resolved without a valid canonical FQN. Nothing was "
+            "posted; the directory answer cannot be put on the wire."
+        )
+
+    if answer.canonical_id != name and answer.alias_used != name:
+        raise UnknownRecipient(
+            f"--to {name!r} returned canonical FQN {answer.canonical_id!r} without "
+            "declaring that input as an authored alias. Nothing was posted."
         )
 
     allowed, why = permitted_to_send(answer.delivery or "inject")

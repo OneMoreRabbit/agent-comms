@@ -337,17 +337,16 @@ def test_zulip_syntax_in_to_is_refused_without_a_post(seat):
     from tests.conftest import FakeTransport
 
     transport = FakeTransport()
-    with pytest.raises(UnknownRecipient, match="mention syntax"):
+    with pytest.raises(UnknownRecipient, match="could not be resolved"):
         operations.send("hi", to="@**bakehouse.agent-eco.agent-skeleton**", subject="s",
                         transport_factory=lambda c: transport,
                         from_fqn="bakehouse.agent-eco.agent-comms")
     assert transport.sent == []
 
 
-def test_an_fqn_shaped_alias_must_match_the_canonical_id_exactly(seat, monkeypatch):
-    """A syntactically valid alias is still not the exact canonical address."""
+def test_an_fqn_shaped_authored_alias_posts_the_canonical_fqn(seat, monkeypatch):
+    """An alias is input only; the directory's one canonical FQN goes on wire."""
     from agent_comms import operations
-    from agent_comms.operations import UnknownRecipient
     from tests.conftest import FakeTransport
 
     alias = "bakehouse.agent-eco.arch-alias"
@@ -357,18 +356,55 @@ def test_an_fqn_shaped_alias_must_match_the_canonical_id_exactly(seat, monkeypat
         return 200, {
             "kind": "resolution-result", "contract": "0.2", "success": True,
             "status": "resolved", "requested": alias,
-            "canonical_id": "bakehouse.agent-eco.arch", "delivery": "inject",
+            "canonical_id": "bakehouse.agent-eco.arch", "alias_used": alias,
+            "delivery": "inject",
             "route_revision": 1,
             "transports": {"comms": {"channel": "agent-eco", "bot": "agent-eco-arch"}},
         }
 
     monkeypatch.setattr("agent_comms.resolve._post", alias_answer)
     transport = FakeTransport()
-    with pytest.raises(UnknownRecipient, match="resolved to canonical FQN"):
-        operations.send("hi", to=alias, subject="s",
-                        transport_factory=lambda c: transport,
+    operations.send("hi", to=alias, subject="s",
+                    transport_factory=lambda c: transport,
+                    from_fqn="bakehouse.agent-eco.agent-comms")
+    sent = transport.sent[-1]
+    assert operations.envelope_from_body(sent["content"]) == "bakehouse.agent-eco.arch"
+    assert sent["content"].startswith("@**agent-eco-arch** ")
+    assert sent["topic"] == "bakehouse.agent-eco.arch: s"
+
+
+def test_an_authored_short_alias_posts_the_canonical_fqn(seat):
+    """`arch` works because the fake directory authors it, not by inference."""
+    from agent_comms import operations
+    from tests.conftest import FakeTransport
+
+    transport = FakeTransport()
+    operations.send("hi", to="arch", subject="alias",
+                    transport_factory=lambda c: transport,
+                    from_fqn="bakehouse.agent-eco.agent-comms")
+    sent = transport.sent[-1]
+    assert operations.envelope_from_body(sent["content"]) == "bakehouse.agent-eco.arch"
+    assert sent["topic"] == "bakehouse.agent-eco.arch: alias"
+
+
+def test_a_canonical_rewrite_without_an_authored_alias_is_refused(seat, monkeypatch):
+    """A changed id is authority only when `alias_used` names the exact input."""
+    from agent_comms import operations
+    from agent_comms.operations import UnknownRecipient
+
+    def malformed_answer(address, payload, timeout):
+        return 200, {
+            "kind": "resolution-result", "contract": "0.2", "success": True,
+            "status": "resolved", "requested": payload["target"],
+            "canonical_id": "bakehouse.agent-eco.arch", "delivery": "inject",
+            "transports": {"comms": {"channel": "agent-eco", "bot": "agent-eco-arch"}},
+        }
+
+    monkeypatch.setattr("agent_comms.resolve._post", malformed_answer)
+    with pytest.raises(UnknownRecipient, match="without declaring.*authored alias"):
+        operations.send("hi", to="arch", subject="bad-answer",
+                        transport_factory=lambda c: pytest.fail("hub was reached"),
                         from_fqn="bakehouse.agent-eco.agent-comms")
-    assert transport.sent == []
 
 
 # -- the blocks failure: a message that reaches nobody ------------------------
@@ -484,7 +520,7 @@ def test_addressing_an_agent_on_our_own_seat_is_DELIVERY_not_a_refusal(seat):
     assert envelope_from_body(body) == "bakehouse.agent-eco.agent-comms"
 
     # The bot name is not an address.
-    with pytest.raises(UnknownRecipient, match="not a full agent FQN"):
+    with pytest.raises(UnknownRecipient, match="could not be resolved"):
         operations.send("hi", to="agent-eco-agent-comms", subject="myself",
                         transport_factory=lambda c: FakeTransport(),
                         from_fqn="bakehouse.agent-eco.agent-comms")
@@ -942,29 +978,38 @@ def test_a_blocked_recipient_is_refused_at_the_SENDER(seat, monkeypatch):
 
 
 @pytest.mark.parametrize("recipient", [
-    "arch",
     "agent-skeleton",
     "agent-eco-arch",
+    "review",
     "@**bakehouse.agent-eco.arch**",
 ])
-def test_send_refuses_every_non_fqn_before_directory_or_hub(
+def test_send_refuses_unresolved_non_fqn_after_directory_before_hub(
         seat, monkeypatch, recipient):
-    """Aliases, short names, bot names and mention syntax stop at syntax gate."""
+    """Only an authored, unique alias survives directory resolution."""
     from agent_comms import operations
     from agent_comms.operations import UnknownRecipient
-    from tests.conftest import FakeTransport
 
-    monkeypatch.setattr(
-        "agent_comms.resolve._post",
-        lambda *a, **kw: pytest.fail("non-FQN --to reached the directory"),
-    )
-    transport = FakeTransport()
-    with pytest.raises(UnknownRecipient, match="not a full agent FQN") as caught:
+    asked = []
+
+    def unresolved(address, payload, timeout):
+        asked.append(payload["target"])
+        ambiguous = payload["target"] == "review"
+        return 404, {
+            "kind": "resolution-result", "contract": "0.2", "success": False,
+            "status": "unknown", "requested": payload["target"],
+            "message": ("alias is ambiguous" if ambiguous else
+                        f"no agent or alias named {payload['target']!r} is known"),
+            "near_misses": (["bakehouse.arc-web.review", "bakehouse.labs.review"]
+                            if ambiguous else []),
+        }
+
+    monkeypatch.setattr("agent_comms.resolve._post", unresolved)
+    with pytest.raises(UnknownRecipient, match="could not be resolved") as caught:
         operations.send("hi", to=recipient, subject="uc02",
-                        transport_factory=lambda c: transport,
+                        transport_factory=lambda c: pytest.fail("hub was reached"),
                         from_fqn="bakehouse.agent-eco.agent-comms")
     assert "Nothing was posted" in str(caught.value)
-    assert transport.sent == []
+    assert asked == [recipient], "the directory, not comms, decides authored aliases"
 
 
 def test_doctor_reports_a_blocked_entry_that_matches_nobody(seat, monkeypatch):
