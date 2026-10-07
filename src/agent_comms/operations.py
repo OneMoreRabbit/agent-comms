@@ -1142,6 +1142,12 @@ class Unaddressed(CommsError):
     tag = "unaddressed"
 
 
+class EmptyMessage(CommsError):
+    """The message has no body text. Refused before any lookup or hub call."""
+
+    tag = "empty-message"
+
+
 class UnknownRecipient(CommsError):
     """`--to` named a seat this seat cannot address. Refused before it is posted.
 
@@ -1254,6 +1260,13 @@ def send(
     like success.
     """
     settings = load_settings(**kw)
+
+    if not (content or "").strip():
+        raise EmptyMessage(
+            "message body is empty. Nothing was posted. Supply body text; the "
+            "FQN envelope and topic identify a message but are not its content."
+        )
+
     sender = sending_agent(from_fqn or "", settings.state_dir)
 
     if not to or not to.strip():

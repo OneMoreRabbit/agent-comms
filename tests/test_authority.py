@@ -393,6 +393,32 @@ def test_a_message_with_no_recipient_is_refused(seat):
     assert transport.sent == [], "nothing may be posted"
 
 
+@pytest.mark.parametrize("content", ["", "   ", "\n\t"])
+def test_an_empty_body_is_refused_before_directory_or_hub(
+        seat, monkeypatch, content):
+    """An envelope without text is not a message and must never be posted."""
+    from agent_comms import operations
+    from agent_comms.operations import EmptyMessage
+
+    monkeypatch.setattr(
+        "agent_comms.resolve._post",
+        lambda *a, **kw: pytest.fail("empty body reached the directory"),
+    )
+
+    def transport(_credential):
+        pytest.fail("empty body created a hub transport")
+
+    with pytest.raises(EmptyMessage, match="message body is empty") as caught:
+        operations.send(
+            content,
+            to="bakehouse.agent-eco.arch",
+            subject="empty-body-gate",
+            from_fqn="bakehouse.agent-eco.agent-comms",
+            transport_factory=transport,
+        )
+    assert "Nothing was posted" in str(caught.value)
+
+
 def test_a_seat_that_does_not_exist_is_refused(seat):
     from agent_comms import operations
     from agent_comms.operations import UnknownRecipient
