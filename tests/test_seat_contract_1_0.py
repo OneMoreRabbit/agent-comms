@@ -941,6 +941,60 @@ def test_a_successful_retry_consumes_exactly_one_attempt(seat, monkeypatch):
     assert row["attempts"] == 1
 
 
+def test_concurrent_retry_passes_report_exactly_one_and_zero(seat, monkeypatch):
+    """UC-11: the loser must not claim the winner's delivery.
+
+    State transitions already prevented two DELIVERED rows, but both passes
+    handed the body to the seat and both returned ``1``.  That makes a losing
+    pass claim work it did not do, and relies on the seat to deduplicate a
+    duplicate handoff.  Start both passes at the lock boundary so this test
+    exercises the measured 1-and-1 race, not two conveniently sequential calls.
+    """
+    import threading
+
+    from agent_comms import operations
+    from agent_comms.store import Mention
+
+    store = operations.message_store(seat / ".comms")
+    store.append(Mention(id=703, sender="agent-eco-arch", channel="agent-eco",
+                         topic="t", content="x", timestamp=NOW, permalink="",
+                         reason="mentioned"))
+    fake_seat(monkeypatch, {"success": True, "status": "delivered",
+                            "message": "typed into the claude session"}, code=0)
+
+    together = threading.Barrier(2)
+    real_lock = operations.MessageStore.acquire_retry_lock
+
+    def contended(self):
+        together.wait(timeout=5)
+        return real_lock(self)
+
+    monkeypatch.setattr(operations.MessageStore, "acquire_retry_lock", contended)
+    results: list[int] = []
+    errors: list[BaseException] = []
+
+    def run():
+        try:
+            results.append(operations.retry_undelivered())
+        except BaseException as exc:  # make a thread failure visible to pytest
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert not errors, errors
+    assert all(not thread.is_alive() for thread in threads), "retry lock deadlocked"
+    assert sorted(results) == [0, 1], results
+    row = store._find(703)
+    assert row["state"] == "delivered" and row["attempts"] == 1
+    events = (seat / ".comms" / "events.log").read_text()
+    assert "message 703" in events and "concurrent pass" in events
+    assert "delivered 0" in events
+
+
 def test_the_daemon_survives_anything_a_retry_pass_can_raise(seat, monkeypatch):
     """A daemon that exits stops the seat receiving SILENTLY, which is the worst
     outcome this component has — worse than any single pass failing.

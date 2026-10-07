@@ -1923,6 +1923,35 @@ def retry_undelivered(
     settings = load_settings(**kw)
     store = message_store(settings.state_dir)
 
+    # Snapshot before waiting for the pass lock so a contender can say which
+    # message another pass settled.  The snapshot authorises nothing: the
+    # queue is read again under the lock below and only that second read drives
+    # delivery.
+    observed = {m.id for m in store.undelivered() if m.authorised}
+    retry_lock = store.acquire_retry_lock()
+    try:
+        current = {m.id for m in store.undelivered() if m.authorised}
+        for message_id in sorted(observed - current):
+            store.record(
+                "info",
+                f"retry: message {message_id} was already delivered or settled by "
+                "a concurrent pass — this pass delivered 0 for that message",
+            )
+        return _retry_undelivered_locked(
+            settings, store, transport_factory, limit, max_age_secs)
+    finally:
+        retry_lock.close()
+
+
+def _retry_undelivered_locked(
+    settings: Settings,
+    store: MessageStore,
+    transport_factory: Callable[[Credential], Transport],
+    limit: int,
+    max_age_secs: int,
+) -> int:
+    """Retry one bounded pass while the cross-process retry lock is held."""
+
     retired = retire_stale(store, max_age_secs)
     waiting = [m for m in store.undelivered() if m.authorised]
     # Newest first for the CAP, then arrival order for DELIVERY.

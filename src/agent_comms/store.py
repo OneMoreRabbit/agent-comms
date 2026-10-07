@@ -291,6 +291,25 @@ class Store:
         handle.flush()
         return handle
 
+    def acquire_retry_lock(self):
+        """Serialise retry passes across the daemon and CLI processes.
+
+        The message state is transactional, but the handoff to ``seat msg`` is
+        outside SQLite.  Without a lock, two passes can both read QUEUED, both
+        hand the same message to the seat, and only afterwards discover which
+        state write won.  Hold this flock across selection, handoff and state
+        recording; a losing pass then rereads the settled queue and reports
+        zero deliveries of its own.
+        """
+        self.ensure()
+        handle = (self.root / "retry.lock").open("a+", encoding="utf-8")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        except OSError:
+            handle.close()
+            raise
+        return handle
+
     # -- messages ----------------------------------------------------------
 
     def append(self, mention: Mention) -> None:

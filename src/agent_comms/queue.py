@@ -458,6 +458,9 @@ class MessageStore(Queue):
     def acquire_daemon_lock(self):
         return self._side().acquire_daemon_lock()
 
+    def acquire_retry_lock(self):
+        return self._side().acquire_retry_lock()
+
     def lock_holder_pid(self):
         return self._side().lock_holder_pid()
 
