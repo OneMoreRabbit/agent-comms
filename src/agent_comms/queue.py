@@ -301,8 +301,8 @@ class Queue:
             else:
                 self._log(message, row["state"], row["state"],
                           (f"attempt {attempts} failed: {detail}" if consumes_attempt else
-                           f"not attemptable: {detail} — a person must act; "
-                           "no attempt consumed, the message stays queued"),
+                           f"not handed off: {detail} — no attempt consumed, "
+                           "the message stays queued"),
                           attempt=attempts if consumes_attempt else None, db=db)
                 if consumes_attempt and attempts >= self.max_attempts:
                     self.move(message, ABANDONED,

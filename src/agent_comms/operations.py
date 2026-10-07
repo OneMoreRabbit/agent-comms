@@ -1693,6 +1693,9 @@ def wake_agent(
     - delivered / queued  → success, marked, done. `queued` is codex taking it for
       a thread that is not loaded; it is not a degraded delivery.
     - no-session / unknown → keep it, retry later, tell the sender once.
+    - queue-at-capacity / queue-unreadable / runtime-unavailable /
+      engine-unavailable → the seat accepted no body; keep it pending without
+      consuming an attempt and expose the machine status in the wake record.
     - failed (exit 10)     → the attempt failed; same treatment.
     - broken               → a person must look. Not retried: nothing a retry can
       change, and spinning would bury the reason.
@@ -1761,7 +1764,10 @@ def wake_agent(
         return _woken(result)
 
     _announce_held(settings, store, mention, result.message, transport_factory)
-    return _woken(result)
+    # Retryable means the seat accepted no durable ownership of the body. Keep
+    # the local row pending and tell every caller — including `_flush_pending`
+    # and the CLI's exit-code mapping — that this remains queued here.
+    return Woken(Woken.QUEUED, f"queued: {result.summary()}")
 
 
 def _announce_held(
@@ -1932,7 +1938,10 @@ def retry_undelivered(
                 # budget for later messages.
                 store.mark_delivered(mention.id)
                 attempts = 0  # inspected only on the failure path below
-            elif getattr(result, "at_capacity", False):
+            elif getattr(result, "deferred_without_attempt", False):
+                # Agent-seat 2.9.0 accepted no body. These stable JSON statuses
+                # are backpressure or operational state, never parsed prose.
+                # Keep the message pending without walking it toward ABANDONED.
                 attempts = store.attempt_by_hub_id(
                     mention.id, result.summary(), consumes_attempt=False)
             else:

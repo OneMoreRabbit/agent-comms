@@ -143,21 +143,35 @@ def test_a_failed_attempt_at_exit_10_is_retried(monkeypatch):
     assert seat_app.deliver("body").retryable
 
 
-def test_codex_capacity_refusal_is_identified_narrowly(monkeypatch):
-    """Seat 2.9-draft has no status word for this yet, so pin its exact response.
-
-    A different Codex failure must retain the ordinary attempt bound.
-    """
-    prefix = seat_app.CODEX_QUEUE_FULL_PREFIX
+def test_codex_capacity_refusal_uses_status_not_prose(monkeypatch):
+    """Seat 2.9.0 gives capacity a stable JSON status; prose is not an API."""
     fake_seat(monkeypatch, {
-        "success": False, "status": "failed", "runtime": "codex",
-        "message": prefix + "thread-1: 3 pending (maximum 3); message was not handed off."
+        "success": False, "status": "queue-at-capacity", "runtime": "codex",
+        "message": "arbitrary human sentence that may change"
     }, code=10)
-    assert seat_app.deliver("body").at_capacity
+    result = seat_app.deliver("body")
+    assert result.at_capacity and result.retryable and result.deferred_without_attempt
 
-    other = Delivery(False, "failed", "codex would not take the message: bad thread",
-                     "codex", exit_code=10)
-    assert not other.at_capacity
+    old_prose = Delivery(
+        False, "failed",
+        "codex would not take the message: Codex queue full for thread-1",
+        "codex", exit_code=10)
+    assert not old_prose.at_capacity, "the retired pinned sentence must have no authority"
+    assert not old_prose.deferred_without_attempt
+
+
+@pytest.mark.parametrize("status,exit_code", [
+    ("queue-at-capacity", 10),
+    ("queue-unreadable", 10),
+    ("runtime-unavailable", 10),
+    ("engine-unavailable", 20),
+])
+def test_codex_no_handoff_statuses_stay_retryable_without_an_attempt(
+        status, exit_code):
+    result = Delivery(False, status, "operator-visible reason", "codex",
+                      exit_code=exit_code)
+    assert result.retryable
+    assert result.deferred_without_attempt
 
 
 # -- the limits the contract states ------------------------------------------
@@ -330,11 +344,8 @@ def test_a_full_codex_queue_does_not_consume_delivery_attempts(seat, monkeypatch
     store = operations.message_store(seat / ".comms")
     store.append(Mention(id=31, sender="agent-eco-arch", channel="agent-eco", topic="t",
                          content="x", timestamp=NOW, permalink="", reason="mentioned"))
-    full = seat_app.CODEX_QUEUE_FULL_PREFIX + (
-        "thread-1: 3 pending (maximum 3); message was not handed off. "
-        "Retry after pending messages are consumed.")
-    fake_seat(monkeypatch, {"success": False, "status": "failed",
-                            "runtime": "codex", "message": full}, code=10)
+    fake_seat(monkeypatch, {"success": False, "status": "queue-at-capacity",
+                            "runtime": "codex", "message": "queue is full"}, code=10)
 
     for _ in range(5):
         assert operations.retry_undelivered() == 0
@@ -346,6 +357,57 @@ def test_a_full_codex_queue_does_not_consume_delivery_attempts(seat, monkeypatch
                             "message": "queued to codex conversation thread-1"}, code=0)
     assert operations.retry_undelivered() == 1
     assert store.undelivered() == []
+    assert operations.retry_undelivered() == 0, "an accepted retry happens exactly once"
+
+
+def test_a_capacity_refusal_from_the_fast_path_stays_queued(seat, monkeypatch):
+    """The initial `comms wake` must not make backpressure look settled."""
+    from dataclasses import asdict
+    from agent_comms.store import Mention
+    from tests.conftest import FakeTransport
+
+    mention = Mention(id=33, sender="agent-eco-arch", channel="agent-eco",
+                      topic="t", content="x", timestamp=NOW, permalink="",
+                      reason="mentioned")
+    store = operations.message_store(seat / ".comms")
+    store.append(mention)
+    fake_seat(monkeypatch, {"success": False, "status": "queue-at-capacity",
+                            "runtime": "codex", "message": "three pending"}, code=10)
+
+    outcome = operations.wake_agent(
+        asdict(mention), transport_factory=lambda c: FakeTransport())
+    assert outcome.outcome == operations.Woken.QUEUED
+    waiting = store.undelivered()
+    assert [m.id for m in waiting] == [33]
+    assert waiting[0].attempts == 0
+
+
+@pytest.mark.parametrize("status,exit_code", [
+    ("queue-unreadable", 10),
+    ("runtime-unavailable", 10),
+    ("engine-unavailable", 20),
+])
+def test_codex_operational_faults_remain_pending_and_visible(
+        seat, monkeypatch, status, exit_code):
+    """No-handoff operational faults neither disappear nor exhaust attempts."""
+    from agent_comms.store import Mention
+
+    store = operations.message_store(seat / ".comms")
+    store.append(Mention(id=32, sender="agent-eco-arch", channel="agent-eco",
+                         topic="t", content="x", timestamp=NOW, permalink="",
+                         reason="mentioned"))
+    fake_seat(monkeypatch, {"success": False, "status": status,
+                            "runtime": "codex", "message": "visible detail"},
+              code=exit_code)
+
+    for _ in range(store.max_attempts + 2):
+        assert operations.retry_undelivered() == 0
+    waiting = store.undelivered()
+    assert [m.id for m in waiting] == [32]
+    assert waiting[0].attempts == 0
+    wake_row = store.last_wake()
+    assert wake_row["outcome"] == status
+    assert status in wake_row["detail"] and "visible detail" in wake_row["detail"]
 
 
 def test_a_pre_1_0_seat_is_refused_loudly(monkeypatch):

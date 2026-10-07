@@ -244,7 +244,7 @@ def test_a_non_attempt_is_still_written_down(q):
     q.record_attempt(m, delivered=False, detail="broken", consumes_attempt=False)
 
     causes = [r["cause"] for r in q.history(m)]
-    assert any("not attemptable" in c and "no attempt consumed" in c for c in causes)
+    assert any("not handed off" in c and "no attempt consumed" in c for c in causes)
 
 
 def test_a_broken_window_cannot_hold_a_message_forever(q):
