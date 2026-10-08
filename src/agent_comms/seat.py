@@ -33,15 +33,16 @@ UNKNOWN = "unknown"
 #: only a consumer branching on the STRING has to care. These are that care.
 UNKNOWN_AGENT = "unknown-agent"   # exit 10 — this seat does not serve that name
 CONFLICTED = "conflicted"         # exit 20 — several sessions could be it; it will not choose
+#: Agent-seat 2.9.0 Codex admission and availability outcomes. These are stable
+#: JSON `status` values; the accompanying prose is for people and is never
+#: parsed by this client.
+QUEUE_AT_CAPACITY = "queue-at-capacity"
+QUEUE_UNREADABLE = "queue-unreadable"
+RUNTIME_UNAVAILABLE = "runtime-unavailable"
+ENGINE_UNAVAILABLE = "engine-unavailable"
 
 #: The seat's body limit (contract: 65536 bytes, never silently truncated).
 MAX_BODY_BYTES = 65536
-
-# Seat 2.9-draft introduced bounded Codex admission before it introduced a
-# distinct machine status for that refusal. This is the exact sentence emitted
-# by the deployed 2.9 helper. Keep the compatibility check narrow: other
-# `failed`/10 answers are real attempts and retain the normal attempt bound.
-CODEX_QUEUE_FULL_PREFIX = "codex would not take the message: Codex queue full for "
 
 #: Which outcomes are worth trying again, and which are not. This is the retry
 #: decision the operator ruled is ours: the queue is this client's, so the seat's
@@ -56,7 +57,25 @@ CODEX_QUEUE_FULL_PREFIX = "codex would not take the message: Codex queue full fo
 #: and retrying would spin against a state no retry can change. `failed` at exit 2
 #: is a usage error — OUR defect, not the seat's, and repeating a malformed call
 #: is how a bug becomes a flood.
-RETRYABLE = frozenset({NO_SESSION, UNKNOWN})
+RETRYABLE = frozenset({
+    NO_SESSION,
+    UNKNOWN,
+    QUEUE_AT_CAPACITY,
+    QUEUE_UNREADABLE,
+    RUNTIME_UNAVAILABLE,
+    ENGINE_UNAVAILABLE,
+})
+
+#: The seat accepted no body for these outcomes. They are operational state or
+#: backpressure, not failed handoff attempts, so the message stays pending
+#: without walking toward the attempt bound. `failed` deliberately stays out:
+#: ordinary handoff failures retain the existing bounded-retry behavior.
+DEFERRED_WITHOUT_ATTEMPT = frozenset({
+    QUEUE_AT_CAPACITY,
+    QUEUE_UNREADABLE,
+    RUNTIME_UNAVAILABLE,
+    ENGINE_UNAVAILABLE,
+})
 
 
 #: The contract majors this client can speak. **An explicit set, never a
@@ -187,13 +206,15 @@ class Delivery:
         Nothing was handed off, so this does not consume a delivery attempt.
         The message remains subject to the normal age and backlog bounds.
 
-        Seat 2.9-draft exposes this only in its response sentence. This one
-        deliberately pinned compatibility check can be removed when the Seat
-        contract publishes a distinct status or field.
+        Agent-seat 2.9.0 publishes this as a stable JSON status. The prose may
+        change freely and is not an input to the decision.
         """
-        return (not self.success and self.runtime == "codex" and
-                self.status == FAILED and self.exit_code == 10 and
-                self.message[:len(CODEX_QUEUE_FULL_PREFIX)] == CODEX_QUEUE_FULL_PREFIX)
+        return not self.success and self.status == QUEUE_AT_CAPACITY
+
+    @property
+    def deferred_without_attempt(self) -> bool:
+        """The seat accepted no body, so keep this delivery pending unchanged."""
+        return not self.success and self.status in DEFERRED_WITHOUT_ATTEMPT
 
     def summary(self) -> str:
         """One line for a log or a sender, in the seat's own words where it has them."""

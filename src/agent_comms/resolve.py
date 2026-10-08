@@ -79,6 +79,9 @@ class Resolution:
     status: str
     requested: str
     canonical_id: str = ""
+    #: Set only when the directory resolved an authored alias. A different
+    #: canonical id without this field is not authority to rewrite an address.
+    alias_used: str = ""
     #: NOTE — `seat` and `host` were the 0.1 route block and are DELETED.
     #: 0.2 carries no route block at all, so they were always empty, and
     #: nothing read them: §11 question 1, the same rule that deleted
@@ -397,6 +400,7 @@ def _read(target: str, body: dict) -> Resolution:
         return Resolution(
             success=True, status=str(body.get("status") or "resolved"), requested=target,
             canonical_id=str(body.get("canonical_id") or ""),
+            alias_used=str(body.get("alias_used") or ""),
             delivery=str(body.get("delivery") or ""),
             transports=body.get("transports") or {},
             permissions=body.get("permissions") or {},

@@ -28,10 +28,20 @@ from tests.conftest import FakeTransport
 
 
 def _event(msg_id, sender, topic="agent-comms: do a thing"):
+    sender_fqn = {
+        "agent-eco-arch": "bakehouse.agent-eco.arch",
+        "blocks-android": "bakehouse.blocks.android",
+        "arc-platform-platform": "bakehouse.arc-platform.platform",
+        "arc-platform-process": "bakehouse.arc-platform.process",
+    }.get(sender, "")
+    content = operations.addressed(
+        "agent-eco-agent-comms", "please do this",
+        to_fqn="bakehouse.agent-eco.agent-comms", from_fqn=sender_fqn,
+    ) if sender_fqn else "please do this"
     return {"id": msg_id, "type": "message", "flags": [], "message": {
         "id": msg_id, "sender_full_name": sender, "sender_email": f"{sender}@h",
         "display_recipient": "agent-eco", "subject": topic,
-        "content": "please do this", "timestamp": 1, "stream_id": 7, "type": "stream"}}
+        "content": content, "timestamp": 1, "stream_id": 7, "type": "stream"}}
 
 
 def _directory(seat_dir, text):
@@ -321,25 +331,80 @@ def test_send_addresses_an_FQN_and_mentions_the_SEATS_bot(seat):
     )
 
 
-def test_zulip_syntax_in_to_is_accepted_and_normalised(seat):
+def test_zulip_syntax_in_to_is_refused_without_a_post(seat):
+    from agent_comms import operations
+    from agent_comms.operations import UnknownRecipient
+    from tests.conftest import FakeTransport
+
+    transport = FakeTransport()
+    with pytest.raises(UnknownRecipient, match="could not be resolved"):
+        operations.send("hi", to="@**bakehouse.agent-eco.agent-skeleton**", subject="s",
+                        transport_factory=lambda c: transport,
+                        from_fqn="bakehouse.agent-eco.agent-comms")
+    assert transport.sent == []
+
+
+def test_an_fqn_shaped_authored_alias_posts_the_canonical_fqn(seat, monkeypatch):
+    """An alias is input only; the directory's one canonical FQN goes on wire."""
+    from agent_comms import operations
+    from tests.conftest import FakeTransport
+
+    alias = "bakehouse.agent-eco.arch-alias"
+
+    def alias_answer(address, payload, timeout):
+        assert payload["target"] == alias
+        return 200, {
+            "kind": "resolution-result", "contract": "0.2", "success": True,
+            "status": "resolved", "requested": alias,
+            "canonical_id": "bakehouse.agent-eco.arch", "alias_used": alias,
+            "delivery": "inject",
+            "route_revision": 1,
+            "transports": {"comms": {"channel": "agent-eco", "bot": "agent-eco-arch"}},
+        }
+
+    monkeypatch.setattr("agent_comms.resolve._post", alias_answer)
+    transport = FakeTransport()
+    operations.send("hi", to=alias, subject="s",
+                    transport_factory=lambda c: transport,
+                    from_fqn="bakehouse.agent-eco.agent-comms")
+    sent = transport.sent[-1]
+    assert operations.envelope_from_body(sent["content"]) == "bakehouse.agent-eco.arch"
+    assert sent["content"].startswith("@**agent-eco-arch** ")
+    assert sent["topic"] == "bakehouse.agent-eco.arch: s"
+
+
+def test_an_authored_short_alias_posts_the_canonical_fqn(seat):
+    """`arch` works because the fake directory authors it, not by inference."""
     from agent_comms import operations
     from tests.conftest import FakeTransport
 
     transport = FakeTransport()
-    operations.send("hi", to="@**bakehouse.agent-eco.agent-skeleton**", subject="s",
-                    transport_factory=lambda c: transport, from_fqn="bakehouse.agent-eco.agent-comms")
-    assert transport.sent[-1]["content"].startswith("@**agent-skeleton** ")
+    operations.send("hi", to="arch", subject="alias",
+                    transport_factory=lambda c: transport,
+                    from_fqn="bakehouse.agent-eco.agent-comms")
+    sent = transport.sent[-1]
+    assert operations.envelope_from_body(sent["content"]) == "bakehouse.agent-eco.arch"
+    assert sent["topic"] == "bakehouse.agent-eco.arch: alias"
 
 
-def test_the_recipient_is_matched_case_insensitively(seat):
-    """A seat should not have to know the hub's capitalisation; the mention must."""
+def test_a_canonical_rewrite_without_an_authored_alias_is_refused(seat, monkeypatch):
+    """A changed id is authority only when `alias_used` names the exact input."""
     from agent_comms import operations
-    from tests.conftest import FakeTransport
+    from agent_comms.operations import UnknownRecipient
 
-    transport = FakeTransport()
-    operations.send("hi", to="Bakehouse.Agent-Eco.Agent-Skeleton", subject="s",
-                    transport_factory=lambda c: transport, from_fqn="bakehouse.agent-eco.agent-comms")
-    assert transport.sent[-1]["content"].startswith("@**agent-skeleton** ")
+    def malformed_answer(address, payload, timeout):
+        return 200, {
+            "kind": "resolution-result", "contract": "0.2", "success": True,
+            "status": "resolved", "requested": payload["target"],
+            "canonical_id": "bakehouse.agent-eco.arch", "delivery": "inject",
+            "transports": {"comms": {"channel": "agent-eco", "bot": "agent-eco-arch"}},
+        }
+
+    monkeypatch.setattr("agent_comms.resolve._post", malformed_answer)
+    with pytest.raises(UnknownRecipient, match="without declaring.*authored alias"):
+        operations.send("hi", to="arch", subject="bad-answer",
+                        transport_factory=lambda c: pytest.fail("hub was reached"),
+                        from_fqn="bakehouse.agent-eco.agent-comms")
 
 
 # -- the blocks failure: a message that reaches nobody ------------------------
@@ -362,6 +427,32 @@ def test_a_message_with_no_recipient_is_refused(seat):
                         topic="agent-comms: my own topic",
                         transport_factory=lambda c: transport, from_fqn="bakehouse.agent-eco.agent-comms")
     assert transport.sent == [], "nothing may be posted"
+
+
+@pytest.mark.parametrize("content", ["", "   ", "\n\t"])
+def test_an_empty_body_is_refused_before_directory_or_hub(
+        seat, monkeypatch, content):
+    """An envelope without text is not a message and must never be posted."""
+    from agent_comms import operations
+    from agent_comms.operations import EmptyMessage
+
+    monkeypatch.setattr(
+        "agent_comms.resolve._post",
+        lambda *a, **kw: pytest.fail("empty body reached the directory"),
+    )
+
+    def transport(_credential):
+        pytest.fail("empty body created a hub transport")
+
+    with pytest.raises(EmptyMessage, match="message body is empty") as caught:
+        operations.send(
+            content,
+            to="bakehouse.agent-eco.arch",
+            subject="empty-body-gate",
+            from_fqn="bakehouse.agent-eco.agent-comms",
+            transport_factory=transport,
+        )
+    assert "Nothing was posted" in str(caught.value)
 
 
 def test_a_seat_that_does_not_exist_is_refused(seat):
@@ -429,7 +520,7 @@ def test_addressing_an_agent_on_our_own_seat_is_DELIVERY_not_a_refusal(seat):
     assert envelope_from_body(body) == "bakehouse.agent-eco.agent-comms"
 
     # The bot name is not an address.
-    with pytest.raises(UnknownRecipient, match="not an agent the directory can resolve"):
+    with pytest.raises(UnknownRecipient, match="could not be resolved"):
         operations.send("hi", to="agent-eco-agent-comms", subject="myself",
                         transport_factory=lambda c: FakeTransport(),
                         from_fqn="bakehouse.agent-eco.agent-comms")
@@ -522,7 +613,11 @@ def test_reply_validates_the_body_too(seat):
     transport = FakeTransport(event_batches=[{"result": "success", "events": [
         {"id": 77, "type": "message", "flags": ["mentioned"], "message": {
             "id": 77, "sender_full_name": "agent-eco-arch", "display_recipient": "agent-eco",
-            "subject": "agent-comms: q", "content": "?", "timestamp": 1, "stream_id": 7}},
+            "subject": "agent-comms: q", "content": operations.addressed(
+                "agent-eco-agent-comms", "?",
+                to_fqn="bakehouse.agent-eco.agent-comms",
+                from_fqn="bakehouse.agent-eco.arch"),
+            "timestamp": 1, "stream_id": 7}},
     ]}])
     operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
     posted = operations.reply(77, "cc @**blocks-android**",
@@ -714,17 +809,16 @@ def test_a_refusal_names_the_rule_that_fired_and_where_it_lives(tmp_path, monkey
             "a refusal pointed at the retired seat file: " + text)
 
 def test_every_message_states_the_sending_agent(seat):
-    """ONE RULE: `--from` is required on every message and has no default.
+    """`--from` is required and must be an agent assigned to this seat.
 
     A message is from an agent to an agent; the seat is only the delivery
     mechanism, mapped to a bot on the hub. comms runs on the seat and cannot
-    know which of its agents is asking, and a seat has no FQN to fall back on.
+    know which of its agents is asking, and it must not accept a bot name or
+    another seat's FQN as the caller's word alone.
 
-    An earlier version read "the one agent this seat serves" when there was
-    exactly one. That is right only while a seat serves one agent and silently
-    wrong the moment it serves two -- which is the shape the estate is moving
-    to. The near-miss is therefore the single-agent seat: it must STILL refuse,
-    because a rule that usually applies is the one that fails quietly later."""
+    The assignment cache is the seat's complete, last verified set. A failed
+    refresh deliberately leaves it in place, so this gate neither guesses from
+    a name nor needs a live directory call."""
     import pytest
     from agent_comms import operations
     from agent_comms.operations import SenderUnknown, sending_agent
@@ -735,11 +829,25 @@ def test_every_message_states_the_sending_agent(seat):
                         transport_factory=lambda c: FakeTransport())
     assert "--from" in str(caught.value)
 
+    state_dir = load_settings().state_dir
     with pytest.raises(SenderUnknown):
-        sending_agent("")
+        sending_agent("", state_dir)
     with pytest.raises(SenderUnknown):
-        sending_agent("   ")
-    assert sending_agent(" bakehouse.agent-eco.arch ") == "bakehouse.agent-eco.arch"
+        sending_agent("   ", state_dir)
+    assert sending_agent(" bakehouse.agent-eco.agent-comms ", state_dir) \
+        == "bakehouse.agent-eco.agent-comms"
+
+    # Both invalid claims are refused before a hub transport can post.
+    transport = FakeTransport()
+    for claimed in ("agent-eco-agent-comms", "bakehouse.agent-eco.arch"):
+        with pytest.raises(SenderUnknown) as refused:
+            operations.send(
+                "body", to="bakehouse.agent-eco.arch", subject="s",
+                from_fqn=claimed, transport_factory=lambda _c: transport,
+            )
+        assert claimed in str(refused.value)
+        assert "Nothing was posted" in str(refused.value)
+    assert transport.sent == []
 
 
 def test_a_reply_states_both_agents_too():
@@ -801,30 +909,6 @@ def test_an_unanswered_directory_is_not_an_empty_set(monkeypatch):
     # ...exercised through the parser rather than the socket:
     answer = addressable.Answer(claimed_from="bakehouse.nowhere.nobody", entries=())
     assert answer.entries == ()
-
-
-def test_a_hub_bot_maps_to_one_fqn_or_none(monkeypatch):
-    """Transport identity is exact; a shared bot never picks an agent."""
-    from agent_comms import addressable
-
-    one = addressable.Answer(claimed_from="", entries=(
-        addressable.Entry(fqn="bakehouse.no-transport.agent", bot=None),
-        addressable.Entry(fqn="bakehouse.arc-platform.platform",
-                          bot="arc-platform-platform"),
-    ))
-    monkeypatch.setattr(addressable, "fetch", lambda **_kw: one)
-    assert addressable.fqn_for_bot("ARC-PLATFORM-PLATFORM") == \
-        "bakehouse.arc-platform.platform"
-    assert addressable.fqn_for_bot("a-human") == ""
-
-    shared = addressable.Answer(claimed_from="", entries=(
-        addressable.Entry(fqn="bakehouse.example.one", bot="shared-seat"),
-        addressable.Entry(fqn="bakehouse.example.two", bot="shared-seat"),
-    ))
-    monkeypatch.setattr(addressable, "fetch", lambda **_kw: shared)
-    with pytest.raises(addressable.AddressableUnavailable,
-                       match="more than one agent"):
-        addressable.fqn_for_bot("shared-seat")
 
 
 def test_a_claim_the_directory_reads_differently_is_reported(monkeypatch):
@@ -893,41 +977,39 @@ def test_a_blocked_recipient_is_refused_at_the_SENDER(seat, monkeypatch):
     assert not entry_matches_fqn("agent-skeleton", me)
 
 
-def test_send_refusing_a_bare_role_carries_the_directorys_near_misses(seat):
-    """`send` and `resolve` must be equally actionable about the same name.
-
-    `arch` is a bare role: it ends several FQNs in different projects, so it is
-    never authored as an alias and both surfaces refuse it. What differed was
-    the help. `_directory_hint` — the `did you mean` line — sits behind
-    `_resolve_recipient`, and the agent-or-human gate added in front of it
-    refuses first, so from 2026-09-25 `comms resolve arch` listed the
-    candidates and `comms send --to arch` printed a dead end. Measured on
-    UC-02 step 4, 2026-09-27.
-
-    The near-miss control is the second half: a name that is simply not an
-    agent must NOT sprout a `did you mean`, or the line means nothing.
-    """
+@pytest.mark.parametrize("recipient", [
+    "agent-skeleton",
+    "agent-eco-arch",
+    "review",
+    "@**bakehouse.agent-eco.arch**",
+])
+def test_send_refuses_unresolved_non_fqn_after_directory_before_hub(
+        seat, monkeypatch, recipient):
+    """Only an authored, unique alias survives directory resolution."""
     from agent_comms import operations
     from agent_comms.operations import UnknownRecipient
-    from tests.conftest import FakeTransport
 
-    with pytest.raises(UnknownRecipient) as caught:
-        operations.send("hi", to="arch", subject="uc02",
-                        transport_factory=lambda c: FakeTransport(),
-                        from_fqn="bakehouse.agent-eco.agent-comms")
-    said = str(caught.value)
-    assert "not an agent the directory can resolve" in said, said
-    assert "Did you mean" in said, "the send refusal dropped the directory's near-misses"
-    assert "bakehouse.agent-eco.arch" in said, said
-    assert "bakehouse.orchestrator.arch" in said, "only one project's arch was offered"
+    asked = []
 
-    # The control: a name with no near-misses gets the refusal and no hint.
-    with pytest.raises(UnknownRecipient) as caught:
-        operations.send("hi", to="zzz-no-such-thing", subject="uc02",
-                        transport_factory=lambda c: FakeTransport(),
+    def unresolved(address, payload, timeout):
+        asked.append(payload["target"])
+        ambiguous = payload["target"] == "review"
+        return 404, {
+            "kind": "resolution-result", "contract": "0.2", "success": False,
+            "status": "unknown", "requested": payload["target"],
+            "message": ("alias is ambiguous" if ambiguous else
+                        f"no agent or alias named {payload['target']!r} is known"),
+            "near_misses": (["bakehouse.arc-web.review", "bakehouse.labs.review"]
+                            if ambiguous else []),
+        }
+
+    monkeypatch.setattr("agent_comms.resolve._post", unresolved)
+    with pytest.raises(UnknownRecipient, match="could not be resolved") as caught:
+        operations.send("hi", to=recipient, subject="uc02",
+                        transport_factory=lambda c: pytest.fail("hub was reached"),
                         from_fqn="bakehouse.agent-eco.agent-comms")
-    assert "Did you mean" not in str(caught.value), (
-        "a 'did you mean' with nothing to mean is noise that trains readers to skip it")
+    assert "Nothing was posted" in str(caught.value)
+    assert asked == [recipient], "the directory, not comms, decides authored aliases"
 
 
 def test_doctor_reports_a_blocked_entry_that_matches_nobody(seat, monkeypatch):
@@ -1028,14 +1110,14 @@ def test_the_directorys_partners_list_decides_and_an_absent_one_does_not(seat, t
         "a short name admitted an FQN sender — that is the guessing that was removed")
 
 
-def test_inbound_bot_names_are_resolved_to_fqns_before_the_partners_check(
+def test_inbound_delivery_requires_an_fqn_sender_but_humans_are_unaffected(
         seat, monkeypatch):
-    """A Zulip event attributes a post to a bot, while policy names agents.
+    """Bot delivery is FQN-only; a hub bot never supplies agent identity.
 
-    Released 2.8.1 compared those different forms. A declared partner was
-    therefore refused even though the refusal printed the matching FQN in the
-    list. The addressable surface supplies the transport-to-agent mapping;
-    permission still comes only from the addressed agent's partners list.
+    A malformed or absent sender header is legacy and ignored, even when the
+    bot belongs to a declared partner. A valid FQN still reaches the partners
+    check, while a human (who has no FQN by design) remains admitted through
+    the existing hub-human path.
     """
     from agent_comms import addressable, config_sync
 
@@ -1049,76 +1131,66 @@ def test_inbound_bot_names_are_resolved_to_fqns_before_the_partners_check(
             "permissions": {"comms": {"partners": [allowed]}},
         },
     })
-    monkeypatch.setattr(addressable, "fetch", lambda **_kw: addressable.Answer(
-        claimed_from="",
-        entries=(
-            addressable.Entry(fqn=allowed, bot="arc-platform-platform"),
-            addressable.Entry(fqn=refused, bot="arc-platform-process"),
-        ),
-    ))
+    monkeypatch.setattr(
+        addressable, "fetch",
+        lambda **_kw: (_ for _ in ()).throw(
+            AssertionError("the receive path must not resolve a bot name")),
+    )
 
-    events = [_event(806, "arc-platform-platform", topic=f"{recipient}: allowed"),
-              _event(807, "arc-platform-process", topic=f"{recipient}: refused")]
+    missing = _event(805, "arc-platform-platform",
+                     topic=f"{recipient}: missing sender")
+    missing["message"]["content"] = "please do this"
+    malformed = _event(806, "arc-platform-platform",
+                       topic=f"{recipient}: legacy allowed")
+    # The 2.8.2 defect: an old client put its bot name in the sender slot.
+    # That is not an FQN, so the receiver ignores the message without trying
+    # to turn the hub-vouched bot into an agent identity.
+    malformed["message"]["content"] = (
+        f"@**agent-eco-agent-comms** `arc-platform-platform`→`{recipient}` "
+        "please do this"
+    )
+    correct = _event(807, "arc-platform-platform",
+                     topic=f"{recipient}: current allowed")
+    correct["message"]["content"] = (
+        f"@**agent-eco-agent-comms** `{allowed}`→`{recipient}` please do this"
+    )
+    undeclared = _event(809, "arc-platform-process",
+                        topic=f"{recipient}: refused")
+    undeclared["message"]["content"] = (
+        f"@**agent-eco-agent-comms** `{refused}`→`{recipient}` please do this"
+    )
+    human = _event(811, "Oliver Blakeman", topic=f"{recipient}: human")
+    events = [missing, malformed, correct, undeclared, human]
     for event in events:
         event["flags"] = ["mentioned"]
     notified = []
     transport = FakeTransport(
         event_batches=[{"result": "success", "events": events}],
         realm=["agent-eco-agent-comms", "arc-platform-platform",
-               "arc-platform-process"],
-        channel_members=["agent-eco-agent-comms"],
+               "arc-platform-process", "Oliver Blakeman"],
+        channel_members=["agent-eco-agent-comms", "Oliver Blakeman"],
     )
 
     assert operations.run_daemon(
         transport_factory=lambda _c: transport, max_iterations=1,
         on_mention=notified.append,
-    ) == 2
+    ) == 3
 
     stored = {message.id: message for message in operations.inbox()}
-    assert stored[806].sender_fqn == allowed
-    assert stored[806].authorised is True
-    assert [message.id for message in notified] == [806]
-    assert stored[807].sender_fqn == refused
-    assert stored[807].authorised is False
+    assert 805 not in stored, "a missing bot sender is ignored, not stored"
+    assert 806 not in stored, "a malformed bot sender is ignored, not stored"
+    assert stored[807].sender_fqn == allowed
+    assert stored[807].authorised is True
+    assert stored[811].sender_fqn == ""
+    assert stored[811].authorised is True
+    assert [message.id for message in notified] == [807, 811]
+    assert stored[809].sender_fqn == refused
+    assert stored[809].authorised is False
     log = (seat / ".comms" / "events.log").read_text(encoding="utf-8")
-    assert f"refused message 807 from '{refused}'" in log
-    assert "refused message 807 from 'arc-platform-process'" not in log
-
-
-def test_a_bot_that_cannot_be_resolved_does_not_widen_an_fqn_partners_list(
-        seat, monkeypatch):
-    """Directory failure cannot turn an allow-list into channel admission."""
-    from agent_comms import config_sync
-
-    recipient = "bakehouse.agent-eco.agent-comms"
-    monkeypatch.setattr(config_sync, "agent_set", lambda _d: {
-        recipient: {
-            "transports": {"comms": {"channel": "agent-eco",
-                                        "bot": "agent-eco-agent-comms"}},
-            "permissions": {"comms": {
-                "partners": ["bakehouse.arc-platform.platform"],
-            }},
-        },
-    })
-    monkeypatch.setattr(
-        "agent_comms.operations.addressable.fqn_for_bot",
-        lambda _name: (_ for _ in ()).throw(RuntimeError("directory unavailable")),
-    )
-    event = _event(808, "arc-platform-platform", topic=f"{recipient}: unresolved")
-    event["flags"] = ["mentioned"]
-    transport = FakeTransport(
-        event_batches=[{"result": "success", "events": [event]}],
-        realm=["agent-eco-agent-comms", "arc-platform-platform"],
-        channel_members=["agent-eco-agent-comms", "arc-platform-platform"],
-    )
-
-    operations.run_daemon(transport_factory=lambda _c: transport, max_iterations=1)
-
-    message = operations.inbox()[0]
-    assert message.authorised is False
-    assert message.sender_fqn == ""
-    log = (seat / ".comms" / "events.log").read_text(encoding="utf-8")
-    assert "could not resolve hub sender 'arc-platform-platform'" in log
+    assert log.count("ignored legacy message 805: no FQN sender") == 1
+    assert log.count("ignored legacy message 806: no FQN sender") == 1
+    assert f"refused message 809 from '{refused}'" in log
+    assert "refused message 809 from 'arc-platform-process'" not in log
 
 
 def test_blocked_beats_an_explicit_allow_on_the_same_agent(seat, tmp_path, monkeypatch):

@@ -354,6 +354,7 @@ def test_supersession_is_read_from_the_body_not_from_a_redirect(directory, monke
 
     assert answer.success is True
     assert answer.canonical_id == "bakehouse.agent-eco.arch"
+    assert answer.alias_used == "agenteco"
     assert answer.degraded is False
 
 
@@ -378,6 +379,7 @@ def test_a_0_2_answer_tells_us_where_to_send_and_nothing_about_the_seat(director
     a = R.Resolver(local_agents={}).resolve("arc-web-review", caller="c")
 
     assert a.success and a.canonical_id == "bakehouse.arc-web.review"
+    assert a.alias_used == "arc-web-review"
     assert a.delivery == "inject" and a.transports["comms"]["channel"] == "arc-web"
     # The strong form: the fields do not EXIST, so nothing can build on them.
     # `seat` and `host` were the 0.1 route block and are deleted; 0.2 carries no
