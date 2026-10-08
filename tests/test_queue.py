@@ -244,7 +244,7 @@ def test_a_non_attempt_is_still_written_down(q):
     q.record_attempt(m, delivered=False, detail="broken", consumes_attempt=False)
 
     causes = [r["cause"] for r in q.history(m)]
-    assert any("not attemptable" in c and "no attempt consumed" in c for c in causes)
+    assert any("not handed off" in c and "no attempt consumed" in c for c in causes)
 
 
 def test_a_broken_window_cannot_hold_a_message_forever(q):
@@ -502,6 +502,17 @@ def test_the_envelope_states_both_ends_as_FQNs():
     old = addressed("test-claude", "hi", to_fqn="bakehouse.agent-eco.test-claude-another1")
     assert envelope_from_body(old) == "bakehouse.agent-eco.test-claude-another1"
     assert envelope_sender(old) == ""
+
+    # A legacy/malformed sender slot can contain the seat bot. A bot is not an
+    # FQN, so the receiver treats the claim as absent and resolves the hub's
+    # attributed sender instead.
+    malformed = addressed(
+        "test-claude", "hi",
+        to_fqn="bakehouse.agent-eco.test-claude-another1",
+        from_fqn="agent-eco-test-codex",
+    )
+    assert envelope_from_body(malformed) == "bakehouse.agent-eco.test-claude-another1"
+    assert envelope_sender(malformed) == ""
 
     # An unmarked message states neither.
     assert envelope_sender("@**test-claude** hello") == ""

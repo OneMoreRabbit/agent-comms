@@ -379,7 +379,10 @@ def test_resume_does_not_discard_events(seat):
     transport = FakeTransport(event_batches=[{"result": "success", "events": [
         {"id": 43, "type": "message", "flags": ["mentioned"], "message": {
             "id": 401, "sender_full_name": "agent-eco-arch", "display_recipient": "agent-eco",
-            "subject": "t", "content": "must not be dropped",
+            "subject": "t", "content": operations.addressed(
+                "agent-eco-agent-comms", "must not be dropped",
+                to_fqn="bakehouse.agent-eco.agent-comms",
+                from_fqn="bakehouse.agent-eco.arch"),
             "timestamp": 1, "stream_id": 7}},
     ]}])
     stored = operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
@@ -403,7 +406,10 @@ def test_daemon_stores_only_mentions(seat):
     transport = FakeTransport(event_batches=[{"result": "success", "events": [
         {"id": 1, "type": "message", "flags": ["mentioned"], "message": {
             "id": 101, "sender_full_name": "agent-eco-arch", "display_recipient": "agent-eco",
-            "subject": "agent-comms: build it", "content": "please proceed",
+            "subject": "agent-comms: build it", "content": operations.addressed(
+                "agent-eco-agent-comms", "please proceed",
+                to_fqn="bakehouse.agent-eco.agent-comms",
+                from_fqn="bakehouse.agent-eco.arch"),
             "timestamp": 1756900000, "stream_id": 7}},
         {"id": 2, "type": "message", "flags": [], "message": {
             "id": 102, "sender_full_name": "someone", "display_recipient": "agent-eco",
@@ -425,7 +431,10 @@ def test_notify_command_receives_the_mention(seat, tmp_path):
     transport = FakeTransport(event_batches=[{"result": "success", "events": [
         {"id": 1, "type": "message", "flags": ["mentioned"], "message": {
             "id": 201, "sender_full_name": "agent-eco-arch", "display_recipient": "agent-eco",
-            "subject": "agent-comms: ping", "content": "hello",
+            "subject": "agent-comms: ping", "content": operations.addressed(
+                "agent-eco-agent-comms", "hello",
+                to_fqn="bakehouse.agent-eco.agent-comms",
+                from_fqn="bakehouse.agent-eco.arch"),
             "timestamp": 1756900000, "stream_id": 7}},
     ]}])
     operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
@@ -439,7 +448,11 @@ def test_failing_notify_command_is_recorded_not_swallowed(seat):
     transport = FakeTransport(event_batches=[{"result": "success", "events": [
         {"id": 1, "type": "message", "flags": ["mentioned"], "message": {
             "id": 202, "sender_full_name": "agent-eco-arch", "display_recipient": "agent-eco",
-            "subject": "t", "content": "c", "timestamp": 1, "stream_id": 7}},
+            "subject": "t", "content": operations.addressed(
+                "agent-eco-agent-comms", "c",
+                to_fqn="bakehouse.agent-eco.agent-comms",
+                from_fqn="bakehouse.agent-eco.arch"),
+            "timestamp": 1, "stream_id": 7}},
     ]}])
     operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
     assert "notify_command exited 7" in (seat / ".comms" / "events.log").read_text()
@@ -449,7 +462,10 @@ def test_reply_goes_to_the_mentions_own_topic(seat):
     transport = FakeTransport(event_batches=[{"result": "success", "events": [
         {"id": 1, "type": "message", "flags": ["mentioned"], "message": {
             "id": 301, "sender_full_name": "agent-eco-arch", "display_recipient": "agent-eco",
-            "subject": "agent-comms: a question", "content": "?",
+            "subject": "agent-comms: a question", "content": operations.addressed(
+                "agent-eco-agent-comms", "?",
+                to_fqn="bakehouse.agent-eco.agent-comms",
+                from_fqn="bakehouse.agent-eco.arch"),
             "timestamp": 1, "stream_id": 7}},
     ]}])
     operations.run_daemon(transport_factory=lambda c: transport, max_iterations=1)
@@ -879,8 +895,13 @@ def test_supervise_conflicts_with_the_other_daemon_flags(seat):
 
 def _history_msg(mid, ts, topic="agent-comms: from history", sender="agent-eco-arch",
                  channel="agent-eco"):
+    content = operations.addressed(
+        "agent-eco-agent-comms", "body",
+        to_fqn="bakehouse.agent-eco.agent-comms",
+        from_fqn="bakehouse.agent-eco.arch",
+    )
     return {"id": mid, "sender_full_name": sender, "display_recipient": channel,
-            "subject": topic, "content": "body", "timestamp": ts, "stream_id": 7,
+            "subject": topic, "content": content, "timestamp": ts, "stream_id": 7,
             "flags": ["mentioned"]}
 
 
@@ -1993,6 +2014,11 @@ def test_doctor_tells_the_truth_about_a_deaf_seat(seat, monkeypatch):
     # -- DEAF: no assignments, so no channel ------------------------------
     routes.write_text(json.dumps({"routes": []}))
     assert not (load_settings().channel or "").strip(), "fixture is not deaf"
+    from agent_comms.store import Mention
+    operations.message_store(seat).append(Mention(
+        id=9877, sender="old-sender", sender_fqn="bakehouse.old.sender",
+        agent="bakehouse.agent-eco.agent-comms", channel="agent-eco", topic="t",
+        content="old refusal", timestamp=NOW, permalink="", authorised=False))
     deaf = operations.preflight(transport_factory=lambda c: FakeTransport())
 
     ok, why = check("deliverable", deaf)[1], check("deliverable", deaf)[2]
@@ -2009,6 +2035,15 @@ def test_doctor_tells_the_truth_about_a_deaf_seat(seat, monkeypatch):
     reach = [c for c in deaf.checks if c[0] == "reachable channels"]
     assert not any("GRANT WITHOUT SUBSCRIPTION" in c[2] for c in reach), (
         "estate drift was reported for a channel named nothing")
+
+    # Historical refusals normally trigger a current per-channel permission
+    # check.  With no assigned channel there is no such question to ask: the
+    # channel fallback would call the hub with ``''`` and replace the true
+    # zero-assignment diagnosis with a second, wrong-cause directory failure.
+    directory = check("directory", deaf)
+    assert directory[1] is True, directory[2]
+    assert "this bot is not subscribed to channel ''" not in "\n".join(
+        c[2] for c in deaf.checks)
 
     # **The later checks still ran** — a failing subscription here must not
     # return early, or the deliverable finding is hidden.

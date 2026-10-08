@@ -301,8 +301,8 @@ class Queue:
             else:
                 self._log(message, row["state"], row["state"],
                           (f"attempt {attempts} failed: {detail}" if consumes_attempt else
-                           f"not attemptable: {detail} — a person must act; "
-                           "no attempt consumed, the message stays queued"),
+                           f"not handed off: {detail} — no attempt consumed, "
+                           "the message stays queued"),
                           attempt=attempts if consumes_attempt else None, db=db)
                 if consumes_attempt and attempts >= self.max_attempts:
                     self.move(message, ABANDONED,
@@ -457,6 +457,9 @@ class MessageStore(Queue):
 
     def acquire_daemon_lock(self):
         return self._side().acquire_daemon_lock()
+
+    def acquire_retry_lock(self):
+        return self._side().acquire_retry_lock()
 
     def lock_holder_pid(self):
         return self._side().lock_holder_pid()

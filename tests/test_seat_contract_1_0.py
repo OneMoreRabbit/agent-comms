@@ -143,21 +143,35 @@ def test_a_failed_attempt_at_exit_10_is_retried(monkeypatch):
     assert seat_app.deliver("body").retryable
 
 
-def test_codex_capacity_refusal_is_identified_narrowly(monkeypatch):
-    """Seat 2.9-draft has no status word for this yet, so pin its exact response.
-
-    A different Codex failure must retain the ordinary attempt bound.
-    """
-    prefix = seat_app.CODEX_QUEUE_FULL_PREFIX
+def test_codex_capacity_refusal_uses_status_not_prose(monkeypatch):
+    """Seat 2.9.0 gives capacity a stable JSON status; prose is not an API."""
     fake_seat(monkeypatch, {
-        "success": False, "status": "failed", "runtime": "codex",
-        "message": prefix + "thread-1: 3 pending (maximum 3); message was not handed off."
+        "success": False, "status": "queue-at-capacity", "runtime": "codex",
+        "message": "arbitrary human sentence that may change"
     }, code=10)
-    assert seat_app.deliver("body").at_capacity
+    result = seat_app.deliver("body")
+    assert result.at_capacity and result.retryable and result.deferred_without_attempt
 
-    other = Delivery(False, "failed", "codex would not take the message: bad thread",
-                     "codex", exit_code=10)
-    assert not other.at_capacity
+    old_prose = Delivery(
+        False, "failed",
+        "codex would not take the message: Codex queue full for thread-1",
+        "codex", exit_code=10)
+    assert not old_prose.at_capacity, "the retired pinned sentence must have no authority"
+    assert not old_prose.deferred_without_attempt
+
+
+@pytest.mark.parametrize("status,exit_code", [
+    ("queue-at-capacity", 10),
+    ("queue-unreadable", 10),
+    ("runtime-unavailable", 10),
+    ("engine-unavailable", 20),
+])
+def test_codex_no_handoff_statuses_stay_retryable_without_an_attempt(
+        status, exit_code):
+    result = Delivery(False, status, "operator-visible reason", "codex",
+                      exit_code=exit_code)
+    assert result.retryable
+    assert result.deferred_without_attempt
 
 
 # -- the limits the contract states ------------------------------------------
@@ -233,7 +247,11 @@ def test_a_held_message_stays_queued_and_is_retried(seat, monkeypatch):
     transport = FakeTransport(event_batches=[{"result": "success", "events": [
         {"id": 1, "type": "message", "flags": ["mentioned"], "message": {
             "id": 500, "sender_full_name": "agent-eco-arch", "display_recipient": "agent-eco",
-            "subject": "agent-comms: q", "content": "?", "timestamp": NOW, "stream_id": 7}},
+            "subject": "agent-comms: q", "content": operations.addressed(
+                "agent-eco-agent-comms", "?",
+                to_fqn="bakehouse.agent-eco.agent-comms",
+                from_fqn="bakehouse.agent-eco.arch"),
+            "timestamp": NOW, "stream_id": 7}},
     ]}])
 
     # First the seat has nothing running, so it holds.
@@ -326,11 +344,8 @@ def test_a_full_codex_queue_does_not_consume_delivery_attempts(seat, monkeypatch
     store = operations.message_store(seat / ".comms")
     store.append(Mention(id=31, sender="agent-eco-arch", channel="agent-eco", topic="t",
                          content="x", timestamp=NOW, permalink="", reason="mentioned"))
-    full = seat_app.CODEX_QUEUE_FULL_PREFIX + (
-        "thread-1: 3 pending (maximum 3); message was not handed off. "
-        "Retry after pending messages are consumed.")
-    fake_seat(monkeypatch, {"success": False, "status": "failed",
-                            "runtime": "codex", "message": full}, code=10)
+    fake_seat(monkeypatch, {"success": False, "status": "queue-at-capacity",
+                            "runtime": "codex", "message": "queue is full"}, code=10)
 
     for _ in range(5):
         assert operations.retry_undelivered() == 0
@@ -342,6 +357,57 @@ def test_a_full_codex_queue_does_not_consume_delivery_attempts(seat, monkeypatch
                             "message": "queued to codex conversation thread-1"}, code=0)
     assert operations.retry_undelivered() == 1
     assert store.undelivered() == []
+    assert operations.retry_undelivered() == 0, "an accepted retry happens exactly once"
+
+
+def test_a_capacity_refusal_from_the_fast_path_stays_queued(seat, monkeypatch):
+    """The initial `comms wake` must not make backpressure look settled."""
+    from dataclasses import asdict
+    from agent_comms.store import Mention
+    from tests.conftest import FakeTransport
+
+    mention = Mention(id=33, sender="agent-eco-arch", channel="agent-eco",
+                      topic="t", content="x", timestamp=NOW, permalink="",
+                      reason="mentioned")
+    store = operations.message_store(seat / ".comms")
+    store.append(mention)
+    fake_seat(monkeypatch, {"success": False, "status": "queue-at-capacity",
+                            "runtime": "codex", "message": "three pending"}, code=10)
+
+    outcome = operations.wake_agent(
+        asdict(mention), transport_factory=lambda c: FakeTransport())
+    assert outcome.outcome == operations.Woken.QUEUED
+    waiting = store.undelivered()
+    assert [m.id for m in waiting] == [33]
+    assert waiting[0].attempts == 0
+
+
+@pytest.mark.parametrize("status,exit_code", [
+    ("queue-unreadable", 10),
+    ("runtime-unavailable", 10),
+    ("engine-unavailable", 20),
+])
+def test_codex_operational_faults_remain_pending_and_visible(
+        seat, monkeypatch, status, exit_code):
+    """No-handoff operational faults neither disappear nor exhaust attempts."""
+    from agent_comms.store import Mention
+
+    store = operations.message_store(seat / ".comms")
+    store.append(Mention(id=32, sender="agent-eco-arch", channel="agent-eco",
+                         topic="t", content="x", timestamp=NOW, permalink="",
+                         reason="mentioned"))
+    fake_seat(monkeypatch, {"success": False, "status": status,
+                            "runtime": "codex", "message": "visible detail"},
+              code=exit_code)
+
+    for _ in range(store.max_attempts + 2):
+        assert operations.retry_undelivered() == 0
+    waiting = store.undelivered()
+    assert [m.id for m in waiting] == [32]
+    assert waiting[0].attempts == 0
+    wake_row = store.last_wake()
+    assert wake_row["outcome"] == status
+    assert status in wake_row["detail"] and "visible detail" in wake_row["detail"]
 
 
 def test_a_pre_1_0_seat_is_refused_loudly(monkeypatch):
@@ -873,6 +939,60 @@ def test_a_successful_retry_consumes_exactly_one_attempt(seat, monkeypatch):
     row = store._find(702)
     assert row["state"] == "delivered"
     assert row["attempts"] == 1
+
+
+def test_concurrent_retry_passes_report_exactly_one_and_zero(seat, monkeypatch):
+    """UC-11: the loser must not claim the winner's delivery.
+
+    State transitions already prevented two DELIVERED rows, but both passes
+    handed the body to the seat and both returned ``1``.  That makes a losing
+    pass claim work it did not do, and relies on the seat to deduplicate a
+    duplicate handoff.  Start both passes at the lock boundary so this test
+    exercises the measured 1-and-1 race, not two conveniently sequential calls.
+    """
+    import threading
+
+    from agent_comms import operations
+    from agent_comms.store import Mention
+
+    store = operations.message_store(seat / ".comms")
+    store.append(Mention(id=703, sender="agent-eco-arch", channel="agent-eco",
+                         topic="t", content="x", timestamp=NOW, permalink="",
+                         reason="mentioned"))
+    fake_seat(monkeypatch, {"success": True, "status": "delivered",
+                            "message": "typed into the claude session"}, code=0)
+
+    together = threading.Barrier(2)
+    real_lock = operations.MessageStore.acquire_retry_lock
+
+    def contended(self):
+        together.wait(timeout=5)
+        return real_lock(self)
+
+    monkeypatch.setattr(operations.MessageStore, "acquire_retry_lock", contended)
+    results: list[int] = []
+    errors: list[BaseException] = []
+
+    def run():
+        try:
+            results.append(operations.retry_undelivered())
+        except BaseException as exc:  # make a thread failure visible to pytest
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert not errors, errors
+    assert all(not thread.is_alive() for thread in threads), "retry lock deadlocked"
+    assert sorted(results) == [0, 1], results
+    row = store._find(703)
+    assert row["state"] == "delivered" and row["attempts"] == 1
+    events = (seat / ".comms" / "events.log").read_text()
+    assert "message 703" in events and "concurrent pass" in events
+    assert "delivered 0" in events
 
 
 def test_the_daemon_survives_anything_a_retry_pass_can_raise(seat, monkeypatch):
