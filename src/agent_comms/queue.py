@@ -43,7 +43,7 @@ SUMMARISED = "summarised"
 FORWARD: dict[str, frozenset[str]] = {
     RECEIVED: frozenset({REFUSED, QUEUED, HELD, EXPIRED}),
     REFUSED: frozenset(),
-    QUEUED: frozenset({DELIVERED, QUEUED, ABANDONED, EXPIRED}),
+    QUEUED: frozenset({DELIVERED, QUEUED, REFUSED, ABANDONED, EXPIRED}),
     HELD: frozenset({RETRIEVED, EXPIRED}),
     DELIVERED: frozenset(),
     RETRIEVED: frozenset(),
@@ -523,7 +523,8 @@ class MessageStore(Queue):
         with self.connection() as db:
             return db.execute("SELECT * FROM messages ORDER BY seq").fetchall()
 
-    def append(self, mention, held: bool = False) -> None:
+    def append(self, mention, held: bool = False, *, delivery_none: bool = False,
+               delivery_source: str = "default") -> None:
         """Store one arrival. Idempotent on the hub id, as `receive` is.
 
         `held` means the addressed agent's declared delivery mode is `hold`:
@@ -551,6 +552,8 @@ class MessageStore(Queue):
             return
         if not mention.authorised:
             self.move(mid, REFUSED, "sender not permitted", rule="directory")
+        elif delivery_none:
+            self.move(mid, REFUSED, f"delivery: none ({delivery_source})", rule="delivery")
         elif mention.retired:
             # Arrives already retired — an import, or a caller that has decided.
             # Honour it rather than queueing something nobody intends to deliver.
@@ -559,7 +562,9 @@ class MessageStore(Queue):
                 db.execute("UPDATE messages SET retired_reason=? WHERE id=?",
                            (mention.retired, mid))
         elif held:
-            self.move(mid, HELD, "delivery: hold — the agent asks for it", rule="delivery")
+            self.move(mid, HELD,
+                      f"delivery: hold ({delivery_source}) — the agent asks for it",
+                      rule="delivery")
         elif mention.delivered:
             self.move(mid, QUEUED, "permitted")
             self.record_attempt(mid, delivered=True, detail="already delivered on arrival")
@@ -606,6 +611,19 @@ class MessageStore(Queue):
             self.record_attempt(row["id"], delivered=True, detail="delivered")
         elif row["state"] == HELD:
             self.move(row["id"], RETRIEVED, "the agent read it")
+        return True
+
+    def refuse_by_hub_id(self, message_id: int, reason: str) -> bool:
+        """Refuse a queued message when current delivery policy becomes none.
+
+        The arrival policy may have admitted it before a refresh. A later
+        retry must not inject it, and it must not be reported as expired or
+        delivered merely to remove it from the queue.
+        """
+        row = self._find(message_id)
+        if row is None or row["state"] not in (RECEIVED, QUEUED):
+            return False
+        self.move(row["id"], REFUSED, reason, rule="delivery")
         return True
 
     def mark_read(self, message_id: int) -> bool:

@@ -347,6 +347,10 @@ def config_show(as_json: bool) -> None:
     for record in held.get("routes") or []:
         click.echo(f"  {record.get('agent', '?'):44} "
                    f"{record.get('label', '-'):10} {record.get('delivery', '-')}")
+        overrides = record.get("delivery_overrides")
+        if isinstance(overrides, dict) and overrides:
+            for sender, mode in sorted(overrides.items()):
+                click.echo(f"    from {sender}: {mode}")
 
 
 @config.command("refresh")

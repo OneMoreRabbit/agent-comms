@@ -77,33 +77,54 @@ class Held(Exception):
     """
 
 
-def holds(agent: str, state_dir=None) -> bool:
-    """Does this agent's DECLARED delivery mode forbid injecting?
+class NoDelivery(Exception):
+    """The effective delivery mode is none; do not hand the message to the seat."""
 
-    Read from the seat's own assignment set, which carries `delivery` per
-    agent. The sender has its own gate -- `permitted_to_send` refuses `none`
-    before anything is posted -- but `hold` is a RECEIVING decision: the
-    message is accepted and stored here, and only the far end knows not to put
-    it in a session.
+
+def effective_delivery(agent: str, sender_fqn: str = "", state_dir=None) -> tuple[str, str]:
+    """Return the receiving agent's mode and the source of that decision.
+
+    The directory's own-seat assignment row carries the scalar default and an
+    optional map from exact sender FQN to override.  A malformed override is
+    not a new policy: fall back to the scalar.  If the scalar is unreadable too,
+    keep the 1.0 behaviour (inject), never silently withhold mail.
+    """
+    if not agent:
+        return "inject", "1.0 fallback (no addressed agent)"
+    from . import config_sync
+    from .config import load_settings
+    try:
+        where = state_dir if state_dir is not None else load_settings().state_dir
+        record = config_sync.agent_set(where).get(agent) or {}
+    except Exception:  # noqa: BLE001 - unreadable policy keeps the 1.0 behaviour
+        return "inject", "1.0 fallback (assignment unreadable)"
+    if not isinstance(record, dict):
+        return "inject", "1.0 fallback (assignment unreadable)"
+
+    valid = {"inject", "hold", "none"}
+    default = str(record.get("delivery") or "").strip().casefold()
+    fallback = (default, "default") if default in valid else (
+        "inject", "1.0 fallback (unknown default mode)")
+    overrides = record.get("delivery_overrides")
+    if sender_fqn and isinstance(overrides, dict) and sender_fqn in overrides:
+        mode = str(overrides[sender_fqn] or "").strip().casefold()
+        if mode in valid:
+            return mode, f"override for {sender_fqn}"
+    return fallback
+
+
+def holds(agent: str, state_dir=None, *, sender_fqn: str = "") -> bool:
+    """Whether this sender's effective mode is hold for the addressed agent.
 
     Until 2026-09-25 the receive path read no delivery mode at all, so `hold`
     was honoured nowhere. It looked honoured on test-claude only because the
     held agent had no session for an unrelated reason -- a check passing for
     the wrong reason (UC-04).
 
-    Unknown agent, unknown mode, or no assignment set: inject, which is the
-    1.0 behaviour. A mode we cannot read must not silently withhold mail.
+    Unknown agent, unknown mode, or no assignment set: inject, the 1.0
+    behaviour. An unreadable mode must not silently withhold mail.
     """
-    if not agent:
-        return False
-    from . import config_sync
-    from .config import load_settings
-    try:
-        where = state_dir if state_dir is not None else load_settings().state_dir
-        record = config_sync.agent_set(where).get(agent) or {}
-    except Exception:  # noqa: BLE001 - never withhold mail because a read failed
-        return False
-    return (record.get("delivery") or "").strip().casefold() == "hold"
+    return effective_delivery(agent, sender_fqn, state_dir)[0] == "hold"
 
 
 def wake(mention: dict, **_ignored) -> Delivery:
@@ -119,9 +140,12 @@ def wake(mention: dict, **_ignored) -> Delivery:
     than quietly honoured.
     """
     agent = mention.get("agent") or None
-    if holds(agent or ""):
+    mode, source = effective_delivery(agent or "", mention.get("sender_fqn") or "")
+    if mode == "none":
+        raise NoDelivery(f"{agent} is delivery: none ({source}) — not injected")
+    if mode == "hold":
         # `hold`: accepted, stored, never injected. The agent asks for it.
-        raise Held(f"{agent} is delivery: hold — stored, not injected")
+        raise Held(f"{agent} is delivery: hold ({source}) — stored, not injected")
 
     try:
         # **Dispatch on the envelope FQN, and nothing else.** A seat can serve
