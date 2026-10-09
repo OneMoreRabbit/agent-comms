@@ -477,7 +477,8 @@ def test_a_held_message_is_never_handed_to_the_seat(monkeypatch):
     calls = []
     monkeypatch.setattr(W.seat_app, "deliver",
                         lambda *a, **k: calls.append(k.get("agent")))
-    monkeypatch.setattr(W, "holds", lambda agent, state_dir=None: True)
+    monkeypatch.setattr(W, "effective_delivery",
+                        lambda agent, sender_fqn="", state_dir=None: ("hold", "default"))
     import pytest
     with pytest.raises(W.Held):
         W.wake({"id": 1, "sender": "s", "content": "x", "topic": "t",

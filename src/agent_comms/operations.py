@@ -44,7 +44,7 @@ from .hub import Hub, Registration, Transport, build_transport
 from .seat import SeatUnavailable, speaks_contract
 from .seat import _client_version, build_id
 from .seat import state as seat_state_now
-from .wake import Held, WakeError, wake
+from .wake import Held, NoDelivery, WakeError, wake
 from .store import DaemonState, Mention, Store
 from .queue import ForwardOnly, MessageStore
 
@@ -1736,6 +1736,12 @@ def wake_agent(
 
     try:
         result = wake(mention)
+    except NoDelivery as refused:
+        if mid is not None:
+            store.refuse_by_hub_id(mid, str(refused))
+        store.record_wake_by_hub_id(mid, "refused", str(refused))
+        store.record("warn", f"refused: {refused}")
+        return Woken(Woken.REFUSED, f"refused: {refused}")
     except Held as held:
         # `hold`: accepted and stored, never injected. The agent asks for it
         # with `comms inbox`. Not a failure, so nothing is retried and no
@@ -1970,6 +1976,11 @@ def _retry_undelivered_locked(
     for mention in pending:
         try:
             result = wake(asdict(mention))
+        except NoDelivery as refused:
+            store.refuse_by_hub_id(mention.id, str(refused))
+            store.record_wake_by_hub_id(mention.id, "refused", str(refused))
+            store.record("warn", f"retry: {refused}; message {mention.id} refused")
+            continue
         except Held as held:
             # `hold`: accepted and stored, never injected. NOT a failure, so no
             # attempt is consumed and the bound is not walked towards -- a held
@@ -2629,8 +2640,11 @@ def run_daemon(
             # The addressed agent's declared mode decides the arrival state:
             # `hold` lands in HELD, which is the only state RETRIEVED can be
             # reached from. Read once here rather than at every delivery pass.
-            from .wake import holds
-            store.append(mention, held=holds(mention.agent or "", settings.state_dir))
+            from .wake import effective_delivery
+            mode, source = effective_delivery(
+                mention.agent or "", mention.sender_fqn or "", settings.state_dir)
+            store.append(mention, held=mode == "hold", delivery_none=mode == "none",
+                         delivery_source=source)
             stored += 1
             if not mention.authorised:
                 # **Refused, not delivered.** Labelling it and handing it to the
@@ -2645,6 +2659,11 @@ def run_daemon(
                     return True  # stored as refused, already logged; no bounce
                 _refuse_sender(settings, store, mention, hub,
                                bounced, transport_factory)
+                return True
+            if mode == "none":
+                store.record("warn", f"refused message {mention.id} from "
+                             f"{mention.sender_fqn or mention.sender}: delivery: none "
+                             f"({source}); no seat handoff")
                 return True
             _notify(settings, store, mention)
             if on_mention is not None:
