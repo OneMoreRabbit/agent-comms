@@ -334,30 +334,21 @@ def preflight(
     # sees a post that appeared to work.
     mine = settings.identity.known_names()
     assigned = config_sync.agent_set(settings.state_dir)
-    # **RESOLVE each one — the assignments answer carries no transports.**
-    # Measured 2026-09-25 on test-claude: `/v0/seats/<p>/<s>/assignments`
-    # returns agent, seat_local_id, label, runtime, delivery, route_revision
-    # and NO transports block. Reading the cache for them would report every
-    # agent as undeclared forever and could never catch the wrong-bot case --
-    # a check that fires every time and detects nothing (constitution §9).
-    # The need asks for the RESOLVED transport, and resolution is where it is.
-    from .resolve import Resolver
-    resolver = Resolver(local_agents=assigned)
-    resolved, unreadable = {}, []
-    for fqn in sorted(assigned):
-        # Each of our own agents asks about itself: a self-lookup needs no
-        # stated sender, and there is no seat identity to offer.
-        answer = resolver.resolve(fqn, caller=fqn)
-        if answer.success:
-            resolved[fqn] = {"transports": answer.transports}
-        else:
-            unreadable.append(f"{fqn} ({answer.status})")
-    wrong, undeclared = agents_reaching(resolved, mine)
+    # Contract 0.2's own-seat assignment row carries the declared transport.
+    # The periodic config refresh already caches it; resolving every agent as
+    # itself added N directory calls per doctor run, and could leave this
+    # wrong-bot check permanently unchecked when self-lookup was refused.
+    readable = {fqn: record for fqn, record in assigned.items()
+                if record.get("transport_readable")}
+    unreadable = [fqn or "<missing agent FQN>" for fqn, record in sorted(assigned.items())
+                  if not record.get("transport_readable")]
+    wrong, undeclared = agents_reaching(readable, mine)
     if unreadable:
-        # We could not ask. Saying "undeclared" would be asserting an absence
-        # we did not observe -- the difference between a no and a silence.
+        # A missing or malformed assignment field is not an explicit empty
+        # transport. Saying "undeclared" would assert an absence not observed.
         report.notes.append(
-            f"could not resolve assigned agent(s), so their transport is unchecked: "
+            f"assigned agent(s) have no readable cached transport, so they are "
+            f"unchecked: "
             f"{', '.join(unreadable)}")
     if wrong:
         report.add(
@@ -380,15 +371,15 @@ def preflight(
             f"is one seat's mailbox and nothing derives a per-agent one. Until they "
             f"are authored, a send to those names is refused at the sender with "
             f"nothing posted.")
-    elif resolved:
+    elif readable:
         report.add("agents reach this seat", True,
-                   f"all {len(resolved)} resolved agent(s) declare a bot this seat "
+                   f"all {len(readable)} assigned agent(s) declare a bot this seat "
                    f"answers to")
     else:
         # **A CHECK WITH NOTHING TO VERIFY SAYS SO BY NAME.**
         #
-        # This branch used to be silent: no agents assigned, or none of them
-        # resolvable, and the check simply did not appear. Measured on the fresh
+        # This branch used to be silent: no agents assigned, or none with a
+        # readable transport, and the check simply did not appear. Measured on the fresh
         # test-codex 2026-09-26 — doctor reported 11 checks where test-claude
         # reported 12, with nothing saying which was missing or why.
         #
@@ -396,9 +387,9 @@ def preflight(
         # counting, which is the diagnostic-without-information class in the one
         # tool whose whole job is information. Ruled by arch the same day: a
         # check with nothing to verify says so by name, never silently absent.
-        why = (f"could not resolve any of them ({', '.join(unreadable)})" if unreadable
+        why = (f"no readable cached transport for any of them ({', '.join(unreadable)})" if unreadable
                else "this seat is assigned no agents yet" if not assigned
-               else f"{len(assigned)} assigned and none resolvable")
+               else f"{len(assigned)} assigned and none readable")
         report.add("agents reach this seat", True,
                    f"nothing to verify — {why}. Stated rather than omitted: an absent "
                    f"check reads the same as a passing one.")
@@ -669,7 +660,9 @@ def _transport_channels(settings: Settings) -> set[str]:
     channels = {c for c in {settings.channel.strip().casefold()} if c}
     records = config_sync.load(settings.state_dir).get("routes") or []
     for record in records:
-        name = ((record or {}).get("transports") or {}).get("comms", {}).get("channel")
+        transports = record.get("transports") if isinstance(record, dict) else None
+        comms = transports.get("comms") if isinstance(transports, dict) else None
+        name = comms.get("channel") if isinstance(comms, dict) else None
         if name:
             channels.add(str(name).strip().casefold())
     return channels
