@@ -12,6 +12,16 @@ about: one short entry per release, newest first
 
 None.
 
+## v2.9.2 — 2026-10-09
+
+**TL;DR:** Doctor checks assigned agents' bot transports from its refreshed local assignment cache, without directory self-lookups.
+
+- A wrong-bot assignment still fails the check and names the affected agent and bot.
+- Missing or malformed transport is reported as unchecked; an explicitly empty transport remains undeclared.
+- On both DEV test seats, doctor passed 15/15 checks and made zero directory calls in the instrumented run.
+
+**Action:** Install agent-comms 2.9.2 on seats monitored with `comms doctor`; restart the comms daemon after installation so its build matches the CLI.
+
 ## v2.9.1 — 2026-10-09
 
 **TL;DR:** Apply directory-authored per-sender delivery overrides at the receiving seat.

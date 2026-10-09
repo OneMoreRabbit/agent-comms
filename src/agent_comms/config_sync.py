@@ -247,11 +247,24 @@ def agent_set(state_dir: Path) -> dict[str, dict]:
         if not fqn:
             out.setdefault("", {"id": "", "unreadable": True,
                                 "delivery": "", "label": "",
-                                "transports": {}, "permissions": {}})
+                                "transports": {}, "transport_readable": False,
+                                "permissions": {}})
             continue
+        transport = record.get("transports")
+        comms = transport.get("comms") if isinstance(transport, dict) else None
+        # An omitted or malformed field is not a declared absence. Doctor
+        # must not call it "undeclared" when this assignment cannot say.
+        transport_readable = (
+            isinstance(transport, dict)
+            and (comms is None or (
+                isinstance(comms, dict)
+                and (comms.get("bot") is None or isinstance(comms.get("bot"), str))
+            ))
+        )
         out[fqn] = {"id": fqn, "delivery": record.get("delivery", ""),
                     "delivery_overrides": record.get("delivery_overrides") or {},
                     "label": record.get("label", ""),
-                    "transports": record.get("transports") or {},
+                    "transports": transport if transport_readable else {},
+                    "transport_readable": transport_readable,
                     "permissions": record.get("permissions") or {}}
     return out

@@ -1747,6 +1747,88 @@ def test_a_seat_whose_agents_all_point_at_it_reports_nothing_wrong():
     }, ("test-claude", "agent-eco-test-claude")) == ([], [])
 
 
+def test_doctor_checks_cached_assignment_bots_without_self_resolving(seat, monkeypatch):
+    """The own-seat assignment feed now carries transport for every agent.
+
+    This is the whole cost and safety boundary: a normal doctor pass must use
+    those records even if the directory's self-lookup endpoint is unusable.
+    """
+    import json
+    from agent_comms.resolve import Resolver
+
+    routes = seat / ".comms" / "routes.json"
+    routes.write_text(json.dumps({"contract": "0.2", "routes": [
+        {"agent": "bakehouse.agent-eco.agent-comms", "transports": {"comms": {
+            "bot": "agent-eco-agent-comms", "channel": "agent-eco"}}},
+        {"agent": "bakehouse.agent-eco.fixture", "transports": {"comms": {
+            "bot": "agent-eco-agent-comms", "channel": "agent-eco",
+            "extra_channels": ["seat-testing"]}}},
+    ]}), encoding="utf-8")
+    lookups = []
+
+    def no_self_lookup(self, target, caller, purpose="comms"):
+        lookups.append((target, caller))
+        raise AssertionError("doctor must not self-resolve an assigned agent")
+
+    monkeypatch.setattr(Resolver, "resolve", no_self_lookup)
+    report = operations.preflight(transport_factory=lambda c: FakeTransport())
+    mirror = next(c for c in report.checks if c[0] == "agents reach this seat")
+    assert mirror[1] is True, mirror[2]
+    assert "all 2 assigned agent(s)" in mirror[2], mirror[2]
+    assert not any("transport" in note and "unchecked" in note for note in report.notes)
+    assert lookups == []
+
+
+def test_doctor_names_a_wrong_bot_in_its_cached_assignment(seat, monkeypatch):
+    """The mirror check must go red from the row, not an external resolution."""
+    import json
+
+    settings = operations.load_settings()
+    monkeypatch.setattr(operations, "load_settings", lambda **_kw: settings)
+    (seat / ".comms" / "routes.json").write_text(json.dumps({"routes": [
+        {"agent": "bakehouse.agent-eco.agent-comms", "transports": {"comms": {
+            "bot": "agent-eco-agent-comms", "channel": "agent-eco"}}},
+        {"agent": "bakehouse.agent-eco.stray", "transports": {"comms": {
+            "bot": "someone-elses-bot", "channel": "agent-eco"}}},
+    ]}), encoding="utf-8")
+
+    report = operations.preflight(transport_factory=lambda c: FakeTransport())
+    mirror = next(c for c in report.checks if c[0] == "agents reach this seat")
+    assert mirror[1] is False
+    assert "DELIVERING TO NOBODY" in mirror[2]
+    assert "bakehouse.agent-eco.stray" in mirror[2]
+    assert "someone-elses-bot" in mirror[2]
+
+
+def test_doctor_distinguishes_undeclared_from_unreadable_cached_transport(seat):
+    """An omitted field is not a directory declaration of no transport."""
+    import json
+
+    routes = seat / ".comms" / "routes.json"
+    good = {"agent": "bakehouse.agent-eco.agent-comms", "transports": {"comms": {
+        "bot": "agent-eco-agent-comms", "channel": "agent-eco"}}}
+    other = "bakehouse.agent-eco.fixture"
+
+    def doctor_for(record):
+        routes.write_text(json.dumps({"contract": "0.2", "routes": [good, record]}),
+                          encoding="utf-8")
+        return operations.preflight(transport_factory=lambda c: FakeTransport())
+
+    explicit = doctor_for({"agent": other, "transports": {}})
+    mirror = next(c for c in explicit.checks if c[0] == "agents reach this seat")
+    assert mirror[1] is True and "no declared transport" in mirror[2]
+    assert not any(other in note and "unchecked" in note for note in explicit.notes)
+
+    for record in ({"agent": other}, {"agent": other, "transports": None},
+                   {"agent": other, "transports": ["malformed"]},
+                   {"agent": other, "transports": {"comms": ["malformed"]}}):
+        incomplete = doctor_for(record)
+        mirror = next(c for c in incomplete.checks if c[0] == "agents reach this seat")
+        assert mirror[1] is True and "all 1 assigned agent(s)" in mirror[2]
+        assert any(other in note and "unchecked" in note for note in incomplete.notes)
+        assert "no declared transport" not in mirror[2]
+
+
 def test_the_wake_outcome_is_a_word_not_a_prefix_of_a_sentence():
     """Write-time gate 1, fixed 2026-09-25. `wake_agent` returned prose and the
     CLI chose an EXIT CODE with `outcome.startswith("queued")` -- a
