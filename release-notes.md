@@ -10,7 +10,7 @@ about: one short entry per release, newest first
 
 ## Built, not yet released
 
-None.
+- 2.9.2 — 2026-10-09 — Doctor checks each assigned agent's bot from the cached assignment row, so a wrong-bot route is caught without a directory self-lookup.
 
 ## v2.9.1 — 2026-10-09
 
