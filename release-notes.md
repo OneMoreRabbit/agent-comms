@@ -10,6 +10,14 @@ about: one short entry per release, newest first
 
 ## Built, not yet released
 
-- 2.9.1 — 2026-10-09 — Apply directory-authored per-sender delivery overrides at the receiving seat, so declared component senders inject while a default-hold sender remains held.
+None.
 
-Newest tagged entries follow when the tested build is released on main.
+## v2.9.1 — 2026-10-09
+
+**TL;DR:** Apply directory-authored per-sender delivery overrides at the receiving seat.
+
+- An exact sender FQN can select inject, hold or none without changing the receiving agent's default.
+- Permission still wins: an override never makes a non-partner deliverable.
+- A default-hold target now injects declared component senders while unrelated senders remain held.
+
+**Action:** Install agent-comms 2.9.1 on receiving seats that use directory delivery overrides. No action is needed for seats without overrides.
