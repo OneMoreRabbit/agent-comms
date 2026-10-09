@@ -250,6 +250,7 @@ def agent_set(state_dir: Path) -> dict[str, dict]:
                                 "transports": {}, "permissions": {}})
             continue
         out[fqn] = {"id": fqn, "delivery": record.get("delivery", ""),
+                    "delivery_overrides": record.get("delivery_overrides") or {},
                     "label": record.get("label", ""),
                     "transports": record.get("transports") or {},
                     "permissions": record.get("permissions") or {}}
