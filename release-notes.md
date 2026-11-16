@@ -10,7 +10,7 @@ about: one short entry per release, newest first
 
 ## Built, not yet released
 
-None.
+2.9.3 — 2026-11-16 — Add opt-in Google Chat settings validation, private-assignment diagnostics and a separate local message store; this prepares the people channel without changing hub delivery. No Google collection or reply is enabled by this build.
 
 ## v2.9.2 — 2026-10-09
 

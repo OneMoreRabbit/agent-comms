@@ -478,5 +478,82 @@ def requeue_cmd(message_id: int, reason: str) -> None:
     click.echo(operations.requeue(message_id, reason))
 
 
+@main.group("google-chat")
+def google_chat_cmd() -> None:
+    """Google Chat for people (separate from the seat-to-seat hub)."""
+
+
+@google_chat_cmd.command("status")
+def google_chat_status() -> None:
+    """Show optional Google Chat readiness; 2.9.3 does not collect yet."""
+    from . import google_chat
+    if not (google_chat.settings_file().exists() or google_chat.settings_file().is_symlink()):
+        click.echo("Google Chat: not configured; hub behaviour is unchanged")
+        return
+    settings = operations.load_settings()
+    ok, detail = google_chat.diagnostic(settings.state_dir, settings.identity.project,
+                                        settings.identity.seat)
+    click.echo(f"Google Chat: {'prepared, not collecting' if ok else 'unavailable'} — {detail}")
+    if not ok:
+        raise click.ClickException("Google Chat configuration failed; hub is unaffected")
+
+
+@google_chat_cmd.command("doctor")
+def google_chat_doctor() -> None:
+    """Check local Google settings and the private directory record."""
+    from . import google_chat
+    if not (google_chat.settings_file().exists() or google_chat.settings_file().is_symlink()):
+        click.echo("Google Chat: not configured; no Google or private directory call")
+        return
+    settings = operations.load_settings()
+    ok, detail = google_chat.diagnostic(settings.state_dir, settings.identity.project,
+                                        settings.identity.seat)
+    click.echo(f"{'PASS' if ok else 'FAIL'} Google Chat configuration — {detail}")
+    if ok:
+        click.echo("NOTE 2.9.3 does not collect or reply; this is not a delivery check")
+    else:
+        raise click.ClickException("Google Chat configuration failed; hub is unaffected")
+
+
+@google_chat_cmd.command("inbox")
+@click.option("--from", "from_fqn", required=True)
+def google_chat_inbox(from_fqn: str) -> None:
+    """Show locally stored Google messages for one assigned agent."""
+    from . import google_store
+    settings = operations.load_settings()
+    agent = operations.sending_agent(from_fqn, settings.state_dir)
+    rows = google_store.GoogleStore(settings.state_dir / "comms.db").list(agent)
+    if not rows:
+        click.echo("nothing stored yet")
+    for row in rows:
+        click.echo(f"{row.id}  {row.event_time}  {row.state}")
+
+
+@google_chat_cmd.command("show")
+@click.option("--from", "from_fqn", required=True)
+@click.argument("message_id")
+def google_chat_show(from_fqn: str, message_id: str) -> None:
+    """Show one local Google message; never changes its state."""
+    from . import google_store
+    settings = operations.load_settings()
+    agent = operations.sending_agent(from_fqn, settings.state_dir)
+    row = google_store.GoogleStore(settings.state_dir / "comms.db").get(message_id)
+    if row is None or row.agent != agent:
+        raise click.ClickException(f"no Google Chat message {message_id} for {agent}")
+    click.echo(f"{row.id}  {row.event_time}  {row.state}\n{json.dumps(row.payload, indent=2)}")
+
+
+@google_chat_cmd.command("log")
+def google_chat_log() -> None:
+    """Show Google message states without mixing them into hub log."""
+    from . import google_store
+    settings = operations.load_settings()
+    rows = google_store.GoogleStore(settings.state_dir / "comms.db").list()
+    if not rows:
+        click.echo("nothing stored yet")
+    for row in rows:
+        click.echo(f"{row.id}  {row.agent}  {row.state}")
+
+
 if __name__ == "__main__":
     run()
