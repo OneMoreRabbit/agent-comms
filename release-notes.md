@@ -1,7 +1,7 @@
 ---
 title: Release notes — agent-comms
 status: active
-updated: 2026-10-09
+updated: 2026-11-16
 owner: agent-eco.component.agent-comms
 about: one short entry per release, newest first
 ---
@@ -10,7 +10,17 @@ about: one short entry per release, newest first
 
 ## Built, not yet released
 
-- **2.9.4 — 2026-11-16:** Add opt-in Google Chat collection in the existing daemon, private-list admission, bounded text handoff, and a durable text-reply outbox with stable request IDs; acknowledge and identify non-message and add-on-form events, log one content-free shape line per event, isolate failures, end failed or aged replies, and erase refused text; keep hub behavior unchanged. Why: prepare a first real-Google text try while refusing unknown people and preserving retry safety. This is not a released tag or the operator beta; files, fixed notices and live Google acceptance remain open.
+None.
+
+## v2.9.4 — 2026-11-16
+
+**TL;DR:** Add opt-in Google Chat text collection and replies while leaving hub behavior unchanged.
+
+- The existing daemon can pull Chat events, check people against the owning seat's private directory record, and hand admitted text to `seat msg` under the agent's exact FQN. It stores a reply with a stable request ID before posting it to the original direct message.
+- Non-message and add-on-form events are acknowledged and identified in content-free logs. Refused text is erased; a failure in one pull, handoff or reply does not stop the remaining work.
+- This is a first real-Google text build, **not** the beta. Files, fixed notices, full test-seat scripts and real-Google acceptance remain open.
+
+**Action:** Estate-manage installs the tag only on test-claude and test-codex with the `agent-comms[google]` extra. With no Google settings file, the hub remains as on 2.9.2. Configure the Google side and restart `comms daemon` only for the operator's text try.
 
 ## v2.9.3 — 2026-11-16
 
