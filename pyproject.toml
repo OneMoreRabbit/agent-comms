@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-comms"
-version = "2.9.3"
+version = "2.9.4"
 description = "Seat-side client for agent-to-agent comms over the estate Zulip hub"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -17,6 +17,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+google = ["google-cloud-pubsub>=2.23", "google-auth>=2.30"]
 
 [project.scripts]
 comms = "agent_comms.cli:run"
