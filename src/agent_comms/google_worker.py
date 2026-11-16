@@ -32,6 +32,21 @@ def _empty_pull(exc: Exception) -> bool:
     return isinstance(exc, DeadlineExceeded)
 
 
+def _event_metadata(raw: object, outcome: str) -> str:
+    """Log event shape without copying untrusted text or a person's address."""
+    data = raw if isinstance(raw, dict) else {}
+    user = data.get("user") if isinstance(data.get("user"), dict) else {}
+    space = data.get("space") if isinstance(data.get("space"), dict) else {}
+
+    def label(value: object, allowed: set[str]) -> str:
+        return value if isinstance(value, str) and value in allowed else "unknown"
+
+    return (f"Google Chat event: type={label(data.get('type'), {'MESSAGE', 'ADDED_TO_SPACE', 'REMOVED_FROM_SPACE'})} "
+            f"space_type={label(space.get('spaceType'), {'DIRECT_MESSAGE', 'GROUP_CHAT', 'SPACE'})} "
+            f"user.name={bool(user.get('name'))} user.email={bool(user.get('email'))} "
+            f"message={isinstance(data.get('message'), dict)} outcome={outcome}")
+
+
 def run_once(state_dir: Path, project: str, seat_name: str,
              subscriber_factory: Callable = _subscriber,
              private_rows: dict[str, dict] | None = None,
@@ -81,6 +96,8 @@ def run_once(state_dir: Path, project: str, seat_name: str,
             if response is None:
                 continue
             for received in response.received_messages:
+                raw = None
+                outcome = "failed"
                 try:
                     raw = json.loads(received.message.data.decode("utf-8"))
                     event = google_intake.from_chat_event(raw, agent)
@@ -89,22 +106,27 @@ def run_once(state_dir: Path, project: str, seat_name: str,
                         lambda ack_id=received.ack_id: client.acknowledge(request={
                             "subscription": config.subscription, "ack_ids": [ack_id]}))
                     accepted += int(inserted)
+                    outcome = "stored" if inserted else "duplicate"
                 except google_intake.NonMessageEvent:
                     try:
                         client.acknowledge(request={"subscription": config.subscription,
                                                     "ack_ids": [received.ack_id]})
                     except Exception as exc:
+                        outcome = "ack_failed"
                         warn(f"Google Chat {agent}: could not acknowledge non-message event "
                              f"({type(exc).__name__})")
                     else:
-                        if record is not None:
-                            record("info", f"Google Chat {agent}: ignored event without a message")
+                        outcome = "ignored_no_message"
                 except (ValueError, UnicodeError):
+                    outcome = "malformed"
                     # Malformed messages remain unacknowledged, but cannot
                     # block the rest of this batch or the local queues.
                     warn(f"Google Chat {agent}: malformed event left unacknowledged")
                 except Exception as exc:
                     warn(f"Google Chat {agent}: event failed ({type(exc).__name__}); left unacknowledged")
+                finally:
+                    if record is not None:
+                        record("info", _event_metadata(raw, outcome))
         except Exception as exc:
             warn(f"Google Chat {agent}: pull failed ({type(exc).__name__})")
         finally:

@@ -132,9 +132,49 @@ def test_non_message_event_is_acked_once_without_content_and_next_message_runs(t
                                    private_rows={AGENT: _private()},
                                    record=lambda level, message: records.append((level, message)))
     assert count == 1 and acks == ["non-message", "message"] and delivered == ["gc-1"]
-    assert len(records) == 1 and records[0][0] == "info"
-    assert "without a message" in records[0][1]
-    assert "must not appear" not in records[0][1]
+    assert len(records) == 2 and all(level == "info" for level, _ in records)
+    assert "type=ADDED_TO_SPACE space_type=unknown" in records[0][1]
+    assert "user.name=True user.email=False message=False outcome=ignored_no_message" in records[0][1]
+    assert "type=MESSAGE space_type=DIRECT_MESSAGE" in records[1][1]
+    assert "user.name=True user.email=True message=True outcome=stored" in records[1][1]
+    assert not any("must not appear" in line or "person@example.org" in line or "users/123" in line
+                   for _, line in records)
+
+
+def test_added_to_space_with_message_is_refused_acked_and_logged(tmp_path, monkeypatch):
+    config = google_chat.AgentConfig(AGENT, "projects/fake/subscriptions/fake",
+                                     tmp_path / "credential.json", "fake-folder")
+    monkeypatch.setattr(google_chat, "load_settings", lambda *_: {AGENT: config})
+    raw = _raw_message("spaces/dm/messages/added", text="private content")
+    raw["type"] = "ADDED_TO_SPACE"
+    acks, records = [], []
+
+    class Subscriber:
+        def pull(self, **_):
+            return SimpleNamespace(received_messages=[_received(raw, "added")])
+        def acknowledge(self, *, request):
+            acks.extend(request["ack_ids"])
+        def close(self):
+            pass
+
+    count = google_worker.run_once(tmp_path, "agent-eco", "test-claude",
+                                   subscriber_factory=lambda _: Subscriber(),
+                                   private_rows={AGENT: _private()},
+                                   record=lambda level, message: records.append((level, message)))
+    assert count == 1 and acks == ["added"]
+    row = _store(tmp_path).get("gc-1")
+    assert row.state == "refused" and row.reason == "unsupported event type"
+    assert row.payload == {"sender_account_id": "users/123", "sender_address": "person@example.org"}
+    assert len(records) == 1 and "type=ADDED_TO_SPACE" in records[0][1]
+    assert "private content" not in records[0][1] and "person@example.org" not in records[0][1]
+
+
+def test_event_metadata_rejects_untrusted_label_text():
+    raw = {"type": "MESSAGE person@example.org", "space": {"spaceType": "DM private text"},
+           "user": {"name": "users/123", "email": "person@example.org"}, "message": {}}
+    line = google_worker._event_metadata(raw, "malformed")
+    assert line == ("Google Chat event: type=unknown space_type=unknown "
+                    "user.name=True user.email=True message=True outcome=malformed")
 
 
 def test_pull_and_handoff_failure_do_not_skip_other_agent_or_reply(tmp_path, monkeypatch):
