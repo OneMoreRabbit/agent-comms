@@ -485,7 +485,7 @@ def google_chat_cmd() -> None:
 
 @google_chat_cmd.command("status")
 def google_chat_status() -> None:
-    """Show optional Google Chat readiness; 2.9.3 does not collect yet."""
+    """Show optional Google Chat readiness, separate from hub status."""
     from . import google_chat
     if not (google_chat.settings_file().exists() or google_chat.settings_file().is_symlink()):
         click.echo("Google Chat: not configured; hub behaviour is unchanged")
@@ -493,7 +493,7 @@ def google_chat_status() -> None:
     settings = operations.load_settings()
     ok, detail = google_chat.diagnostic(settings.state_dir, settings.identity.project,
                                         settings.identity.seat)
-    click.echo(f"Google Chat: {'prepared, not collecting' if ok else 'unavailable'} — {detail}")
+    click.echo(f"Google Chat: {'configured; collector runs with comms daemon' if ok else 'unavailable'} — {detail}")
     if not ok:
         raise click.ClickException("Google Chat configuration failed; hub is unaffected")
 
@@ -510,16 +510,38 @@ def google_chat_doctor() -> None:
                                         settings.identity.seat)
     click.echo(f"{'PASS' if ok else 'FAIL'} Google Chat configuration — {detail}")
     if ok:
-        click.echo("NOTE 2.9.3 does not collect or reply; this is not a delivery check")
+        click.echo("NOTE configuration passes; check the running daemon and a stand-in round trip for delivery")
     else:
         raise click.ClickException("Google Chat configuration failed; hub is unaffected")
+
+
+@google_chat_cmd.command("daemon")
+@click.option("--once", is_flag=True, required=True,
+              help="Pull one bounded Google batch; the supervised hub daemon is unchanged.")
+def google_chat_daemon(once: bool) -> None:
+    """Run one opt-in collection pass, without starting another daemon."""
+    from . import google_chat, google_worker
+    if not (google_chat.settings_file().exists() or google_chat.settings_file().is_symlink()):
+        click.echo("Google Chat: not configured; no Google or private directory call")
+        return
+    settings = operations.load_settings()
+    try:
+        count = google_worker.run_once(settings.state_dir, settings.identity.project,
+                                       settings.identity.seat,
+                                       record=lambda level, message: click.echo(f"{level.upper()} {message}"))
+    except (google_chat.GoogleChatConfigError, OSError) as exc:
+        raise click.ClickException(f"Google Chat collection failed: {exc}") from exc
+    click.echo(f"Google Chat: stored {count} new message(s)")
 
 
 @google_chat_cmd.command("inbox")
 @click.option("--from", "from_fqn", required=True)
 def google_chat_inbox(from_fqn: str) -> None:
     """Show locally stored Google messages for one assigned agent."""
-    from . import google_store
+    from . import google_chat, google_store
+    if not (google_chat.settings_file().exists() or google_chat.settings_file().is_symlink()):
+        click.echo("Google Chat: not configured; no local Google store opened")
+        return
     settings = operations.load_settings()
     agent = operations.sending_agent(from_fqn, settings.state_dir)
     rows = google_store.GoogleStore(settings.state_dir / "comms.db").list(agent)
@@ -534,25 +556,76 @@ def google_chat_inbox(from_fqn: str) -> None:
 @click.argument("message_id")
 def google_chat_show(from_fqn: str, message_id: str) -> None:
     """Show one local Google message; never changes its state."""
-    from . import google_store
+    from . import google_chat, google_store
+    if not (google_chat.settings_file().exists() or google_chat.settings_file().is_symlink()):
+        click.echo("Google Chat: not configured; no local Google store opened")
+        return
     settings = operations.load_settings()
     agent = operations.sending_agent(from_fqn, settings.state_dir)
     row = google_store.GoogleStore(settings.state_dir / "comms.db").get(message_id)
     if row is None or row.agent != agent:
         raise click.ClickException(f"no Google Chat message {message_id} for {agent}")
-    click.echo(f"{row.id}  {row.event_time}  {row.state}\n{json.dumps(row.payload, indent=2)}")
+    reason = f" — {row.reason}" if row.reason else ""
+    click.echo(f"{row.id}  {row.event_time}  {row.state}{reason}\n"
+               f"{json.dumps(row.payload, indent=2)}")
 
 
 @google_chat_cmd.command("log")
 def google_chat_log() -> None:
-    """Show Google message states without mixing them into hub log."""
-    from . import google_store
+    """Show Google message states and content-free event shapes."""
+    from . import google_chat, google_store
+    if not (google_chat.settings_file().exists() or google_chat.settings_file().is_symlink()):
+        click.echo("Google Chat: not configured; no local Google store opened")
+        return
     settings = operations.load_settings()
     rows = google_store.GoogleStore(settings.state_dir / "comms.db").list()
     if not rows:
         click.echo("nothing stored yet")
     for row in rows:
         click.echo(f"{row.id}  {row.agent}  {row.state}")
+    for outbound in google_store.GoogleStore(settings.state_dir / "comms.db").replies():
+        detail = f" ({outbound.failure_reason})" if outbound.failure_reason else ""
+        click.echo(f"{outbound.message_id}  reply  {outbound.state}{detail}")
+    event_log = settings.state_dir / "events.log"
+    if event_log.is_file():
+        with event_log.open(encoding="utf-8", errors="replace") as lines:
+            for line in lines:
+                if " INFO Google Chat event: " in line:
+                    click.echo(line.rstrip("\n"))
+
+
+@google_chat_cmd.command("reply")
+@click.option("--from", "from_fqn", required=True)
+@click.option("--file", "file_path", type=click.Path(), default=None)
+@click.argument("message_id")
+@click.argument("text")
+def google_chat_reply(from_fqn: str, file_path: str | None,
+                      message_id: str, text: str) -> None:
+    """Post one text reply to the original Google direct-message space."""
+    from . import google_chat, google_reply, google_store
+    if file_path is not None:
+        raise click.ClickException("Google Chat file replies are not yet supported by this build")
+    settings = operations.load_settings()
+    agent = operations.sending_agent(from_fqn, settings.state_dir)
+    try:
+        configured = google_chat.load_settings(settings.state_dir)
+        if agent not in configured:
+            raise google_chat.GoogleChatConfigError(f"{agent}: no Google Chat contact configured")
+        rows = google_chat.private_assignments(settings.identity.project,
+                                               settings.identity.seat)
+        store = google_store.GoogleStore(settings.state_dir / "comms.db")
+        row = store.get(message_id)
+        if row is None or row.agent != agent:
+            raise ValueError(f"no Google Chat message {message_id} for {agent}")
+        outgoing = google_reply.send_text(store, row, text, configured[agent], rows.get(agent, {}))
+    except (ValueError, google_chat.GoogleChatConfigError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    except Exception as exc:  # Google API uncertainty keeps the durable outbox pending
+        raise click.ClickException(
+            f"Google Chat post was not confirmed ({type(exc).__name__}: {exc}); "
+            "the same requestId remains pending, not sent"
+        ) from exc
+    click.echo(f"{outgoing.message_id}: reply {outgoing.state}")
 
 
 if __name__ == "__main__":
