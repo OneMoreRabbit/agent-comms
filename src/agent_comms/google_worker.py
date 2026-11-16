@@ -41,7 +41,9 @@ def _event_metadata(raw: object, outcome: str) -> str:
     def label(value: object, allowed: set[str]) -> str:
         return value if isinstance(value, str) and value in allowed else "unknown"
 
-    return (f"Google Chat event: type={label(data.get('type'), {'MESSAGE', 'ADDED_TO_SPACE', 'REMOVED_FROM_SPACE'})} "
+    form = "add_on" if "chat" in data else "interaction"
+    return (f"Google Chat event: form={form} "
+            f"type={label(data.get('type'), {'MESSAGE', 'ADDED_TO_SPACE', 'REMOVED_FROM_SPACE'})} "
             f"space_type={label(space.get('spaceType'), {'DIRECT_MESSAGE', 'GROUP_CHAT', 'SPACE'})} "
             f"user.name={bool(user.get('name'))} user.email={bool(user.get('email'))} "
             f"message={isinstance(data.get('message'), dict)} outcome={outcome}")
@@ -116,7 +118,8 @@ def run_once(state_dir: Path, project: str, seat_name: str,
                         warn(f"Google Chat {agent}: could not acknowledge non-message event "
                              f"({type(exc).__name__})")
                     else:
-                        outcome = "ignored_no_message"
+                        outcome = ("ignored_add_on_form" if isinstance(raw, dict) and "chat" in raw
+                                   else "ignored_no_message")
                 except (ValueError, UnicodeError):
                     outcome = "malformed"
                     # Malformed messages remain unacknowledged, but cannot

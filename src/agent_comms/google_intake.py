@@ -48,6 +48,10 @@ def from_chat_event(raw: dict, agent: str) -> IntakeEvent:
     """
     if not isinstance(raw, dict):
         raise ValueError("Google event must be an object")
+    if "chat" in raw:
+        # Workspace add-ons use chat.messagePayload (and related payloads),
+        # not the interaction-event shape this text build accepts.
+        raise NonMessageEvent("Google Workspace add-on event")
     message = raw.get("message") or {}
     if isinstance(message, dict) and (
             not isinstance(message.get("name"), str) or not message["name"]):

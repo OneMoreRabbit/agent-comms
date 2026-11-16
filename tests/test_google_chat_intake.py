@@ -133,9 +133,9 @@ def test_non_message_event_is_acked_once_without_content_and_next_message_runs(t
                                    record=lambda level, message: records.append((level, message)))
     assert count == 1 and acks == ["non-message", "message"] and delivered == ["gc-1"]
     assert len(records) == 2 and all(level == "info" for level, _ in records)
-    assert "type=ADDED_TO_SPACE space_type=unknown" in records[0][1]
+    assert "form=interaction type=ADDED_TO_SPACE space_type=unknown" in records[0][1]
     assert "user.name=True user.email=False message=False outcome=ignored_no_message" in records[0][1]
-    assert "type=MESSAGE space_type=DIRECT_MESSAGE" in records[1][1]
+    assert "form=interaction type=MESSAGE space_type=DIRECT_MESSAGE" in records[1][1]
     assert "user.name=True user.email=True message=True outcome=stored" in records[1][1]
     assert not any("must not appear" in line or "person@example.org" in line or "users/123" in line
                    for _, line in records)
@@ -173,8 +173,52 @@ def test_event_metadata_rejects_untrusted_label_text():
     raw = {"type": "MESSAGE person@example.org", "space": {"spaceType": "DM private text"},
            "user": {"name": "users/123", "email": "person@example.org"}, "message": {}}
     line = google_worker._event_metadata(raw, "malformed")
-    assert line == ("Google Chat event: type=unknown space_type=unknown "
+    assert line == ("Google Chat event: form=interaction type=unknown space_type=unknown "
                     "user.name=True user.email=True message=True outcome=malformed")
+
+
+def test_add_on_payload_is_acked_dropped_and_visible_in_google_log(tmp_path, monkeypatch):
+    config = google_chat.AgentConfig(AGENT, "projects/fake/subscriptions/fake",
+                                     tmp_path / "credential.json", "fake-folder")
+    monkeypatch.setattr(google_chat, "load_settings", lambda *_: {AGENT: config})
+    raw = {"chat": {"messagePayload": {"message": {"text": "private content"}}}}
+    acks, records = [], []
+
+    class Subscriber:
+        def pull(self, **_):
+            return SimpleNamespace(received_messages=[_received(raw, "add-on")])
+        def acknowledge(self, *, request):
+            acks.extend(request["ack_ids"])
+        def close(self):
+            pass
+
+    count = google_worker.run_once(tmp_path, "agent-eco", "test-claude",
+                                   subscriber_factory=lambda _: Subscriber(),
+                                   private_rows={AGENT: _private()},
+                                   record=lambda level, message: records.append((level, message)))
+    assert count == 0 and acks == ["add-on"]
+    assert _store(tmp_path).list() == []
+    assert records == [("info", "Google Chat event: form=add_on type=unknown "
+                      "space_type=unknown user.name=False user.email=False "
+                      "message=False outcome=ignored_add_on_form")]
+    assert "private content" not in records[0][1]
+
+
+def test_google_log_shows_only_content_free_shape_lines(seat):
+    root = google_chat.settings_dir()
+    root.mkdir(mode=0o700)
+    (root / "settings.json").write_text("{}")
+    state_dir = root.parent.parent / ".comms"
+    state_dir.mkdir(exist_ok=True)
+    (state_dir / "events.log").write_text(
+        "2026-11-16T12:00:00+00:00 INFO Google Chat event: form=add_on "
+        "type=unknown space_type=unknown user.name=False user.email=False "
+        "message=False outcome=ignored_add_on_form\n"
+        "2026-11-16T12:00:01+00:00 WARN unrelated private content person@example.org\n")
+    result = CliRunner().invoke(cli.main, ["google-chat", "log"])
+    assert result.exit_code == 0, result.output
+    assert "form=add_on" in result.output
+    assert "private content" not in result.output and "person@example.org" not in result.output
 
 
 def test_pull_and_handoff_failure_do_not_skip_other_agent_or_reply(tmp_path, monkeypatch):

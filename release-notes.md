@@ -10,7 +10,7 @@ about: one short entry per release, newest first
 
 ## Built, not yet released
 
-- **2.9.4 — 2026-11-16:** Add opt-in Google Chat collection in the existing daemon, private-list admission, bounded text handoff, and a durable text-reply outbox with stable request IDs; acknowledge non-message events, log one content-free shape line per event, isolate failures, end failed or aged replies, and erase refused text; keep hub behavior unchanged. Why: prepare a first real-Google text try while refusing unknown people and preserving retry safety. This is not a released tag or the operator beta; files, fixed notices and live Google acceptance remain open.
+- **2.9.4 — 2026-11-16:** Add opt-in Google Chat collection in the existing daemon, private-list admission, bounded text handoff, and a durable text-reply outbox with stable request IDs; acknowledge and identify non-message and add-on-form events, log one content-free shape line per event, isolate failures, end failed or aged replies, and erase refused text; keep hub behavior unchanged. Why: prepare a first real-Google text try while refusing unknown people and preserving retry safety. This is not a released tag or the operator beta; files, fixed notices and live Google acceptance remain open.
 
 ## v2.9.3 — 2026-11-16
 

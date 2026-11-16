@@ -572,7 +572,7 @@ def google_chat_show(from_fqn: str, message_id: str) -> None:
 
 @google_chat_cmd.command("log")
 def google_chat_log() -> None:
-    """Show Google message states without mixing them into hub log."""
+    """Show Google message states and content-free event shapes."""
     from . import google_chat, google_store
     if not (google_chat.settings_file().exists() or google_chat.settings_file().is_symlink()):
         click.echo("Google Chat: not configured; no local Google store opened")
@@ -586,6 +586,12 @@ def google_chat_log() -> None:
     for outbound in google_store.GoogleStore(settings.state_dir / "comms.db").replies():
         detail = f" ({outbound.failure_reason})" if outbound.failure_reason else ""
         click.echo(f"{outbound.message_id}  reply  {outbound.state}{detail}")
+    event_log = settings.state_dir / "events.log"
+    if event_log.is_file():
+        with event_log.open(encoding="utf-8", errors="replace") as lines:
+            for line in lines:
+                if " INFO Google Chat event: " in line:
+                    click.echo(line.rstrip("\n"))
 
 
 @google_chat_cmd.command("reply")
