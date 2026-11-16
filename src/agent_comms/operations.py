@@ -2517,6 +2517,24 @@ def run_daemon(
     store.record_build(build_id())
     store.save_position(registration.queue_id, registration.last_event_id)
 
+    # Google is opt-in and shares this supervised process, not a second daemon.
+    # A failure in that worker has its own log boundary and cannot stop hub
+    # polling. On an unconfigured seat, do not touch the private directory or
+    # import a Google client.
+    google_stop = None
+    google_settings = Path.home() / ".secrets" / "google-chat" / "settings.json"
+    if google_settings.exists() or google_settings.is_symlink():
+        import threading
+        from . import google_worker
+        google_stop = threading.Event()
+        google_thread = threading.Thread(
+            target=google_worker.run_forever,
+            args=(settings.state_dir, settings.identity.project, settings.identity.seat,
+                  google_stop, store.record),
+            name="comms-google-chat", daemon=True)
+        google_thread.start()
+        store.record("info", "Google Chat worker started in the hub daemon process")
+
     stored, iterations, backoff = 0, 0, 1
     last_backstop = time.monotonic()
     last_config = 0.0
@@ -2782,6 +2800,8 @@ def run_daemon(
         _flush_pending(settings, store, transport_factory)
         store.save_position(registration.queue_id, registration.last_event_id)
 
+    if google_stop is not None:
+        google_stop.set()
     return stored
 
 

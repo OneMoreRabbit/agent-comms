@@ -20,6 +20,8 @@ from .resolve import directory_address
 
 _FQN = re.compile(r"^[a-z0-9][a-z0-9-]*\.[a-z0-9][a-z0-9-]*\.[a-z0-9][a-z0-9-]*$")
 _SUBSCRIPTION = re.compile(r"^projects/[^/]+/subscriptions/[^/]+$")
+_ACCOUNT_ID = re.compile(r"^users/[A-Za-z0-9_-]+$")
+_ADDRESS = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _FIELDS = {"subscription", "credential_file", "reply_drive_folder_id"}
 
 
@@ -120,6 +122,45 @@ def private_assignments(project: str, seat: str, *, timeout: float = 10.0) -> di
     return rows
 
 
+def people_for_agent(rows: dict[str, dict], agent: str) -> list[dict[str, str]]:
+    """Validate the private allow-list, including optional Google account IDs.
+
+    This list is deliberately not read from hub partners or public transports.
+    """
+    record = rows.get(agent, {}).get("google_chat")
+    if not isinstance(record, dict) or not isinstance(record.get("people"), list):
+        raise GoogleChatConfigError(f"{agent}: no private google_chat.people record")
+    people: list[dict[str, str]] = []
+    addresses: set[str] = set()
+    account_ids: set[str] = set()
+    for person in record["people"]:
+        if not isinstance(person, dict) or not set(person) <= {"address", "account_id"}:
+            raise GoogleChatConfigError(f"{agent}: malformed private people list")
+        address = person.get("address")
+        account_id = person.get("account_id")
+        if not isinstance(address, str) or not _ADDRESS.fullmatch(address):
+            raise GoogleChatConfigError(f"{agent}: malformed private person address")
+        if account_id is not None and (not isinstance(account_id, str)
+                                    or not _ACCOUNT_ID.fullmatch(account_id)):
+            raise GoogleChatConfigError(f"{agent}: malformed private person account_id")
+        if address.casefold() in addresses or (account_id and account_id in account_ids):
+            raise GoogleChatConfigError(f"{agent}: duplicate private person")
+        addresses.add(address.casefold())
+        if account_id:
+            account_ids.add(account_id)
+        people.append({"address": address, **({"account_id": account_id} if account_id else {})})
+    return people
+
+
+def google_dependencies_available() -> bool:
+    try:
+        from google.cloud import pubsub_v1  # noqa: F401
+        from google.auth.transport.requests import AuthorizedSession  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 def diagnostic(state_dir: Path, project: str, seat: str) -> tuple[bool, str]:
     """A local-only off verdict, or a checked private assignment verdict."""
     try:
@@ -128,12 +169,11 @@ def diagnostic(state_dir: Path, project: str, seat: str) -> tuple[bool, str]:
             return True, "not configured; no Google connection or private directory read"
         rows = private_assignments(project, seat)
         for agent in configured:
-            record = rows.get(agent, {}).get("google_chat")
-            if not isinstance(record, dict) or not isinstance(record.get("people"), list):
-                raise GoogleChatConfigError(f"{agent}: no private google_chat.people record")
-            if any(not isinstance(person, dict) or not isinstance(person.get("address"), str)
-                   or not person["address"] for person in record["people"]):
-                raise GoogleChatConfigError(f"{agent}: malformed private people list")
+            people_for_agent(rows, agent)
+        if not google_dependencies_available():
+            raise GoogleChatConfigError(
+                "Google Chat dependencies missing; install agent-comms[google]"
+            )
         return True, f"configured for {len(configured)} agent(s); private people records available"
     except (GoogleChatConfigError, OSError) as exc:
         return False, str(exc)

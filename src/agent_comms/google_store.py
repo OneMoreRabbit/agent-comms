@@ -1,8 +1,4 @@
-"""Google Chat records, isolated from integer hub message identifiers.
-
-The first build persists events but never delivers them. Later builds can add
-admission and delivery without changing the deployed hub tables or cursor.
-"""
+"""Google Chat records, isolated from integer hub message identifiers."""
 
 from __future__ import annotations
 
@@ -10,6 +6,7 @@ import json
 import re
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -22,6 +19,18 @@ class GoogleMessage:
     event_time: str
     state: str
     payload: dict
+    reason: str = ""
+    attempts: int = 0
+
+
+@dataclass(frozen=True)
+class GoogleOutbound:
+    id: int
+    message_id: str
+    kind: str
+    payload: dict
+    request_id: str
+    state: str
 
 
 class GoogleStore:
@@ -52,7 +61,16 @@ class GoogleStore:
                     created_at TEXT NOT NULL,
                     sent_at TEXT
                 );
+                CREATE UNIQUE INDEX IF NOT EXISTS google_outbound_one_kind
+                    ON google_outbound(message_id, kind);
             """)
+            # 2.9.3 stores already have the table. Add only Google-owned columns;
+            # the hub's messages and cursor are never migrated by this module.
+            columns = {row[1] for row in db.execute("PRAGMA table_info(google_messages)")}
+            if "reason" not in columns:
+                db.execute("ALTER TABLE google_messages ADD COLUMN reason TEXT NOT NULL DEFAULT ''")
+            if "attempts" not in columns:
+                db.execute("ALTER TABLE google_messages ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0")
 
     def _open(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.path, timeout=10)
@@ -64,7 +82,7 @@ class GoogleStore:
     def _message(row: sqlite3.Row) -> GoogleMessage:
         return GoogleMessage(f"gc-{row['id']}", row["agent"], row["source_name"],
                              row["space"], row["event_time"], row["state"],
-                             json.loads(row["payload"]))
+                             json.loads(row["payload"]), row["reason"], row["attempts"])
 
     def receive(self, agent: str, source_name: str, space: str,
                 event_time: str, payload: dict) -> tuple[GoogleMessage, bool]:
@@ -96,3 +114,52 @@ class GoogleStore:
         query += " ORDER BY id DESC"
         with self._open() as db:
             return [self._message(row) for row in db.execute(query, args)]
+
+    def transition(self, local_id: str, *, from_state: str, to_state: str,
+                   reason: str = "", attempt: bool = False) -> GoogleMessage | None:
+        """Compare-and-set a Google state so duplicate workers cannot both advance it."""
+        if not re.fullmatch(r"gc-[0-9]+", local_id):
+            raise ValueError("invalid Google message id")
+        with self._open() as db:
+            changed = db.execute("""UPDATE google_messages
+                SET state=?, reason=?, attempts=attempts+?
+                WHERE id=? AND state=?""",
+                (to_state, reason, int(attempt), int(local_id[3:]), from_state)).rowcount
+            if not changed:
+                return None
+            row = db.execute("SELECT * FROM google_messages WHERE id=?",
+                             (int(local_id[3:]),)).fetchone()
+            return self._message(row)
+
+    @staticmethod
+    def _outbound(row: sqlite3.Row) -> GoogleOutbound:
+        return GoogleOutbound(row["id"], f"gc-{row['message_id']}", row["kind"],
+                              json.loads(row["payload"]), row["request_id"], row["state"])
+
+    def queue_reply(self, row: GoogleMessage, text: str, request_id: str) -> GoogleOutbound:
+        """Durably fix one reply and requestId before any Google API call."""
+        if row.state not in {"delivered", "held", "retrieved"}:
+            raise ValueError(f"{row.id}: cannot reply to a {row.state} message")
+        payload = {"space": row.space, "text": text}
+        encoded = json.dumps(payload, sort_keys=True)
+        with self._open() as db:
+            db.execute("""INSERT OR IGNORE INTO google_outbound
+                (message_id,kind,payload,request_id,created_at)
+                VALUES (?,'reply',?,?,?)""", (int(row.id[3:]), encoded, request_id,
+                                              datetime.now(timezone.utc).isoformat()))
+            stored = db.execute("""SELECT * FROM google_outbound
+                WHERE message_id=? AND kind='reply'""", (int(row.id[3:]),)).fetchone()
+            if stored["payload"] != encoded:
+                raise ValueError(f"{row.id}: a different reply is already recorded")
+            return self._outbound(stored)
+
+    def mark_sent(self, outbound_id: int) -> None:
+        with self._open() as db:
+            db.execute("""UPDATE google_outbound SET state='sent', sent_at=?
+                WHERE id=? AND state='pending'""",
+                (datetime.now(timezone.utc).isoformat(), outbound_id))
+
+    def pending_replies(self) -> list[GoogleOutbound]:
+        with self._open() as db:
+            return [self._outbound(row) for row in db.execute(
+                "SELECT * FROM google_outbound WHERE kind='reply' AND state='pending' ORDER BY id")]

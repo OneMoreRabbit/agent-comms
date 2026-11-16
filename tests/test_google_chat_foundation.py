@@ -49,10 +49,11 @@ def test_strict_settings_and_private_assignment(seat, monkeypatch):
         calls.append((args, kwargs))
         return {AGENT: {"agent": AGENT, "google_chat": {"people": []}}}
     monkeypatch.setattr(google_chat, "private_assignments", private)
+    monkeypatch.setattr(google_chat, "google_dependencies_available", lambda: True)
     result = CliRunner().invoke(cli.main, ["google-chat", "doctor"])
     assert result.exit_code == 0, result.output
     assert "prepared" not in result.output
-    assert "does not collect or reply" in result.output
+    assert "check the running daemon" in result.output
     assert len(calls) == 1
 
     raw = json.loads(path.read_text())
