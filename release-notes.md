@@ -12,6 +12,16 @@ about: one short entry per release, newest first
 
 None.
 
+## v2.9.3 — 2026-11-16
+
+**TL;DR:** Add opt-in Google Chat settings validation, private-assignment diagnostics and a separate local message store, without changing hub delivery.
+
+- `comms google-chat` now has status, doctor and local message inspection commands. A hub-only seat needs no Google settings or credential and makes no Google or private-directory call.
+- A configured seat checks its fixed local settings and reads its own private 0.3 assignment record separately from the hub's 0.2 cache. Google-only records use separate tables in the existing database, with deduplication by source message name.
+- This foundation release does **not** collect Google events, deliver them to an agent, or post replies. It is not the beta. Rolling back to 2.9.2 preserves hub service but cannot read the Google-only tables until a newer version returns.
+
+**Action:** No estate rollout. Install on test-claude or test-codex only after arch grants a window; otherwise leave existing seats on 2.9.2. The next build adds collection and admission.
+
 ## v2.9.2 — 2026-10-09
 
 **TL;DR:** Doctor checks assigned agents' bot transports from its refreshed local assignment cache, without directory self-lookups.
