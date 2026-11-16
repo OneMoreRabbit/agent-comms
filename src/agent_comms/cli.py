@@ -527,7 +527,8 @@ def google_chat_daemon(once: bool) -> None:
     settings = operations.load_settings()
     try:
         count = google_worker.run_once(settings.state_dir, settings.identity.project,
-                                       settings.identity.seat)
+                                       settings.identity.seat,
+                                       record=lambda level, message: click.echo(f"{level.upper()} {message}"))
     except (google_chat.GoogleChatConfigError, OSError) as exc:
         raise click.ClickException(f"Google Chat collection failed: {exc}") from exc
     click.echo(f"Google Chat: stored {count} new message(s)")
@@ -564,7 +565,9 @@ def google_chat_show(from_fqn: str, message_id: str) -> None:
     row = google_store.GoogleStore(settings.state_dir / "comms.db").get(message_id)
     if row is None or row.agent != agent:
         raise click.ClickException(f"no Google Chat message {message_id} for {agent}")
-    click.echo(f"{row.id}  {row.event_time}  {row.state}\n{json.dumps(row.payload, indent=2)}")
+    reason = f" — {row.reason}" if row.reason else ""
+    click.echo(f"{row.id}  {row.event_time}  {row.state}{reason}\n"
+               f"{json.dumps(row.payload, indent=2)}")
 
 
 @google_chat_cmd.command("log")
@@ -580,8 +583,9 @@ def google_chat_log() -> None:
         click.echo("nothing stored yet")
     for row in rows:
         click.echo(f"{row.id}  {row.agent}  {row.state}")
-    for outbound in google_store.GoogleStore(settings.state_dir / "comms.db").pending_replies():
-        click.echo(f"{outbound.message_id}  reply  pending (requestId {outbound.request_id})")
+    for outbound in google_store.GoogleStore(settings.state_dir / "comms.db").replies():
+        detail = f" ({outbound.failure_reason})" if outbound.failure_reason else ""
+        click.echo(f"{outbound.message_id}  reply  {outbound.state}{detail}")
 
 
 @google_chat_cmd.command("reply")

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event
 from typing import Callable
@@ -22,9 +23,20 @@ def _subscriber(config: google_chat.AgentConfig):
     return pubsub_v1.SubscriberClient.from_service_account_file(str(config.credential_file))
 
 
+def _empty_pull(exc: Exception) -> bool:
+    """A bounded unary pull can time out with no available messages."""
+    try:
+        from google.api_core.exceptions import DeadlineExceeded
+    except ImportError:
+        return False
+    return isinstance(exc, DeadlineExceeded)
+
+
 def run_once(state_dir: Path, project: str, seat_name: str,
              subscriber_factory: Callable = _subscriber,
-             private_rows: dict[str, dict] | None = None) -> int:
+             private_rows: dict[str, dict] | None = None,
+             record: Callable[[str, str], None] | None = None,
+             *, raise_on_error: bool = True) -> int:
     """Pull one batch per configured agent; ack after commit, then hand off.
 
     No settings means no private directory, Google, or store call. A failed
@@ -33,17 +45,41 @@ def run_once(state_dir: Path, project: str, seat_name: str,
     configured = google_chat.load_settings(state_dir)
     if not configured:
         return 0
+    store = GoogleStore(state_dir / "comms.db")
+    for message_id in store.expire_pending_replies():
+        if record is not None:
+            record("warn", f"Google Chat {message_id}: reply failed after 24 hours")
     rows = (private_rows if private_rows is not None else
             google_chat.private_assignments(project, seat_name))
-    for agent in configured:
-        google_chat.people_for_agent(rows, agent)
-    store = GoogleStore(state_dir / "comms.db")
     accepted = 0
+    failures = []
+
+    def warn(message: str) -> None:
+        failures.append(message)
+        if record is not None:
+            record("warn", message)
+
+    valid_agents = set()
     for agent, config in configured.items():
-        client = subscriber_factory(config)
         try:
-            response = client.pull(request={"subscription": config.subscription,
-                                            "max_messages": 10}, timeout=20)
+            google_chat.people_for_agent(rows, agent)
+            valid_agents.add(agent)
+        except (google_chat.GoogleChatConfigError, KeyError) as exc:
+            warn(f"Google Chat {agent}: private people record unavailable ({type(exc).__name__})")
+            continue
+        client = None
+        try:
+            client = subscriber_factory(config)
+            try:
+                response = client.pull(request={"subscription": config.subscription,
+                                                "max_messages": 10}, timeout=20)
+            except Exception as exc:
+                if _empty_pull(exc):
+                    response = None
+                else:
+                    raise
+            if response is None:
+                continue
             for received in response.received_messages:
                 try:
                     raw = json.loads(received.message.data.decode("utf-8"))
@@ -53,32 +89,61 @@ def run_once(state_dir: Path, project: str, seat_name: str,
                         lambda ack_id=received.ack_id: client.acknowledge(request={
                             "subscription": config.subscription, "ack_ids": [ack_id]}))
                     accepted += int(inserted)
-                except (ValueError, UnicodeError) as exc:
-                    # A malformed event has no trustworthy source name to
-                    # dedupe, so do not acknowledge it or invent an identity.
-                    raise google_chat.GoogleChatConfigError(
-                        f"{agent}: malformed Google event; Pub/Sub delivery left unacknowledged"
-                    ) from exc
+                except google_intake.NonMessageEvent:
+                    try:
+                        client.acknowledge(request={"subscription": config.subscription,
+                                                    "ack_ids": [received.ack_id]})
+                    except Exception as exc:
+                        warn(f"Google Chat {agent}: could not acknowledge non-message event "
+                             f"({type(exc).__name__})")
+                    else:
+                        if record is not None:
+                            record("info", f"Google Chat {agent}: ignored event without a message")
+                except (ValueError, UnicodeError):
+                    # Malformed messages remain unacknowledged, but cannot
+                    # block the rest of this batch or the local queues.
+                    warn(f"Google Chat {agent}: malformed event left unacknowledged")
+                except Exception as exc:
+                    warn(f"Google Chat {agent}: event failed ({type(exc).__name__}); left unacknowledged")
+        except Exception as exc:
+            warn(f"Google Chat {agent}: pull failed ({type(exc).__name__})")
         finally:
-            client.close()
+            if client is not None:
+                try:
+                    client.close()
+                except Exception as exc:
+                    warn(f"Google Chat {agent}: subscriber close failed ({type(exc).__name__})")
     # Pub/Sub is no longer on the critical path. This also resumes rows that
     # were committed before a prior process exit or a no-session result.
     for row in store.list():
-        if row.agent in configured and row.state == "queued":
-            google_intake.deliver_queued(store, row)
-    failures = []
+        if row.agent in valid_agents and row.state == "queued":
+            try:
+                google_intake.deliver_queued(store, row)
+            except Exception as exc:
+                warn(f"Google Chat {row.id}: handoff failed ({type(exc).__name__})")
     for outbound in store.pending_replies():
+        created = datetime.fromisoformat(outbound.created_at.replace("Z", "+00:00"))
+        if (datetime.now(timezone.utc) - created).total_seconds() >= google_reply.MAX_PENDING_SECONDS:
+            store.mark_failed(outbound.id, "reply pending for 24 hours")
+            if record is not None:
+                record("warn", f"Google Chat {outbound.message_id}: reply failed after 24 hours")
+            continue
         row = store.get(outbound.message_id)
         if row is None or row.agent not in configured:
-            failures.append(f"{outbound.message_id}: no configured agent")
+            warn(f"Google Chat {outbound.message_id}: no configured agent for pending reply")
+            continue
+        if row.agent not in valid_agents:
+            warn(f"Google Chat {outbound.message_id}: private people record unavailable for reply")
             continue
         try:
-            google_reply.retry_pending(store, outbound, configured[row.agent], rows[row.agent])
+            result = google_reply.retry_pending(store, outbound, configured[row.agent], rows[row.agent])
+            if result.state == "failed" and record is not None:
+                record("warn", f"Google Chat {outbound.message_id}: reply failed ({result.failure_reason})")
         except Exception as exc:  # noqa: BLE001 - continue other pending replies
-            failures.append(f"{outbound.message_id}: {type(exc).__name__}: {exc}")
-    if failures:
+            warn(f"Google Chat {outbound.message_id}: reply retry failed ({type(exc).__name__})")
+    if failures and raise_on_error:
         raise google_chat.GoogleChatConfigError(
-            f"{len(failures)} Google Chat reply/replies remain pending: {'; '.join(failures[:3])}")
+            f"{len(failures)} Google Chat operation(s) failed: {'; '.join(failures[:3])}")
     return accepted
 
 
@@ -102,12 +167,15 @@ def run_forever(state_dir: Path, project: str, seat_name: str, stop: Event,
                 rows = None
                 stop.wait(5)
                 continue
+            for message_id in GoogleStore(state_dir / "comms.db").expire_pending_replies():
+                record("warn", f"Google Chat {message_id}: reply failed after 24 hours")
             if rows is None or time.monotonic() - refreshed_at >= CONFIG_REFRESH_SECS:
                 rows = None
                 rows = google_chat.private_assignments(project, seat_name)
                 refreshed_at = time.monotonic()
             count = run_once(state_dir, project, seat_name,
-                             subscriber_factory=subscriber_factory, private_rows=rows)
+                             subscriber_factory=subscriber_factory, private_rows=rows,
+                             record=record, raise_on_error=False)
             if count:
                 record("info", f"Google Chat: stored {count} new message(s)")
         except Exception as exc:  # noqa: BLE001 - Google failure must not end hub

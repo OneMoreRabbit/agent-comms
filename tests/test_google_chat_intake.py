@@ -1,8 +1,10 @@
 """Stand-in Google intake: no live Google service or test seat is touched."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
+import sqlite3
 from threading import Event
+from types import SimpleNamespace
 
 import pytest
 from click.testing import CliRunner
@@ -93,6 +95,123 @@ def test_bounded_collector_uses_standin_and_acks_after_store(seat, monkeypatch):
     assert count == 1 and acks == ["delivery-1"] and delivered == [("gc-1", AGENT)]
 
 
+def _raw_message(name: str, *, text: str = "Hello") -> dict:
+    return {"type": "MESSAGE", "eventTime": "2026-11-16T11:59:00Z",
+            "message": {"name": name, "text": text},
+            "space": {"name": "spaces/dm", "spaceType": "DIRECT_MESSAGE",
+                      "singleUserBotDm": True},
+            "user": {"name": "users/123", "email": "person@example.org", "type": "HUMAN"}}
+
+
+def _received(raw: dict, ack_id: str):
+    return SimpleNamespace(message=SimpleNamespace(data=json.dumps(raw).encode()), ack_id=ack_id)
+
+
+def test_non_message_event_is_acked_once_without_content_and_next_message_runs(tmp_path, monkeypatch):
+    config = google_chat.AgentConfig(AGENT, "projects/fake/subscriptions/fake",
+                                     tmp_path / "credential.json", "fake-folder")
+    monkeypatch.setattr(google_chat, "load_settings", lambda *_: {AGENT: config})
+    records, acks, delivered = [], [], []
+    non_message = {"type": "ADDED_TO_SPACE", "eventTime": "2026-11-16T11:59:00Z",
+                   "user": {"name": "users/123"}, "text": "must not appear in log"}
+
+    class Subscriber:
+        def pull(self, **_):
+            return SimpleNamespace(received_messages=[
+                _received(non_message, "non-message"),
+                _received(_raw_message("spaces/dm/messages/next"), "message")])
+        def acknowledge(self, *, request):
+            acks.extend(request["ack_ids"])
+        def close(self):
+            pass
+
+    monkeypatch.setattr(google_intake, "deliver_queued",
+                        lambda store, row: delivered.append(row.id))
+    count = google_worker.run_once(tmp_path, "agent-eco", "test-claude",
+                                   subscriber_factory=lambda _: Subscriber(),
+                                   private_rows={AGENT: _private()},
+                                   record=lambda level, message: records.append((level, message)))
+    assert count == 1 and acks == ["non-message", "message"] and delivered == ["gc-1"]
+    assert len(records) == 1 and records[0][0] == "info"
+    assert "without a message" in records[0][1]
+    assert "must not appear" not in records[0][1]
+
+
+def test_pull_and_handoff_failure_do_not_skip_other_agent_or_reply(tmp_path, monkeypatch):
+    other = "bakehouse.agent-eco.test-codex"
+    configured = {agent: google_chat.AgentConfig(agent, "projects/fake/subscriptions/fake",
+                                                tmp_path / "credential.json", "fake-folder")
+                  for agent in (AGENT, other)}
+    monkeypatch.setattr(google_chat, "load_settings", lambda *_: configured)
+    store = _store(tmp_path)
+    previous, _ = google_intake.ingest(store, _event(message_name="spaces/dm/messages/previous",
+                                                  agent=other, app_agent=other),
+                                       {**_private(), "agent": other}, now=NOW)
+    previous = store.transition(previous.id, from_state="queued", to_state="delivered")
+    outbound = store.queue_reply(previous, "reply", "request-previous")
+    acks, records, retried = [], [], []
+
+    class Subscriber:
+        def __init__(self, agent):
+            self.agent = agent
+        def pull(self, **_):
+            if self.agent == AGENT:
+                raise OSError("first agent pull failed")
+            return SimpleNamespace(received_messages=[
+                _received(_raw_message("spaces/dm/messages/new"), "new")])
+        def acknowledge(self, *, request):
+            acks.extend(request["ack_ids"])
+        def close(self):
+            pass
+
+    def failed_handoff(store, row):
+        raise OSError("seat unavailable")
+
+    def retry(store, outgoing, *_):
+        retried.append(outgoing.id)
+        store.mark_sent(outgoing.id)
+        return store.get_outbound(outgoing.id)
+
+    monkeypatch.setattr(google_intake, "deliver_queued", failed_handoff)
+    monkeypatch.setattr(google_reply, "retry_pending", retry)
+    count = google_worker.run_once(tmp_path, "agent-eco", "test-claude",
+                                   subscriber_factory=lambda config: Subscriber(config.agent),
+                                   private_rows={agent: {**_private(), "agent": agent}
+                                                 for agent in configured},
+                                   record=lambda level, message: records.append((level, message)),
+                                   raise_on_error=False)
+    assert count == 1 and acks == ["new"] and retried == [outbound.id]
+    assert store.get_outbound(outbound.id).state == "sent"
+    assert any("pull failed" in message for _, message in records)
+    assert any("handoff failed" in message for _, message in records)
+
+
+def test_empty_pull_deadline_still_processes_stored_handoff(tmp_path, monkeypatch):
+    config = google_chat.AgentConfig(AGENT, "projects/fake/subscriptions/fake",
+                                     tmp_path / "credential.json", "fake-folder")
+    monkeypatch.setattr(google_chat, "load_settings", lambda *_: {AGENT: config})
+    row, _ = google_intake.ingest(_store(tmp_path), _event(), _private(), now=NOW)
+
+    class EmptyDeadline(Exception):
+        pass
+
+    class Subscriber:
+        def pull(self, **_):
+            raise EmptyDeadline()
+        def close(self):
+            pass
+
+    monkeypatch.setattr(google_worker, "_empty_pull", lambda exc: isinstance(exc, EmptyDeadline))
+    handed = []
+    monkeypatch.setattr(google_intake, "deliver_queued", lambda store, message: handed.append(message.id))
+    records = []
+    count = google_worker.run_once(tmp_path, "agent-eco", "test-claude",
+                                   subscriber_factory=lambda _: Subscriber(),
+                                   private_rows={AGENT: _private()},
+                                   record=lambda level, message: records.append((level, message)))
+    assert count == 0 and handed == [row.id] and records == []
+
+
 def test_private_account_id_form_and_precedence(tmp_path):
     people = [{"address": "person@example.org", "account_id": "bad/123"}]
     with pytest.raises(google_chat.GoogleChatConfigError, match="account_id"):
@@ -127,6 +246,40 @@ def test_private_account_id_form_and_precedence(tmp_path):
 def test_wrong_source_is_stored_but_never_queued(tmp_path, change, reason):
     row, inserted = google_intake.ingest(_store(tmp_path), _event(**change), _private(), now=NOW)
     assert inserted and row.state == "refused" and reason in row.reason
+    assert "text" not in row.payload and row.space == ""
+    assert row.payload.get("sender_account_id") == change.get("sender_account_id", "users/123")
+    with sqlite3.connect(tmp_path / "comms.db") as db:
+        stored = db.execute("SELECT payload FROM google_messages WHERE id=1").fetchone()[0]
+    assert "Hello" not in stored
+
+
+def test_refused_show_keeps_reason_but_not_text(seat):
+    root = google_chat.settings_dir()
+    root.mkdir(mode=0o700)
+    (root / "settings.json").write_text("{}")
+    store = GoogleStore(root.parent.parent / ".comms" / "comms.db")
+    row, _ = google_intake.ingest(
+        store, _event(text="PRIVATE REFUSED TEXT", sender_account_id="users/other"),
+        _private(), now=NOW)
+    assert row.state == "refused"
+    result = CliRunner().invoke(cli.main, ["google-chat", "show", "--from", AGENT, row.id])
+    assert result.exit_code == 0, result.output
+    assert "person is not listed" in result.output
+    assert "users/other" in result.output
+    assert "PRIVATE REFUSED TEXT" not in result.output
+
+
+def test_refused_text_is_not_stored_even_if_state_transition_crashes(tmp_path, monkeypatch):
+    store = _store(tmp_path)
+    monkeypatch.setattr(store, "transition", lambda *a, **k: (_ for _ in ()).throw(
+        OSError("simulated crash after receive")))
+    with pytest.raises(OSError):
+        google_intake.ingest(store, _event(text="PRIVATE CRASH TEXT",
+                                           sender_account_id="users/other"),
+                             _private(), now=NOW)
+    with sqlite3.connect(tmp_path / "comms.db") as db:
+        stored = db.execute("SELECT payload FROM google_messages WHERE id=1").fetchone()[0]
+    assert "PRIVATE CRASH TEXT" not in stored
 
 
 def test_duplicate_source_name_is_inert_even_with_new_pubsub_delivery(tmp_path):
@@ -204,6 +357,14 @@ def test_ambiguous_handoff_does_not_retry_automatically(tmp_path):
     row = google_intake.deliver_queued(store, row, uncertain, now=NOW)
     assert row.state == "uncertain"
     assert google_intake.deliver_queued(store, row, uncertain, now=NOW).state == "uncertain"
+    config = google_chat.AgentConfig(AGENT, "projects/fake/subscriptions/fake",
+                                     tmp_path / "credential.json", "fake-folder")
+    posts = []
+    outgoing = google_reply.send_text(store, row, "I got it", config, _private(),
+                                      lambda out, _: posts.append(out.request_id))
+    assert outgoing.state == "sent" and len(posts) == 1
+    assert store.get(row.id).state == "delivered"
+    assert "reply confirms" in store.get(row.id).reason
 
 
 def test_old_event_expires_without_seat_handoff(tmp_path):
@@ -279,10 +440,113 @@ def test_removed_person_cannot_receive_a_late_reply(tmp_path):
     row = store.transition(row.id, from_state="queued", to_state="delivered")
     config = google_chat.AgentConfig(AGENT, "projects/fake/subscriptions/fake",
                                      tmp_path / "credential.json", "fake-folder")
-    with pytest.raises(google_chat.GoogleChatConfigError, match="no longer permitted"):
+    with pytest.raises(google_reply.PermanentReplyError, match="no longer permitted"):
         google_reply.send_text(store, row, "Done.", config, _private([]),
                                lambda *a: pytest.fail("posted to a removed person"))
     assert store.pending_replies() == []
+
+
+def test_pending_reply_removed_person_is_failed_once(tmp_path):
+    store = _store(tmp_path)
+    row, _ = google_intake.ingest(store, _event(), _private(), now=NOW)
+    row = store.transition(row.id, from_state="queued", to_state="delivered")
+    config = google_chat.AgentConfig(AGENT, "projects/fake/subscriptions/fake",
+                                     tmp_path / "credential.json", "fake-folder")
+    with pytest.raises(OSError):
+        google_reply.send_text(store, row, "Done.", config, _private(),
+                               lambda *_: (_ for _ in ()).throw(OSError("offline")))
+    pending = store.pending_replies()[0]
+    result = google_reply.retry_pending(store, pending, config, _private([]),
+                                        lambda *_: pytest.fail("posted to removed person"))
+    assert result.state == "failed" and "no longer permitted" in result.failure_reason
+    assert store.pending_replies() == []
+
+
+def test_pending_reply_permanent_google_refusal_and_24_hour_bound(tmp_path):
+    store = _store(tmp_path)
+    config = google_chat.AgentConfig(AGENT, "projects/fake/subscriptions/fake",
+                                     tmp_path / "credential.json", "fake-folder")
+    first, _ = google_intake.ingest(store, _event(), _private(), now=NOW)
+    first = store.transition(first.id, from_state="queued", to_state="delivered")
+    outgoing = store.queue_reply(first, "Done.", "request-1")
+
+    class Refused(Exception):
+        response = type("Response", (), {"status_code": 403})()
+
+    result = google_reply.retry_pending(store, outgoing, config, _private(),
+                                        lambda *_: (_ for _ in ()).throw(Refused()))
+    assert result.state == "failed" and result.failure_reason.endswith("HTTP 403")
+    with pytest.raises(google_reply.PermanentReplyError, match="HTTP 403"):
+        google_reply.send_text(store, first, "Done.", config, _private(),
+                               lambda *_: pytest.fail("retried a failed reply"))
+    second, _ = google_intake.ingest(store, _event(message_name="spaces/dm/messages/two"),
+                                     _private(), now=NOW)
+    second = store.transition(second.id, from_state="queued", to_state="delivered")
+    old = store.queue_reply(second, "Later.", "request-2")
+    future = datetime.fromisoformat(old.created_at) + timedelta(hours=24, seconds=1)
+    result = google_reply.retry_pending(store, old, config, _private(),
+                                        lambda *_: pytest.fail("posted an expired reply"), now=future)
+    assert result.state == "failed" and "24 hours" in result.failure_reason
+    assert store.pending_replies() == []
+
+
+def test_worker_failed_reply_does_not_block_the_next_reply(tmp_path, monkeypatch):
+    config = google_chat.AgentConfig(AGENT, "projects/fake/subscriptions/fake",
+                                     tmp_path / "credential.json", "fake-folder")
+    monkeypatch.setattr(google_chat, "load_settings", lambda *_: {AGENT: config})
+    store = _store(tmp_path)
+    removed, _ = google_intake.ingest(
+        store, _event(message_name="spaces/dm/messages/removed",
+                      sender_account_id="users/removed", sender_address="removed@example.org"),
+        _private([{"address": "removed@example.org", "account_id": "users/removed"}]), now=NOW)
+    allowed, _ = google_intake.ingest(
+        store, _event(message_name="spaces/dm/messages/allowed"), _private(), now=NOW)
+    for row in (removed, allowed):
+        delivered = store.transition(row.id, from_state="queued", to_state="delivered")
+        store.queue_reply(delivered, "Answer", f"request-{row.id}")
+    posts = []
+    original_retry = google_reply.retry_pending
+
+    def retry(store, outbound, config, private_row):
+        return original_retry(store, outbound, config, private_row,
+                              lambda posted, _: posts.append(posted.message_id))
+
+    class Subscriber:
+        def pull(self, **_):
+            return SimpleNamespace(received_messages=[])
+        def close(self):
+            pass
+
+    monkeypatch.setattr(google_reply, "retry_pending", retry)
+    records = []
+    google_worker.run_once(tmp_path, "agent-eco", "test-claude",
+                           subscriber_factory=lambda _: Subscriber(),
+                           private_rows={AGENT: _private()},
+                           record=lambda level, message: records.append((level, message)))
+    replies = {out.message_id: out for out in store.replies()}
+    assert replies[removed.id].state == "failed"
+    assert replies[allowed.id].state == "sent" and posts == [allowed.id]
+    assert any("reply failed" in message for _, message in records)
+
+
+def test_pending_reply_expires_even_if_private_directory_read_fails(tmp_path, monkeypatch):
+    config = google_chat.AgentConfig(AGENT, "projects/fake/subscriptions/fake",
+                                     tmp_path / "credential.json", "fake-folder")
+    monkeypatch.setattr(google_chat, "load_settings", lambda *_: {AGENT: config})
+    store = _store(tmp_path)
+    row, _ = google_intake.ingest(store, _event(), _private(), now=NOW)
+    row = store.transition(row.id, from_state="queued", to_state="delivered")
+    outbound = store.queue_reply(row, "Answer", "request-old")
+    old_time = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat()
+    with sqlite3.connect(tmp_path / "comms.db") as db:
+        db.execute("UPDATE google_outbound SET created_at=? WHERE id=?", (old_time, outbound.id))
+    with pytest.raises(google_chat.GoogleChatConfigError, match="directory down"):
+        with monkeypatch.context() as patch:
+            patch.setattr(google_chat, "private_assignments",
+                          lambda *_: (_ for _ in ()).throw(
+                              google_chat.GoogleChatConfigError("directory down")))
+            google_worker.run_once(tmp_path, "agent-eco", "test-claude")
+    assert store.get_outbound(outbound.id).state == "failed"
 
 
 def test_cli_reply_rejects_wrong_message_id_without_post(seat, monkeypatch):

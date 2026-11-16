@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import uuid
+from datetime import datetime, timezone
 from typing import Callable
 from urllib.parse import urlencode
 
@@ -11,7 +12,12 @@ from . import google_chat
 from .google_store import GoogleMessage, GoogleOutbound, GoogleStore
 
 MAX_REPLY_BYTES = 32000
+MAX_PENDING_SECONDS = 24 * 60 * 60
 _SPACE = re.compile(r"^spaces/[A-Za-z0-9_-]+$")
+
+
+class PermanentReplyError(ValueError):
+    """A reply cannot be posted and must not be retried."""
 
 
 def _post(outbound: GoogleOutbound, config: google_chat.AgentConfig) -> None:
@@ -34,6 +40,8 @@ def _post(outbound: GoogleOutbound, config: google_chat.AgentConfig) -> None:
 def _still_allowed(row: GoogleMessage, private_row: dict) -> None:
     from .google_intake import IntakeEvent, _admission
 
+    if private_row.get("google_chat") is None:
+        raise PermanentReplyError(f"{row.id}: Google Chat contact is no longer enabled")
     people = google_chat.people_for_agent({row.agent: private_row}, row.agent)
     event = IntakeEvent(
         agent=row.agent, message_name=row.source_name, space_name=row.space,
@@ -48,7 +56,43 @@ def _still_allowed(row: GoogleMessage, private_row: dict) -> None:
     )
     reason = _admission(event, people)
     if reason:
-        raise google_chat.GoogleChatConfigError(f"{row.id}: no longer permitted: {reason}")
+        raise PermanentReplyError(f"{row.id}: no longer permitted: {reason}")
+
+
+def _permanent_http_status(exc: Exception) -> int | None:
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    return status if isinstance(status, int) and 400 <= status < 500 and status not in (408, 429) else None
+
+
+def _attempt_pending(store: GoogleStore, outbound: GoogleOutbound,
+                     config: google_chat.AgentConfig, private_row: dict,
+                     post: Callable[[GoogleOutbound, google_chat.AgentConfig], None],
+                     *, now: datetime | None = None) -> GoogleOutbound:
+    moment = now or datetime.now(timezone.utc)
+    created = datetime.fromisoformat(outbound.created_at.replace("Z", "+00:00"))
+    if (moment - created).total_seconds() >= MAX_PENDING_SECONDS:
+        store.mark_failed(outbound.id, "reply pending for 24 hours")
+        return store.get_outbound(outbound.id)
+    row = store.get(outbound.message_id)
+    if row is None or row.agent != config.agent or not _SPACE.fullmatch(row.space):
+        store.mark_failed(outbound.id, "pending reply has no valid original route")
+        return store.get_outbound(outbound.id)
+    try:
+        _still_allowed(row, private_row)
+    except PermanentReplyError as exc:
+        store.mark_failed(outbound.id, str(exc))
+        return store.get_outbound(outbound.id)
+    try:
+        post(outbound, config)
+    except Exception as exc:
+        status = _permanent_http_status(exc)
+        if status is None:
+            raise
+        store.mark_failed(outbound.id, f"Google Chat rejected reply with HTTP {status}")
+        return store.get_outbound(outbound.id)
+    store.mark_sent(outbound.id)
+    return store.get_outbound(outbound.id)
 
 
 def send_text(store: GoogleStore, row: GoogleMessage, text: str,
@@ -68,21 +112,19 @@ def send_text(store: GoogleStore, row: GoogleMessage, text: str,
     outgoing = store.queue_reply(row, text, str(uuid.uuid4()))
     if outgoing.state == "sent":
         return outgoing
-    post(outgoing, config)
-    store.mark_sent(outgoing.id)
-    return store.queue_reply(row, text, outgoing.request_id)
+    if outgoing.state == "failed":
+        raise PermanentReplyError(f"{row.id}: {outgoing.failure_reason}")
+    result = _attempt_pending(store, outgoing, config, private_row, post)
+    if result.state == "failed":
+        raise PermanentReplyError(f"{row.id}: {result.failure_reason}")
+    return result
 
 
 def retry_pending(store: GoogleStore, outbound: GoogleOutbound,
                   config: google_chat.AgentConfig, private_row: dict,
                   post: Callable[[GoogleOutbound, google_chat.AgentConfig], None] = _post,
-                  ) -> None:
+                  *, now: datetime | None = None) -> GoogleOutbound:
     """Replay only the original outbox row, with its original requestId."""
     if outbound.state != "pending" or outbound.kind != "reply":
-        return
-    row = store.get(outbound.message_id)
-    if row is None or row.agent != config.agent or not _SPACE.fullmatch(row.space):
-        raise ValueError(f"{outbound.message_id}: pending reply has no valid original route")
-    _still_allowed(row, private_row)
-    post(outbound, config)
-    store.mark_sent(outbound.id)
+        return outbound
+    return _attempt_pending(store, outbound, config, private_row, post, now=now)

@@ -19,6 +19,10 @@ MAX_AGE_SECONDS = 24 * 60 * 60
 MAX_ATTEMPTS = 3
 
 
+class NonMessageEvent(ValueError):
+    """A Chat event with no message to store or hand off."""
+
+
 @dataclass(frozen=True)
 class IntakeEvent:
     agent: str
@@ -45,6 +49,9 @@ def from_chat_event(raw: dict, agent: str) -> IntakeEvent:
     if not isinstance(raw, dict):
         raise ValueError("Google event must be an object")
     message = raw.get("message") or {}
+    if isinstance(message, dict) and (
+            not isinstance(message.get("name"), str) or not message["name"]):
+        raise NonMessageEvent("Google event has no message")
     space = raw.get("space") or {}
     user = raw.get("user") or {}
     if not all(isinstance(part, dict) for part in (message, space, user)):
@@ -122,14 +129,6 @@ def ingest(store: GoogleStore, event: IntakeEvent, private_row: dict,
     people = people_for_agent({event.agent: private_row}, event.agent)
     moment = now or datetime.now(timezone.utc)
     age = _age_seconds(event.event_time, moment)
-    payload = {"text": event.text, "sender_address": event.sender_address,
-               "sender_account_id": event.sender_account_id, "sender_type": event.sender_type,
-               "event_type": event.event_type, "space_type": event.space_type,
-               "app_agent": event.app_agent, "has_attachments": event.has_attachments}
-    row, inserted = store.receive(event.agent, event.message_name, event.space_name,
-                                  event.event_time, payload)
-    if not inserted and row.state != "received":
-        return row, False
     reason = _admission(event, people)
     if age > MAX_AGE_SECONDS:
         state, reason = "expired", "Google event is older than 24 hours"
@@ -148,6 +147,19 @@ def ingest(store: GoogleStore, event: IntakeEvent, private_row: dict,
         else:
             # A malformed private row cannot silently select the old inject fallback.
             state, reason = "refused", "agent delivery mode is unavailable"
+    payload = {"text": event.text, "sender_address": event.sender_address,
+               "sender_account_id": event.sender_account_id, "sender_type": event.sender_type,
+               "event_type": event.event_type, "space_type": event.space_type,
+               "app_agent": event.app_agent, "has_attachments": event.has_attachments}
+    if state == "refused":
+        # A crash after receive and before transition must not leave rejected
+        # text visible in a temporary `received` row.
+        payload = {key: payload[key] for key in ("sender_account_id", "sender_address")
+                   if payload[key]}
+    row, inserted = store.receive(event.agent, event.message_name, event.space_name,
+                                  event.event_time, payload)
+    if not inserted and row.state != "received":
+        return row, False
     updated = store.transition(row.id, from_state="received", to_state=state, reason=reason)
     if updated is None:
         # Another collector completed the same durable event while this one
@@ -184,7 +196,7 @@ def turn(row: GoogleMessage) -> str:
 def deliver_queued(store: GoogleStore, row: GoogleMessage,
                    handoff: Callable[..., seat.Delivery] = seat.deliver,
                    *, now: datetime | None = None) -> GoogleMessage:
-    """One bounded handoff; ambiguous crash remains visible for reconciliation.
+    """One bounded handoff; an ambiguous outcome is never handed off twice.
 
     Claim before calling seat. A process crash or an ambiguous transport error
     leaves `handing_off` instead of replaying a turn that may already exist.
@@ -208,7 +220,7 @@ def deliver_queued(store: GoogleStore, row: GoogleMessage,
         # SeatUnavailable includes timeouts: we cannot prove whether seat saw
         # the turn, so do not requeue it automatically.
         return store.transition(row.id, from_state="handing_off", to_state="uncertain",
-                                reason="seat handoff outcome unknown; manual reconciliation required") or store.get(row.id)
+                                reason="seat handoff outcome unknown; a reply confirms delivery") or store.get(row.id)
     if result.success:
         target, reason, attempt = "delivered", result.status, False
     elif result.status == seat.NO_SESSION or result.deferred_without_attempt or result.needs_a_person:
