@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 from click.testing import CliRunner
 
-from agent_comms import cli, google_chat, google_intake, google_reply, google_worker, seat as seat_api
+from agent_comms import cli, google_chat, google_intake, google_media, google_reply, google_worker, seat as seat_api
 from agent_comms.google_store import GoogleStore
 
 AGENT = "bakehouse.agent-eco.agent-comms"
@@ -58,7 +58,7 @@ def test_bounded_collector_uses_standin_and_acks_after_store(seat, monkeypatch):
     config_file.chmod(0o600)
     state_dir = root.parent.parent / ".comms"
     monkeypatch.setattr(google_chat, "private_assignments", lambda *a: {AGENT: _private()})
-    raw = {"type": "MESSAGE", "eventTime": "2026-11-16T11:59:00Z",
+    raw = {"type": "MESSAGE", "eventTime": datetime.now(timezone.utc).isoformat(),
            "message": {"name": "spaces/dm/messages/one", "text": "Hello"},
            "space": {"name": "spaces/dm", "spaceType": "DIRECT_MESSAGE",
                      "singleUserBotDm": True},
@@ -96,7 +96,7 @@ def test_bounded_collector_uses_standin_and_acks_after_store(seat, monkeypatch):
 
 
 def _raw_message(name: str, *, text: str = "Hello") -> dict:
-    return {"type": "MESSAGE", "eventTime": "2026-11-16T11:59:00Z",
+    return {"type": "MESSAGE", "eventTime": datetime.now(timezone.utc).isoformat(),
             "message": {"name": name, "text": text},
             "space": {"name": "spaces/dm", "spaceType": "DIRECT_MESSAGE",
                       "singleUserBotDm": True},
@@ -130,7 +130,8 @@ def test_non_message_event_is_acked_once_without_content_and_next_message_runs(t
     count = google_worker.run_once(tmp_path, "agent-eco", "test-claude",
                                    subscriber_factory=lambda _: Subscriber(),
                                    private_rows={AGENT: _private()},
-                                   record=lambda level, message: records.append((level, message)))
+                                   record=lambda level, message: records.append((level, message)),
+                                   notice_post=lambda outbound, config: None)
     assert count == 1 and acks == ["non-message", "message"] and delivered == ["gc-1"]
     assert len(records) == 2 and all(level == "info" for level, _ in records)
     assert "form=interaction type=ADDED_TO_SPACE space_type=unknown" in records[0][1]
@@ -139,6 +140,37 @@ def test_non_message_event_is_acked_once_without_content_and_next_message_runs(t
     assert "user.name=True user.email=True message=True outcome=stored" in records[1][1]
     assert not any("must not appear" in line or "person@example.org" in line or "users/123" in line
                    for _, line in records)
+
+
+def test_failed_shape_log_does_not_skip_the_next_event_or_handoff(tmp_path, monkeypatch):
+    config = google_chat.AgentConfig(AGENT, "projects/fake/subscriptions/fake",
+                                     tmp_path / "credential.json", "fake-folder")
+    monkeypatch.setattr(google_chat, "load_settings", lambda *_: {AGENT: config})
+    acks, delivered = [], []
+
+    class Subscriber:
+        def pull(self, **_):
+            return SimpleNamespace(received_messages=[
+                _received(_raw_message("spaces/dm/messages/one"), "one"),
+                _received(_raw_message("spaces/dm/messages/two"), "two")])
+
+        def acknowledge(self, *, request):
+            acks.extend(request["ack_ids"])
+
+        def close(self):
+            pass
+
+    def broken_record(level, message):
+        if level == "info":
+            raise OSError("event log unavailable")
+
+    monkeypatch.setattr(google_intake, "deliver_queued",
+                        lambda store, row: delivered.append(row.id))
+    count = google_worker.run_once(tmp_path, "agent-eco", "test-claude",
+                                   subscriber_factory=lambda _: Subscriber(),
+                                   private_rows={AGENT: _private()},
+                                   record=broken_record, raise_on_error=False)
+    assert count == 2 and acks == ["one", "two"] and delivered == ["gc-2", "gc-1"]
 
 
 def test_added_to_space_with_message_is_refused_acked_and_logged(tmp_path, monkeypatch):
@@ -160,7 +192,8 @@ def test_added_to_space_with_message_is_refused_acked_and_logged(tmp_path, monke
     count = google_worker.run_once(tmp_path, "agent-eco", "test-claude",
                                    subscriber_factory=lambda _: Subscriber(),
                                    private_rows={AGENT: _private()},
-                                   record=lambda level, message: records.append((level, message)))
+                                   record=lambda level, message: records.append((level, message)),
+                                   notice_post=lambda outbound, config: None)
     assert count == 1 and acks == ["added"]
     row = _store(tmp_path).get("gc-1")
     assert row.state == "refused" and row.reason == "unsupported event type"
@@ -219,6 +252,28 @@ def test_google_log_shows_only_content_free_shape_lines(seat):
     assert result.exit_code == 0, result.output
     assert "form=add_on" in result.output
     assert "private content" not in result.output and "person@example.org" not in result.output
+
+
+def test_google_log_shows_fixed_refusal_without_account_id_and_only_recent_events(seat):
+    root = google_chat.settings_dir()
+    root.mkdir(mode=0o700)
+    (root / "settings.json").write_text("{}")
+    state_dir = root.parent.parent / ".comms"
+    store = GoogleStore(state_dir / "comms.db")
+    row, _ = google_intake.ingest(store, _event(sender_account_id="users/secret123"),
+                                  _private(), now=NOW)
+    assert row.state == "refused"
+    (state_dir / "events.log").write_text("".join(
+        f"2026-11-16T12:00:00+00:00 INFO Google Chat event: form=interaction "
+        f"type=MESSAGE space_type=DIRECT_MESSAGE user.name=True "
+        f"user.email=True message=True outcome=stored-{number}\n"
+        for number in range(25)))
+    result = CliRunner().invoke(cli.main, ["google-chat", "log"])
+    assert result.exit_code == 0, result.output
+    assert "refused (person is not listed: check the address on the directory's Google Chat people page)" in result.output
+    assert "secret123" not in result.output and "person@example.org" not in result.output
+    assert "stored-4" not in result.output and "stored-5" in result.output
+    assert "stored-24" in result.output
 
 
 def test_pull_and_handoff_failure_do_not_skip_other_agent_or_reply(tmp_path, monkeypatch):
@@ -322,9 +377,8 @@ def test_private_account_id_form_and_precedence(tmp_path):
     ({"sender_type": "BOT"}, "not a person"),
     ({"app_agent": "other.app.agent"}, "another Chat app"),
     ({"event_type": "ADDED_TO_SPACE"}, "unsupported event"),
-    ({"sender_address": "intruder@example.net", "sender_account_id": "users/other"}, "permitted domain"),
-    ({"sender_address": "intruder@example.net", "sender_account_id": "users/123"}, "permitted domain"),
-    ({"has_attachments": True}, "no partial text handoff"),
+    ({"sender_address": "intruder@example.net", "sender_account_id": "users/other"}, "person is not listed"),
+    ({"has_attachments": True}, "attachment reference is unavailable"),
     ({"text": ""}, "empty message"),
 ])
 def test_wrong_source_is_stored_but_never_queued(tmp_path, change, reason):
@@ -335,6 +389,70 @@ def test_wrong_source_is_stored_but_never_queued(tmp_path, change, reason):
     with sqlite3.connect(tmp_path / "comms.db") as db:
         stored = db.execute("SELECT payload FROM google_messages WHERE id=1").fetchone()[0]
     assert "Hello" not in stored
+
+
+def test_listed_account_id_wins_even_when_event_address_has_another_domain(tmp_path):
+    row, _ = google_intake.ingest(
+        _store(tmp_path), _event(sender_address="changed@example.net",
+                                 sender_account_id="users/123"), _private(), now=NOW)
+    assert row.state == "queued"
+
+
+def test_uploaded_attachment_is_saved_before_the_seat_turn(seat, tmp_path):
+    attachment = {"source": "UPLOADED_CONTENT", "contentName": "../../ignore-me.jpg",
+                  "contentType": "image/jpeg",
+                  "attachmentDataRef": {"resourceName": "spaces/dm/messages/one/attachments/a=+.%"}}
+    store = _store(tmp_path)
+    row, _ = google_intake.ingest(
+        store, _event(text="", has_attachments=True, attachments=(attachment,),
+                      event_time=datetime.now(timezone.utc).isoformat()), _private())
+    assert row.state == "queued"
+    config = google_chat.AgentConfig(AGENT, "projects/fake/subscriptions/fake",
+                                     tmp_path / "credential.json", "fake-folder")
+    prepared = google_media.prepare_queued(store, row, config,
+                                           download=lambda *_: [b"photo", b" data"])
+    assert prepared.state == "queued" and prepared.payload["files"][0]["bytes"] == 10
+    path = seat / "comms-files" / "in" / "gc-1" / "file-01.jpg"
+    assert path.read_bytes() == b"photo data"
+    assert str(path) in google_intake.turn(prepared)
+    assert "ignore-me.jpg" not in google_intake.turn(prepared)
+    assert google_media.prepare_queued(store, prepared, config,
+                                       download=lambda *_: pytest.fail("download repeated")) == prepared
+
+
+def test_drive_backed_attachment_is_refused_without_text(tmp_path):
+    attachment = {"source": "DRIVE_FILE", "driveDataRef": {"driveFileId": "secret"}}
+    row, _ = google_intake.ingest(
+        _store(tmp_path), _event(has_attachments=True, attachments=(attachment,),
+                                 text="DO NOT DELIVER"), _private(), now=NOW)
+    assert row.state == "refused" and "Drive-backed" in row.reason
+    assert "text" not in row.payload
+
+
+def test_oversize_upload_refuses_without_naming_partial_file(seat, tmp_path, monkeypatch):
+    attachment = {"source": "UPLOADED_CONTENT", "contentType": "application/pdf",
+                  "attachmentDataRef": {"resourceName": "spaces/dm/media/one"}}
+    store = _store(tmp_path)
+    row, _ = google_intake.ingest(store, _event(has_attachments=True, attachments=(attachment,),
+                                                event_time=datetime.now(timezone.utc).isoformat()),
+                                   _private())
+    monkeypatch.setattr(google_media, "MAX_FILE_BYTES", 3)
+    config = google_chat.AgentConfig(AGENT, "projects/fake/subscriptions/fake",
+                                     tmp_path / "credential.json", "fake-folder")
+    prepared = google_media.prepare_queued(store, row, config,
+                                           download=lambda *_: [b"toolarge"])
+    assert prepared.state == "refused" and prepared.reason == "file too large"
+    assert "files" not in prepared.payload and "text" not in prepared.payload
+    assert not (seat / "comms-files" / "in" / "gc-1" / "file-01.pdf").exists()
+
+
+def test_unlisted_old_message_is_refused_without_storing_text(tmp_path):
+    row, _ = google_intake.ingest(
+        _store(tmp_path), _event(event_time="2026-11-14T00:00:00Z",
+                                 sender_account_id="users/other", text="PRIVATE OLD TEXT"),
+        _private(), now=NOW)
+    assert row.state == "refused" and row.reason.startswith("person is not listed")
+    assert "text" not in row.payload
 
 
 def test_refused_show_keeps_reason_but_not_text(seat):

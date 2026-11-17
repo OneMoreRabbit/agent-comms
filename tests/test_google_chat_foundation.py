@@ -6,7 +6,7 @@ import sqlite3
 import pytest
 from click.testing import CliRunner
 
-from agent_comms import cli, google_chat
+from agent_comms import cli, google_chat, google_drive
 from agent_comms.google_store import GoogleStore
 
 AGENT = "bakehouse.agent-eco.agent-comms"
@@ -50,6 +50,7 @@ def test_strict_settings_and_private_assignment(seat, monkeypatch):
         return {AGENT: {"agent": AGENT, "google_chat": {"people": []}}}
     monkeypatch.setattr(google_chat, "private_assignments", private)
     monkeypatch.setattr(google_chat, "google_dependencies_available", lambda: True)
+    monkeypatch.setattr(google_drive, "check_reply_folder", lambda config: None)
     result = CliRunner().invoke(cli.main, ["google-chat", "doctor"])
     assert result.exit_code == 0, result.output
     assert "prepared" not in result.output
