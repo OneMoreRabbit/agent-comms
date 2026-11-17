@@ -10,7 +10,15 @@ about: one short entry per release, newest first
 
 ## Built, not yet released
 
-- 2.9.5 — 2026-11-17 — Add bounded Google Chat file intake, shared-drive reply links, durable notices, stand-in reply testing and long-answer links, so the operator can test the full people-messaging flow without changing hub-only seats.
+## v2.9.5 — 2026-11-17
+
+**TL;DR:** Add bounded Google Chat file intake, shared-drive reply links, durable notices, stand-in reply testing and long-answer links without changing hub-only seats.
+
+- Admitted photos and documents are saved under owner-only paths before the agent turn; file replies and complete long answers are uploaded to a configured shared-drive folder and posted as links.
+- Fixed one-time notices cover delivery and file failures. A hidden, isolated stand-in reply option supports the test-seat acceptance scripts without calling live Google.
+- Known issue: if the reply command records an upload link between a worker pass reading the pending row and claiming an upload, the worker may upload the same file a second time. The Chat reply is still posted once. This race remains for a later build.
+
+**Action:** Install only on test-claude and test-codex for the stand-in and operator Google Chat tests. The Google beta is not yet accepted; do not install on other seats.
 
 ## v2.9.4 — 2026-11-16
 
