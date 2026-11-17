@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sys
 from dataclasses import asdict
+from pathlib import Path
 
 import click
 
@@ -500,8 +501,8 @@ def google_chat_status() -> None:
 
 @google_chat_cmd.command("doctor")
 def google_chat_doctor() -> None:
-    """Check local Google settings and the private directory record."""
-    from . import google_chat
+    """Check local Google settings, private people and the reply folder."""
+    from . import google_chat, google_drive
     if not (google_chat.settings_file().exists() or google_chat.settings_file().is_symlink()):
         click.echo("Google Chat: not configured; no Google or private directory call")
         return
@@ -510,6 +511,14 @@ def google_chat_doctor() -> None:
                                         settings.identity.seat)
     click.echo(f"{'PASS' if ok else 'FAIL'} Google Chat configuration — {detail}")
     if ok:
+        try:
+            configured = google_chat.load_settings(settings.state_dir)
+            for config in configured.values():
+                google_drive.check_reply_folder(config)
+        except google_drive.DriveError as exc:
+            click.echo(f"FAIL reply folder — {exc}; text and hub replies remain available")
+            raise click.ClickException("Google Chat reply folder check failed") from exc
+        click.echo("PASS reply folder — shared drive, writable by this service account")
         click.echo("NOTE configuration passes; check the running daemon and a stand-in round trip for delivery")
     else:
         raise click.ClickException("Google Chat configuration failed; hub is unaffected")
@@ -573,7 +582,38 @@ def google_chat_show(from_fqn: str, message_id: str) -> None:
 @google_chat_cmd.command("log")
 def google_chat_log() -> None:
     """Show Google message states and content-free event shapes."""
+    from collections import deque
     from . import google_chat, google_store
+
+    def safe_reason(reason: str) -> str:
+        # The stored reason can include a Google account ID. The overview
+        # never copies identity or arbitrary provider text from that field.
+        fixed = {
+            "person is not listed":
+                "person is not listed: check the address on the directory's Google Chat people page",
+            "attachment reference is unavailable": "attachment reference unavailable",
+            "more than ten attachments": "more than ten attachments",
+            "malformed attachment reference": "malformed attachment reference",
+            "Drive-backed attachment is not supported": "Drive-backed attachment unsupported; attach from your device",
+            "file too large": "file too large",
+            "inbound file directory is not owner-only": "inbound file directory is not owner-only",
+            "inbound file path is not a regular file": "inbound file path is not a regular file",
+            "media download returned non-bytes data": "media download failed",
+            "media download unavailable after three attempts": "media download unavailable after three attempts",
+            "seat turn exceeds 65536 UTF-8 bytes": "seat turn exceeds 65536 UTF-8 bytes",
+            "empty message has no text to deliver": "empty message",
+            "unsupported event type": "unsupported event type",
+            "not a direct message": "not a direct message",
+            "message is for another Chat app": "wrong Chat app",
+            "sender is not a person": "sender is not a person",
+            "agent delivery is none": "delivery none",
+            "agent delivery mode is unavailable": "delivery mode unavailable",
+            "failed": "seat declined delivery",
+            "Google event time is in the future": "future event",
+            "Google event is older than 24 hours": "message expired",
+        }
+        return fixed.get(reason.partition(" (Google account ")[0], "refused (unclassified)")
+
     if not (google_chat.settings_file().exists() or google_chat.settings_file().is_symlink()):
         click.echo("Google Chat: not configured; no local Google store opened")
         return
@@ -582,32 +622,67 @@ def google_chat_log() -> None:
     if not rows:
         click.echo("nothing stored yet")
     for row in rows:
-        click.echo(f"{row.id}  {row.agent}  {row.state}")
+        detail = f" ({safe_reason(row.reason)})" if row.state == "refused" else ""
+        click.echo(f"{row.id}  {row.agent}  {row.state}{detail}")
     for outbound in google_store.GoogleStore(settings.state_dir / "comms.db").replies():
-        detail = f" ({outbound.failure_reason})" if outbound.failure_reason else ""
+        if outbound.failure_reason in {
+                "Drive API not enabled or access refused (HTTP 403)",
+                "reply folder not found or not shared with this account (HTTP 404)",
+                "Google Drive is not reachable", "reply folder is not a shared-drive folder",
+                "reply folder is not writable by this service account",
+                "Drive upload outcome uncertain; automatic re-upload refused",
+                "Drive link could not be recorded; automatic re-upload refused",
+                "Drive upload attempt limit reached"}:
+            detail = f" (reply upload: {outbound.failure_reason}; attempt {outbound.upload_attempts}/3)"
+        elif outbound.failure_reason == "reply pending for 24 hours":
+            detail = " (reply failed: pending for 24 hours)"
+        elif "no longer permitted" in outbound.failure_reason:
+            detail = " (reply failed: person is no longer permitted)"
+        elif "exceeds 32000 UTF-8 bytes" in outbound.failure_reason:
+            detail = " (reply failed: message too large)"
+        elif "rejected reply" in outbound.failure_reason:
+            detail = " (reply failed: Google rejected it)"
+        elif outbound.failure_reason:
+            detail = " (reply failed: cause not shown here; use show)"
+        else:
+            detail = ""
         click.echo(f"{outbound.message_id}  reply  {outbound.state}{detail}")
+    for outbound in google_store.GoogleStore(settings.state_dir / "comms.db").notices():
+        detail = " (notice failed: retry bound or Google refusal)" if outbound.failure_reason else ""
+        click.echo(f"{outbound.message_id}  {outbound.kind}  {outbound.state}{detail}")
     event_log = settings.state_dir / "events.log"
     if event_log.is_file():
         with event_log.open(encoding="utf-8", errors="replace") as lines:
-            for line in lines:
-                if " INFO Google Chat event: " in line:
-                    click.echo(line.rstrip("\n"))
+            recent = deque((line.rstrip("\n") for line in lines
+                            if " INFO Google Chat event: " in line), maxlen=20)
+        for line in recent:
+            click.echo(line)
 
 
 @google_chat_cmd.command("reply")
 @click.option("--from", "from_fqn", required=True)
 @click.option("--file", "file_path", type=click.Path(), default=None)
+@click.option("--stand-in-run", "stand_in_run", type=click.Path(), default=None, hidden=True)
 @click.argument("message_id")
-@click.argument("text")
-def google_chat_reply(from_fqn: str, file_path: str | None,
+@click.argument("text", required=False, default="")
+def google_chat_reply(from_fqn: str, file_path: str | None, stand_in_run: str | None,
                       message_id: str, text: str) -> None:
-    """Post one text reply to the original Google direct-message space."""
-    from . import google_chat, google_reply, google_store
-    if file_path is not None:
-        raise click.ClickException("Google Chat file replies are not yet supported by this build")
+    """Post text and optionally one Drive file to the original direct message."""
+    from . import google_chat, google_reply, google_store, google_standin
     settings = operations.load_settings()
     agent = operations.sending_agent(from_fqn, settings.state_dir)
     try:
+        if stand_in_run is not None:
+            store, config, private_row, run_dir = google_standin.open_run(Path(stand_in_run), agent)
+            row = store.get(message_id)
+            if row is None or row.agent != agent:
+                raise ValueError(f"no stand-in Google Chat message {message_id} for {agent}")
+            outgoing = google_reply.send_text(
+                store, row, text, config, private_row, post=google_standin.recorder(run_dir),
+                file_path=Path(file_path) if file_path else None,
+                upload=google_standin.fake_upload(run_dir))
+            click.echo(f"{outgoing.message_id}: stand-in reply {outgoing.state}")
+            return
         configured = google_chat.load_settings(settings.state_dir)
         if agent not in configured:
             raise google_chat.GoogleChatConfigError(f"{agent}: no Google Chat contact configured")
@@ -617,7 +692,8 @@ def google_chat_reply(from_fqn: str, file_path: str | None,
         row = store.get(message_id)
         if row is None or row.agent != agent:
             raise ValueError(f"no Google Chat message {message_id} for {agent}")
-        outgoing = google_reply.send_text(store, row, text, configured[agent], rows.get(agent, {}))
+        outgoing = google_reply.send_text(store, row, text, configured[agent], rows.get(agent, {}),
+                                          file_path=Path(file_path) if file_path else None)
     except (ValueError, google_chat.GoogleChatConfigError) as exc:
         raise click.ClickException(str(exc)) from exc
     except Exception as exc:  # Google API uncertainty keeps the durable outbox pending

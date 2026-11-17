@@ -1,7 +1,7 @@
 ---
 title: Release notes — agent-comms
 status: active
-updated: 2026-10-09
+updated: 2026-11-16
 owner: agent-eco.component.agent-comms
 about: one short entry per release, newest first
 ---
@@ -10,7 +10,25 @@ about: one short entry per release, newest first
 
 ## Built, not yet released
 
-- **2.9.4 — 2026-11-16:** Add opt-in Google Chat collection in the existing daemon, private-list admission, bounded text handoff, and a durable text-reply outbox with stable request IDs; acknowledge and identify non-message and add-on-form events, log one content-free shape line per event, isolate failures, end failed or aged replies, and erase refused text; keep hub behavior unchanged. Why: prepare a first real-Google text try while refusing unknown people and preserving retry safety. This is not a released tag or the operator beta; files, fixed notices and live Google acceptance remain open.
+## v2.9.5 — 2026-11-17
+
+**TL;DR:** Add bounded Google Chat file intake, shared-drive reply links, durable notices, stand-in reply testing and long-answer links without changing hub-only seats.
+
+- Admitted photos and documents are saved under owner-only paths before the agent turn; file replies and complete long answers are uploaded to a configured shared-drive folder and posted as links.
+- Fixed one-time notices cover delivery and file failures. A hidden, isolated stand-in reply option supports the test-seat acceptance scripts without calling live Google.
+- Known issue: if the reply command records an upload link between a worker pass reading the pending row and claiming an upload, the worker may upload the same file a second time. The Chat reply is still posted once. This race remains for a later build.
+
+**Action:** Install only on test-claude and test-codex for the stand-in and operator Google Chat tests. The Google beta is not yet accepted; do not install on other seats.
+
+## v2.9.4 — 2026-11-16
+
+**TL;DR:** Add opt-in Google Chat text collection and replies while leaving hub behavior unchanged.
+
+- The existing daemon can pull Chat events, check people against the owning seat's private directory record, and hand admitted text to `seat msg` under the agent's exact FQN. It stores a reply with a stable request ID before posting it to the original direct message.
+- Non-message and add-on-form events are acknowledged and identified in content-free logs. Refused text is erased; a failure in one pull, handoff or reply does not stop the remaining work.
+- This is a first real-Google text build, **not** the beta. Files, fixed notices, full test-seat scripts and real-Google acceptance remain open.
+
+**Action:** Estate-manage installs the tag only on test-claude and test-codex with the `agent-comms[google]` extra. With no Google settings file, the hub remains as on 2.9.2. Configure the Google side and restart `comms daemon` only for the operator's text try.
 
 ## v2.9.3 — 2026-11-16
 
