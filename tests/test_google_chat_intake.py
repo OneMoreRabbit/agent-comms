@@ -141,6 +141,37 @@ def test_non_message_event_is_acked_once_without_content_and_next_message_runs(t
                    for _, line in records)
 
 
+def test_failed_shape_log_does_not_skip_the_next_event_or_handoff(tmp_path, monkeypatch):
+    config = google_chat.AgentConfig(AGENT, "projects/fake/subscriptions/fake",
+                                     tmp_path / "credential.json", "fake-folder")
+    monkeypatch.setattr(google_chat, "load_settings", lambda *_: {AGENT: config})
+    acks, delivered = [], []
+
+    class Subscriber:
+        def pull(self, **_):
+            return SimpleNamespace(received_messages=[
+                _received(_raw_message("spaces/dm/messages/one"), "one"),
+                _received(_raw_message("spaces/dm/messages/two"), "two")])
+
+        def acknowledge(self, *, request):
+            acks.extend(request["ack_ids"])
+
+        def close(self):
+            pass
+
+    def broken_record(level, message):
+        if level == "info":
+            raise OSError("event log unavailable")
+
+    monkeypatch.setattr(google_intake, "deliver_queued",
+                        lambda store, row: delivered.append(row.id))
+    count = google_worker.run_once(tmp_path, "agent-eco", "test-claude",
+                                   subscriber_factory=lambda _: Subscriber(),
+                                   private_rows={AGENT: _private()},
+                                   record=broken_record, raise_on_error=False)
+    assert count == 2 and acks == ["one", "two"] and delivered == ["gc-2", "gc-1"]
+
+
 def test_added_to_space_with_message_is_refused_acked_and_logged(tmp_path, monkeypatch):
     config = google_chat.AgentConfig(AGENT, "projects/fake/subscriptions/fake",
                                      tmp_path / "credential.json", "fake-folder")

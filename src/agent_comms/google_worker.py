@@ -129,7 +129,12 @@ def run_once(state_dir: Path, project: str, seat_name: str,
                     warn(f"Google Chat {agent}: event failed ({type(exc).__name__}); left unacknowledged")
                 finally:
                     if record is not None:
-                        record("info", _event_metadata(raw, outcome))
+                        try:
+                            record("info", _event_metadata(raw, outcome))
+                        except Exception:
+                            # A broken event logger cannot skip the remaining
+                            # pull batch, handoffs, or pending replies.
+                            failures.append("Google Chat event shape log failed")
         except Exception as exc:
             warn(f"Google Chat {agent}: pull failed ({type(exc).__name__})")
         finally:
