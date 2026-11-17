@@ -106,13 +106,6 @@ def _admission(event: IntakeEvent, people: list[dict[str, str]]) -> str:
         return "attachments are not supported by this build; no partial text handoff"
     if not event.text.strip():
         return "empty message has no text to deliver"
-    if event.sender_address:
-        allowed_domains = {person["address"].rsplit("@", 1)[1].casefold()
-                           for person in people}
-        if allowed_domains and event.sender_address.rsplit("@", 1)[-1].casefold() not in allowed_domains:
-            return ("sender address is outside the permitted domain" +
-                    (f" (Google account {event.sender_account_id})"
-                     if event.sender_account_id else ""))
     for person in people:
         if "account_id" in person:
             if event.sender_account_id and event.sender_account_id == person["account_id"]:
@@ -134,12 +127,12 @@ def ingest(store: GoogleStore, event: IntakeEvent, private_row: dict,
     moment = now or datetime.now(timezone.utc)
     age = _age_seconds(event.event_time, moment)
     reason = _admission(event, people)
-    if age > MAX_AGE_SECONDS:
+    if reason:
+        state = "refused"
+    elif age > MAX_AGE_SECONDS:
         state, reason = "expired", "Google event is older than 24 hours"
     elif age < -300:
         state, reason = "refused", "Google event time is in the future"
-    elif reason:
-        state = "refused"
     else:
         mode = private_row.get("delivery")
         if mode == "hold":

@@ -58,7 +58,7 @@ def test_bounded_collector_uses_standin_and_acks_after_store(seat, monkeypatch):
     config_file.chmod(0o600)
     state_dir = root.parent.parent / ".comms"
     monkeypatch.setattr(google_chat, "private_assignments", lambda *a: {AGENT: _private()})
-    raw = {"type": "MESSAGE", "eventTime": "2026-11-16T11:59:00Z",
+    raw = {"type": "MESSAGE", "eventTime": datetime.now(timezone.utc).isoformat(),
            "message": {"name": "spaces/dm/messages/one", "text": "Hello"},
            "space": {"name": "spaces/dm", "spaceType": "DIRECT_MESSAGE",
                      "singleUserBotDm": True},
@@ -96,7 +96,7 @@ def test_bounded_collector_uses_standin_and_acks_after_store(seat, monkeypatch):
 
 
 def _raw_message(name: str, *, text: str = "Hello") -> dict:
-    return {"type": "MESSAGE", "eventTime": "2026-11-16T11:59:00Z",
+    return {"type": "MESSAGE", "eventTime": datetime.now(timezone.utc).isoformat(),
             "message": {"name": name, "text": text},
             "space": {"name": "spaces/dm", "spaceType": "DIRECT_MESSAGE",
                       "singleUserBotDm": True},
@@ -221,6 +221,28 @@ def test_google_log_shows_only_content_free_shape_lines(seat):
     assert "private content" not in result.output and "person@example.org" not in result.output
 
 
+def test_google_log_shows_fixed_refusal_without_account_id_and_only_recent_events(seat):
+    root = google_chat.settings_dir()
+    root.mkdir(mode=0o700)
+    (root / "settings.json").write_text("{}")
+    state_dir = root.parent.parent / ".comms"
+    store = GoogleStore(state_dir / "comms.db")
+    row, _ = google_intake.ingest(store, _event(sender_account_id="users/secret123"),
+                                  _private(), now=NOW)
+    assert row.state == "refused"
+    (state_dir / "events.log").write_text("".join(
+        f"2026-11-16T12:00:00+00:00 INFO Google Chat event: form=interaction "
+        f"type=MESSAGE space_type=DIRECT_MESSAGE user.name=True "
+        f"user.email=True message=True outcome=stored-{number}\n"
+        for number in range(25)))
+    result = CliRunner().invoke(cli.main, ["google-chat", "log"])
+    assert result.exit_code == 0, result.output
+    assert "refused (person is not listed)" in result.output
+    assert "secret123" not in result.output and "person@example.org" not in result.output
+    assert "stored-4" not in result.output and "stored-5" in result.output
+    assert "stored-24" in result.output
+
+
 def test_pull_and_handoff_failure_do_not_skip_other_agent_or_reply(tmp_path, monkeypatch):
     other = "bakehouse.agent-eco.test-codex"
     configured = {agent: google_chat.AgentConfig(agent, "projects/fake/subscriptions/fake",
@@ -322,8 +344,7 @@ def test_private_account_id_form_and_precedence(tmp_path):
     ({"sender_type": "BOT"}, "not a person"),
     ({"app_agent": "other.app.agent"}, "another Chat app"),
     ({"event_type": "ADDED_TO_SPACE"}, "unsupported event"),
-    ({"sender_address": "intruder@example.net", "sender_account_id": "users/other"}, "permitted domain"),
-    ({"sender_address": "intruder@example.net", "sender_account_id": "users/123"}, "permitted domain"),
+    ({"sender_address": "intruder@example.net", "sender_account_id": "users/other"}, "person is not listed"),
     ({"has_attachments": True}, "no partial text handoff"),
     ({"text": ""}, "empty message"),
 ])
@@ -335,6 +356,22 @@ def test_wrong_source_is_stored_but_never_queued(tmp_path, change, reason):
     with sqlite3.connect(tmp_path / "comms.db") as db:
         stored = db.execute("SELECT payload FROM google_messages WHERE id=1").fetchone()[0]
     assert "Hello" not in stored
+
+
+def test_listed_account_id_wins_even_when_event_address_has_another_domain(tmp_path):
+    row, _ = google_intake.ingest(
+        _store(tmp_path), _event(sender_address="changed@example.net",
+                                 sender_account_id="users/123"), _private(), now=NOW)
+    assert row.state == "queued"
+
+
+def test_unlisted_old_message_is_refused_without_storing_text(tmp_path):
+    row, _ = google_intake.ingest(
+        _store(tmp_path), _event(event_time="2026-11-14T00:00:00Z",
+                                 sender_account_id="users/other", text="PRIVATE OLD TEXT"),
+        _private(), now=NOW)
+    assert row.state == "refused" and row.reason.startswith("person is not listed")
+    assert "text" not in row.payload
 
 
 def test_refused_show_keeps_reason_but_not_text(seat):

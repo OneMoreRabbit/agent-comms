@@ -573,7 +573,26 @@ def google_chat_show(from_fqn: str, message_id: str) -> None:
 @google_chat_cmd.command("log")
 def google_chat_log() -> None:
     """Show Google message states and content-free event shapes."""
+    from collections import deque
     from . import google_chat, google_store
+
+    def safe_reason(reason: str) -> str:
+        # The stored reason can include a Google account ID. The overview
+        # never copies identity or arbitrary provider text from that field.
+        fixed = {
+            "person is not listed": "person is not listed",
+            "attachments are not supported by this build; no partial text handoff":
+                "attachment unsupported",
+            "empty message has no text to deliver": "empty message",
+            "unsupported event type": "unsupported event type",
+            "not a direct message": "not a direct message",
+            "message is for another Chat app": "wrong Chat app",
+            "sender is not a person": "sender is not a person",
+            "agent delivery is none": "delivery none",
+            "Google event time is in the future": "future event",
+        }
+        return fixed.get(reason.partition(" (Google account ")[0], "refused")
+
     if not (google_chat.settings_file().exists() or google_chat.settings_file().is_symlink()):
         click.echo("Google Chat: not configured; no local Google store opened")
         return
@@ -582,16 +601,18 @@ def google_chat_log() -> None:
     if not rows:
         click.echo("nothing stored yet")
     for row in rows:
-        click.echo(f"{row.id}  {row.agent}  {row.state}")
+        detail = f" ({safe_reason(row.reason)})" if row.state == "refused" else ""
+        click.echo(f"{row.id}  {row.agent}  {row.state}{detail}")
     for outbound in google_store.GoogleStore(settings.state_dir / "comms.db").replies():
-        detail = f" ({outbound.failure_reason})" if outbound.failure_reason else ""
+        detail = " (reply failed)" if outbound.failure_reason else ""
         click.echo(f"{outbound.message_id}  reply  {outbound.state}{detail}")
     event_log = settings.state_dir / "events.log"
     if event_log.is_file():
         with event_log.open(encoding="utf-8", errors="replace") as lines:
-            for line in lines:
-                if " INFO Google Chat event: " in line:
-                    click.echo(line.rstrip("\n"))
+            recent = deque((line.rstrip("\n") for line in lines
+                            if " INFO Google Chat event: " in line), maxlen=20)
+        for line in recent:
+            click.echo(line)
 
 
 @google_chat_cmd.command("reply")
