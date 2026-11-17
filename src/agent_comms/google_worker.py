@@ -9,7 +9,7 @@ from pathlib import Path
 from threading import Event
 from typing import Callable
 
-from . import google_chat, google_intake, google_media, google_reply
+from . import google_chat, google_intake, google_media, google_notices, google_reply
 from .google_store import GoogleStore
 
 
@@ -53,6 +53,9 @@ def run_once(state_dir: Path, project: str, seat_name: str,
              subscriber_factory: Callable = _subscriber,
              private_rows: dict[str, dict] | None = None,
              record: Callable[[str, str], None] | None = None,
+             notice_post: Callable | None = None,
+             reply_post: Callable | None = None,
+             reply_upload: Callable | None = None,
              *, raise_on_error: bool = True) -> int:
     """Pull one batch per configured agent; ack after commit, then hand off.
 
@@ -63,6 +66,7 @@ def run_once(state_dir: Path, project: str, seat_name: str,
     if not configured:
         return 0
     store = GoogleStore(state_dir / "comms.db")
+    google_media.cleanup_inbound(store)
     for message_id in store.expire_pending_replies():
         if record is not None:
             record("warn", f"Google Chat {message_id}: reply failed after 24 hours")
@@ -146,6 +150,12 @@ def run_once(state_dir: Path, project: str, seat_name: str,
     # Pub/Sub is no longer on the critical path. This also resumes rows that
     # were committed before a prior process exit or a no-session result.
     for row in store.list():
+        if row.agent in valid_agents and row.state == "held":
+            store.queue_notice(row, "notice-held", google_notices.HELD)
+        elif row.agent in valid_agents and row.state == "expired":
+            store.queue_notice(row, "notice-expired", google_notices.NOT_DELIVERED)
+        elif row.agent in valid_agents and row.state == "abandoned":
+            store.queue_notice(row, "notice-abandoned", google_notices.NOT_DELIVERED)
         if row.agent in valid_agents and row.state == "queued":
             try:
                 prepared = google_media.prepare_queued(store, row, configured[row.agent])
@@ -168,11 +178,31 @@ def run_once(state_dir: Path, project: str, seat_name: str,
             warn(f"Google Chat {outbound.message_id}: private people record unavailable for reply")
             continue
         try:
-            result = google_reply.retry_pending(store, outbound, configured[row.agent], rows[row.agent])
+            if reply_post is None and reply_upload is None:
+                result = google_reply.retry_pending(store, outbound, configured[row.agent], rows[row.agent])
+            else:
+                result = google_reply.retry_pending(
+                    store, outbound, configured[row.agent], rows[row.agent],
+                    post=reply_post or google_reply._post,
+                    upload=reply_upload or google_reply.google_drive.upload_file)
             if result.state == "failed" and record is not None:
-                record("warn", f"Google Chat {outbound.message_id}: reply failed ({result.failure_reason})")
+                record("warn", f"Google Chat {outbound.message_id}: reply failed; inspect Google Chat show")
         except Exception as exc:  # noqa: BLE001 - continue other pending replies
             warn(f"Google Chat {outbound.message_id}: reply retry failed ({type(exc).__name__})")
+    for outbound in store.pending_notices():
+        row = store.get(outbound.message_id)
+        if row is None or row.agent not in valid_agents:
+            continue
+        try:
+            if notice_post is None:
+                result = google_reply.retry_notice(store, outbound, configured[row.agent])
+            else:
+                result = google_reply.retry_notice(store, outbound, configured[row.agent],
+                                                   post=notice_post)
+            if result.state == "failed" and record is not None:
+                record("warn", f"Google Chat {outbound.message_id}: notice failed; inspect Google Chat log")
+        except Exception as exc:
+            warn(f"Google Chat {outbound.message_id}: notice retry failed ({type(exc).__name__})")
     if failures and raise_on_error:
         raise google_chat.GoogleChatConfigError(
             f"{len(failures)} Google Chat operation(s) failed: {'; '.join(failures[:3])}")
@@ -213,5 +243,6 @@ def run_forever(state_dir: Path, project: str, seat_name: str, stop: Event,
         except Exception as exc:  # noqa: BLE001 - Google failure must not end hub
             rows = None
             delay = 60
-            record("warn", f"Google Chat worker failed: {type(exc).__name__}: {exc}")
+            detail = str(exc) if isinstance(exc, google_chat.GoogleChatConfigError) else type(exc).__name__
+            record("warn", f"Google Chat worker failed: {detail}")
         stop.wait(delay)

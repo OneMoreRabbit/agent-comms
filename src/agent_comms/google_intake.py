@@ -13,7 +13,7 @@ from typing import Callable
 
 from .google_chat import people_for_agent
 from .google_store import GoogleMessage, GoogleStore
-from . import seat
+from . import google_notices, seat
 
 MAX_AGE_SECONDS = 24 * 60 * 60
 MAX_ATTEMPTS = 3
@@ -178,11 +178,17 @@ def ingest(store: GoogleStore, event: IntakeEvent, private_row: dict,
                                   event.event_time, payload)
     if not inserted and row.state != "received":
         return row, False
-    updated = store.transition(row.id, from_state="received", to_state=state, reason=reason)
+    updated = store.transition(row.id, from_state="received", to_state=state,
+                               reason=reason,
+                               notice=google_notices.for_refusal(reason) if state == "refused" else None)
     if updated is None:
         # Another collector completed the same durable event while this one
         # was checking it. The redelivery is safe and must still be acked.
         return store.get(row.id), False
+    if state == "held":
+        store.queue_notice(updated, "notice-held", google_notices.HELD)
+    elif state == "expired":
+        store.queue_notice(updated, "notice-expired", google_notices.NOT_DELIVERED)
     return updated, inserted
 
 
@@ -230,12 +236,14 @@ def deliver_queued(store: GoogleStore, row: GoogleMessage,
         return row
     moment = now or datetime.now(timezone.utc)
     if _age_seconds(row.event_time, moment) > MAX_AGE_SECONDS:
+        store.queue_notice(row, "notice-expired", google_notices.NOT_DELIVERED)
         return store.transition(row.id, from_state="queued", to_state="expired",
                                 reason="Google event is older than 24 hours") or store.get(row.id)
     body = turn(row)
     if len(body.encode("utf-8")) > seat.MAX_BODY_BYTES:
         return store.transition(row.id, from_state="queued", to_state="refused",
-                                reason="seat turn exceeds 65536 UTF-8 bytes") or store.get(row.id)
+                                reason="seat turn exceeds 65536 UTF-8 bytes",
+                                notice=google_notices.NOT_DELIVERED) or store.get(row.id)
     claimed = store.transition(row.id, from_state="queued", to_state="handing_off")
     if claimed is None:
         return store.get(row.id)
@@ -258,5 +266,17 @@ def deliver_queued(store: GoogleStore, row: GoogleMessage,
         attempt = True
         target = "abandoned" if claimed.attempts + 1 >= MAX_ATTEMPTS else "queued"
         reason = result.status
-    return store.transition(row.id, from_state="handing_off", to_state=target,
-                            reason=reason, attempt=attempt) or store.get(row.id)
+    advanced = store.transition(row.id, from_state="handing_off", to_state=target,
+                                reason=reason, attempt=attempt,
+                                notice=google_notices.NOT_DELIVERED if target == "refused" else None)
+    if advanced is None:
+        return store.get(row.id)
+    if target == "queued":
+        if result.status == seat.NO_SESSION:
+            store.queue_notice(advanced, "notice-no-session", google_notices.NO_SESSION)
+        elif result.status in {seat.QUEUE_AT_CAPACITY, seat.RUNTIME_UNAVAILABLE,
+                               seat.ENGINE_UNAVAILABLE}:
+            store.queue_notice(advanced, "notice-unavailable", google_notices.TEMPORARILY_UNAVAILABLE)
+    if target == "abandoned":
+        store.queue_notice(advanced, "notice-abandoned", google_notices.NOT_DELIVERED)
+    return advanced

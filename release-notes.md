@@ -10,7 +10,7 @@ about: one short entry per release, newest first
 
 ## Built, not yet released
 
-None.
+- 2.9.5 — 2026-11-17 — Add bounded Google Chat file intake, shared-drive reply links, durable notices, stand-in reply testing and long-answer links, so the operator can test the full people-messaging flow without changing hub-only seats.
 
 ## v2.9.4 — 2026-11-16
 

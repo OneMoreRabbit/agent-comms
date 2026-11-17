@@ -130,7 +130,8 @@ def test_non_message_event_is_acked_once_without_content_and_next_message_runs(t
     count = google_worker.run_once(tmp_path, "agent-eco", "test-claude",
                                    subscriber_factory=lambda _: Subscriber(),
                                    private_rows={AGENT: _private()},
-                                   record=lambda level, message: records.append((level, message)))
+                                   record=lambda level, message: records.append((level, message)),
+                                   notice_post=lambda outbound, config: None)
     assert count == 1 and acks == ["non-message", "message"] and delivered == ["gc-1"]
     assert len(records) == 2 and all(level == "info" for level, _ in records)
     assert "form=interaction type=ADDED_TO_SPACE space_type=unknown" in records[0][1]
@@ -191,7 +192,8 @@ def test_added_to_space_with_message_is_refused_acked_and_logged(tmp_path, monke
     count = google_worker.run_once(tmp_path, "agent-eco", "test-claude",
                                    subscriber_factory=lambda _: Subscriber(),
                                    private_rows={AGENT: _private()},
-                                   record=lambda level, message: records.append((level, message)))
+                                   record=lambda level, message: records.append((level, message)),
+                                   notice_post=lambda outbound, config: None)
     assert count == 1 and acks == ["added"]
     row = _store(tmp_path).get("gc-1")
     assert row.state == "refused" and row.reason == "unsupported event type"
@@ -268,7 +270,7 @@ def test_google_log_shows_fixed_refusal_without_account_id_and_only_recent_event
         for number in range(25)))
     result = CliRunner().invoke(cli.main, ["google-chat", "log"])
     assert result.exit_code == 0, result.output
-    assert "refused (person is not listed)" in result.output
+    assert "refused (person is not listed: check the address on the directory's Google Chat people page)" in result.output
     assert "secret123" not in result.output and "person@example.org" not in result.output
     assert "stored-4" not in result.output and "stored-5" in result.output
     assert "stored-24" in result.output
@@ -399,7 +401,7 @@ def test_listed_account_id_wins_even_when_event_address_has_another_domain(tmp_p
 def test_uploaded_attachment_is_saved_before_the_seat_turn(seat, tmp_path):
     attachment = {"source": "UPLOADED_CONTENT", "contentName": "../../ignore-me.jpg",
                   "contentType": "image/jpeg",
-                  "attachmentDataRef": {"resourceName": "spaces/dm/messages/one/attachments/one"}}
+                  "attachmentDataRef": {"resourceName": "spaces/dm/messages/one/attachments/a=+.%"}}
     store = _store(tmp_path)
     row, _ = google_intake.ingest(
         store, _event(text="", has_attachments=True, attachments=(attachment,),
@@ -410,7 +412,7 @@ def test_uploaded_attachment_is_saved_before_the_seat_turn(seat, tmp_path):
     prepared = google_media.prepare_queued(store, row, config,
                                            download=lambda *_: [b"photo", b" data"])
     assert prepared.state == "queued" and prepared.payload["files"][0]["bytes"] == 10
-    path = seat / "comms-files" / "in" / "gc-1" / "file-01"
+    path = seat / "comms-files" / "in" / "gc-1" / "file-01.jpg"
     assert path.read_bytes() == b"photo data"
     assert str(path) in google_intake.turn(prepared)
     assert "ignore-me.jpg" not in google_intake.turn(prepared)
@@ -441,7 +443,7 @@ def test_oversize_upload_refuses_without_naming_partial_file(seat, tmp_path, mon
                                            download=lambda *_: [b"toolarge"])
     assert prepared.state == "refused" and prepared.reason == "file too large"
     assert "files" not in prepared.payload and "text" not in prepared.payload
-    assert not (seat / "comms-files" / "in" / "gc-1" / "file-01").exists()
+    assert not (seat / "comms-files" / "in" / "gc-1" / "file-01.pdf").exists()
 
 
 def test_unlisted_old_message_is_refused_without_storing_text(tmp_path):
