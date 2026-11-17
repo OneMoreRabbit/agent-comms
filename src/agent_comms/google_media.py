@@ -77,12 +77,12 @@ def prepare_queued(store: GoogleStore, row: GoogleMessage, config: AgentConfig,
         return row
     if _age_seconds(row.event_time, now or datetime.now(timezone.utc)) > MAX_AGE_SECONDS:
         return store.transition(row.id, from_state="queued", to_state="expired",
-                                reason="Google event is older than 24 hours") or store.get(row.id)
+                                reason="Google event is older than 24 hours",
+                                notice=google_notices.retirement(row.event_time)) or store.get(row.id)
     attachments = row.payload.get("attachments")
     if not isinstance(attachments, list) or not 1 <= len(attachments) <= 10:
         return store.transition(row.id, from_state="queued", to_state="refused",
-                                reason="attachment reference is unavailable",
-                                notice=google_notices.NOT_DELIVERED) or store.get(row.id)
+                                reason="attachment reference is unavailable") or store.get(row.id)
     target_dir = _target_directory(row.id)
     files = []
     written = []
@@ -136,8 +136,7 @@ def prepare_queued(store: GoogleStore, row: GoogleMessage, config: AgentConfig,
         if row.attempts + 1 >= 3:
             return store.transition(row.id, from_state="queued", to_state="refused",
                                     reason="media download unavailable after three attempts",
-                                    attempt=True,
-                                    notice=google_notices.NOT_DELIVERED) or store.get(row.id)
+                                    attempt=True) or store.get(row.id)
         return store.transition(row.id, from_state="queued", to_state="queued",
                                 reason="media download unavailable",
                                 attempt=True) or store.get(row.id)

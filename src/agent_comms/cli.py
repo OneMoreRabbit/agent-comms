@@ -625,7 +625,16 @@ def google_chat_log() -> None:
         detail = f" ({safe_reason(row.reason)})" if row.state == "refused" else ""
         click.echo(f"{row.id}  {row.agent}  {row.state}{detail}")
     for outbound in google_store.GoogleStore(settings.state_dir / "comms.db").replies():
-        if outbound.failure_reason == "reply pending for 24 hours":
+        if outbound.failure_reason in {
+                "Drive API not enabled or access refused (HTTP 403)",
+                "reply folder not found or not shared with this account (HTTP 404)",
+                "Google Drive is not reachable", "reply folder is not a shared-drive folder",
+                "reply folder is not writable by this service account",
+                "Drive upload outcome uncertain; automatic re-upload refused",
+                "Drive link could not be recorded; automatic re-upload refused",
+                "Drive upload attempt limit reached"}:
+            detail = f" (reply upload: {outbound.failure_reason}; attempt {outbound.upload_attempts}/3)"
+        elif outbound.failure_reason == "reply pending for 24 hours":
             detail = " (reply failed: pending for 24 hours)"
         elif "no longer permitted" in outbound.failure_reason:
             detail = " (reply failed: person is no longer permitted)"

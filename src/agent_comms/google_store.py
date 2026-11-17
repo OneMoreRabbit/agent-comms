@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -33,6 +34,8 @@ class GoogleOutbound:
     state: str
     created_at: str
     failure_reason: str = ""
+    upload_attempts: int = 0
+    upload_in_progress: bool = False
 
 
 class GoogleStore:
@@ -76,6 +79,10 @@ class GoogleStore:
             outbound_columns = {row[1] for row in db.execute("PRAGMA table_info(google_outbound)")}
             if "failure_reason" not in outbound_columns:
                 db.execute("ALTER TABLE google_outbound ADD COLUMN failure_reason TEXT NOT NULL DEFAULT ''")
+            if "upload_attempts" not in outbound_columns:
+                db.execute("ALTER TABLE google_outbound ADD COLUMN upload_attempts INTEGER NOT NULL DEFAULT 0")
+            if "upload_in_progress" not in outbound_columns:
+                db.execute("ALTER TABLE google_outbound ADD COLUMN upload_in_progress INTEGER NOT NULL DEFAULT 0")
 
     def _open(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.path, timeout=10)
@@ -144,12 +151,15 @@ class GoogleStore:
             raise ValueError("invalid Google message id")
         with self._open() as db:
             original_route = None
+            if notice:
+                route = db.execute("SELECT space FROM google_messages WHERE id=? AND state=?",
+                                   (int(local_id[3:]), from_state)).fetchone()
+                original_route = route["space"] if route else None
             if to_state == "refused":
                 existing = db.execute("SELECT payload,space FROM google_messages WHERE id=? AND state=?",
                                       (int(local_id[3:]), from_state)).fetchone()
                 if existing is None:
                     return None
-                original_route = existing["space"]
                 original = json.loads(existing["payload"])
                 identity = {key: original[key] for key in ("sender_account_id", "sender_address")
                             if isinstance(original.get(key), str) and original[key]}
@@ -169,9 +179,9 @@ class GoogleStore:
                 db.execute("""INSERT OR IGNORE INTO google_outbound
                     (message_id,kind,payload,request_id,created_at)
                     VALUES (?,?,?,?,?)""",
-                    (int(local_id[3:]), "notice-refused",
+                    (int(local_id[3:]), "notice-" + to_state,
                      json.dumps({"space": original_route, "text": notice}, sort_keys=True),
-                     "notice-refused-" + local_id, datetime.now(timezone.utc).isoformat()))
+                     str(uuid.uuid4()), datetime.now(timezone.utc).isoformat()))
             row = db.execute("SELECT * FROM google_messages WHERE id=?",
                              (int(local_id[3:]),)).fetchone()
             return self._message(row)
@@ -180,24 +190,39 @@ class GoogleStore:
     def _outbound(row: sqlite3.Row) -> GoogleOutbound:
         return GoogleOutbound(row["id"], f"gc-{row['message_id']}", row["kind"],
                               json.loads(row["payload"]), row["request_id"], row["state"],
-                              row["created_at"], row["failure_reason"])
+                              row["created_at"], row["failure_reason"],
+                              row["upload_attempts"], bool(row["upload_in_progress"]))
 
     def queue_reply(self, row: GoogleMessage, text: str, request_id: str,
                     file_path: str | None = None,
-                    source_text: str | None = None) -> GoogleOutbound:
+                    source_text: str | None = None,
+                    generated_answer: bool = False) -> GoogleOutbound:
         """Durably fix one reply and requestId before any Google API call."""
         if row.state not in {"delivered", "held", "retrieved", "uncertain"}:
             raise ValueError(f"{row.id}: cannot reply to a {row.state} message")
         payload = {"space": row.space, "text": text}
+        if source_text is not None and source_text != text:
+            payload["source_text"] = source_text
         if file_path is not None:
             payload["source_text"] = source_text if source_text is not None else text
             payload["file_path"] = file_path
+        if generated_answer:
+            payload["generated_answer"] = True
         encoded = json.dumps(payload, sort_keys=True)
         with self._open() as db:
             if row.state == "uncertain":
                 db.execute("""UPDATE google_messages SET state='delivered',
                     reason='agent reply confirms uncertain handoff'
                     WHERE id=? AND state='uncertain'""", (int(row.id[3:]),))
+            existing = db.execute("SELECT * FROM google_outbound WHERE message_id=? AND kind='reply'",
+                                  (int(row.id[3:]),)).fetchone()
+            if existing is not None and existing["state"] == "failed":
+                previous = json.loads(existing["payload"])
+                if previous.get("file_path") and not previous.get("drive_link"):
+                    db.execute("""UPDATE google_outbound SET payload=?, request_id=?, state='pending',
+                        created_at=?, failure_reason='', upload_attempts=0, upload_in_progress=0
+                        WHERE id=? AND state='failed'""",
+                        (encoded, request_id, datetime.now(timezone.utc).isoformat(), existing["id"]))
             db.execute("""INSERT OR IGNORE INTO google_outbound
                 (message_id,kind,payload,request_id,created_at)
                 VALUES (?,'reply',?,?,?)""", (int(row.id[3:]), encoded, request_id,
@@ -228,7 +253,7 @@ class GoogleStore:
                 VALUES (?,?,?,?,?)""",
                 (int(row.id[3:]), kind,
                  json.dumps({"space": row.space, "text": text}, sort_keys=True),
-                 kind + "-" + row.id, datetime.now(timezone.utc).isoformat()))
+                 str(uuid.uuid4()), datetime.now(timezone.utc).isoformat()))
             stored = db.execute("SELECT * FROM google_outbound WHERE message_id=? AND kind=?",
                                 (int(row.id[3:]), kind)).fetchone()
             return self._outbound(stored)
@@ -241,7 +266,7 @@ class GoogleStore:
         wire_text = outbound.payload["text"]
         payload["text"] = f"{wire_text}\n\nFile: {link}" if wire_text else f"File: {link}"
         with self._open() as db:
-            changed = db.execute("""UPDATE google_outbound SET payload=?
+            changed = db.execute("""UPDATE google_outbound SET payload=?, upload_in_progress=0
                 WHERE id=? AND state='pending' AND payload=?""",
                 (json.dumps(payload, sort_keys=True), outbound.id,
                  json.dumps(outbound.payload, sort_keys=True))).rowcount
@@ -259,7 +284,24 @@ class GoogleStore:
     def mark_failed(self, outbound_id: int, reason: str) -> None:
         with self._open() as db:
             db.execute("""UPDATE google_outbound SET state='failed', failure_reason=?
+                , upload_in_progress=0 WHERE id=? AND state='pending'""", (reason, outbound_id))
+
+    def begin_upload(self, outbound_id: int) -> GoogleOutbound | None:
+        """Persist an attempt before upload; an interrupted attempt is never replayed."""
+        with self._open() as db:
+            changed = db.execute("""UPDATE google_outbound SET upload_attempts=upload_attempts+1,
+                upload_in_progress=1 WHERE id=? AND state='pending' AND upload_in_progress=0
+                AND upload_attempts<3""", (outbound_id,)).rowcount
+            row = db.execute("SELECT * FROM google_outbound WHERE id=?", (outbound_id,)).fetchone()
+            return self._outbound(row) if changed else None
+
+    def upload_failed(self, outbound_id: int, reason: str) -> GoogleOutbound:
+        with self._open() as db:
+            db.execute("""UPDATE google_outbound SET upload_in_progress=0,
+                failure_reason=?, state=CASE WHEN upload_attempts>=3 THEN 'failed' ELSE state END
                 WHERE id=? AND state='pending'""", (reason, outbound_id))
+            row = db.execute("SELECT * FROM google_outbound WHERE id=?", (outbound_id,)).fetchone()
+            return self._outbound(row)
 
     def get_outbound(self, outbound_id: int) -> GoogleOutbound | None:
         with self._open() as db:

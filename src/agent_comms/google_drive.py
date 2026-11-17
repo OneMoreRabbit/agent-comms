@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import mimetypes
 import os
+import re
 import stat
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 from urllib.parse import quote, urlparse
@@ -18,6 +20,17 @@ _FOLDER_MIME = "application/vnd.google-apps.folder"
 
 class DriveError(ValueError):
     """The declared shared-drive reply folder or file cannot be used."""
+
+
+def describe_failure(exc: Exception) -> str:
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status == 403:
+        return "Drive API not enabled or access refused (HTTP 403)"
+    if status == 404:
+        return "reply folder not found or not shared with this account (HTTP 404)"
+    if isinstance(exc, DriveError):
+        return str(exc)
+    return "Google Drive is not reachable"
 
 
 def _session(config: AgentConfig):
@@ -42,7 +55,7 @@ def check_reply_folder(config: AgentConfig, session_factory: Callable = _session
             response.raise_for_status()
             folder = response.json()
     except Exception as exc:
-        raise DriveError("reply folder inaccessible") from exc
+        raise DriveError(describe_failure(exc)) from exc
     if not isinstance(folder, dict) or folder.get("mimeType") != _FOLDER_MIME or not folder.get("driveId"):
         raise DriveError("reply folder is not a shared-drive folder")
     if folder.get("capabilities", {}).get("canAddChildren") is not True:
@@ -125,3 +138,35 @@ def upload_file(config: AgentConfig, path: Path, session_factory: Callable = _se
     if not isinstance(uploaded, dict) or not isinstance(uploaded.get("webViewLink"), str):
         raise DriveError("Drive did not return a file link")
     return uploaded["webViewLink"]
+
+
+def cleanup_long_answers(store, *, now: datetime | None = None) -> int:
+    """Remove only generated long-answer files after 30 days; retain the outbox."""
+    cutoff = (now or datetime.now(timezone.utc)) - timedelta(days=30)
+    removed = 0
+    for outbound in store.replies():
+        if not outbound.payload.get("generated_answer"):
+            continue
+        try:
+            created = datetime.fromisoformat(outbound.created_at.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if created >= cutoff:
+            continue
+        row = store.get(outbound.message_id)
+        if row is None:
+            continue
+        root = Path.home() / "comms-files" / "out" / row.agent
+        candidate = Path(outbound.payload.get("file_path", ""))
+        if candidate.parent != root or not re.fullmatch(r"answer-[A-Za-z0-9_-]+\.txt", candidate.name):
+            continue
+        try:
+            info = candidate.lstat()
+            directory = root.lstat()
+        except FileNotFoundError:
+            continue
+        if (stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid()
+                and stat.S_ISDIR(directory.st_mode) and directory.st_uid == os.getuid()):
+            candidate.unlink()
+            removed += 1
+    return removed

@@ -16,11 +16,41 @@ from .google_store import GoogleMessage, GoogleOutbound, GoogleStore
 MAX_REPLY_BYTES = 32000
 MAX_PENDING_SECONDS = 24 * 60 * 60
 _SPACE = re.compile(r"^spaces/[A-Za-z0-9_-]+$")
+_HEADING = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*$")
 
 
 def _wire_bytes(text: str) -> int:
     return len(json.dumps({"text": text, "markupSyntax": "MARKUP_SYNTAX_MARKDOWN"},
                           ensure_ascii=False).encode("utf-8"))
+
+
+def _chat_text(source: str) -> str:
+    """Keep headings and tables readable in Chat's limited Markdown dialect."""
+    result = []
+    fenced = False
+    for line in source.splitlines(keepends=True):
+        content = line.rstrip("\r\n")
+        ending = line[len(content):]
+        if content.strip().find("```") == 0:
+            fenced = not fenced
+            result.append(line)
+            continue
+        if fenced:
+            result.append(line)
+            continue
+        heading = _HEADING.fullmatch(content)
+        if heading:
+            result.append("*" + heading.group(1) + "*" + ending)
+            continue
+        stripped = content.strip()
+        if stripped.count("|") >= 2 and stripped[0:1] == "|" and stripped[-1:] == "|":
+            cells = [cell.strip() for cell in stripped[1:-1].split("|")]
+            if all(cell and set(cell) <= {"-", ":"} for cell in cells):
+                continue
+            result.append(" — ".join(cells) + ending)
+            continue
+        result.append(line)
+    return "".join(result)
 
 
 class PermanentReplyError(ValueError):
@@ -94,8 +124,25 @@ def _attempt_pending(store: GoogleStore, outbound: GoogleOutbound,
         store.mark_failed(outbound.id, str(exc))
         return store.get_outbound(outbound.id)
     if outbound.payload.get("file_path") and not outbound.payload.get("drive_link"):
-        link = upload(config, Path(outbound.payload["file_path"]))
-        outbound = store.set_outbound_link(outbound, link) or store.get_outbound(outbound.id)
+        if outbound.upload_in_progress:
+            store.mark_failed(outbound.id, "Drive upload outcome uncertain; automatic re-upload refused")
+            return store.get_outbound(outbound.id)
+        started = store.begin_upload(outbound.id)
+        if started is None:
+            store.mark_failed(outbound.id, "Drive upload attempt limit reached")
+            return store.get_outbound(outbound.id)
+        try:
+            link = upload(config, Path(outbound.payload["file_path"]))
+        except Exception as exc:
+            return store.upload_failed(outbound.id, google_drive.describe_failure(exc))
+        try:
+            outbound = store.set_outbound_link(started, link)
+        except Exception:
+            store.mark_failed(outbound.id, "Drive link could not be recorded; automatic re-upload refused")
+            return store.get_outbound(outbound.id)
+        if outbound is None:
+            store.mark_failed(started.id, "Drive link could not be recorded; automatic re-upload refused")
+            return store.get_outbound(started.id)
         if _wire_bytes(outbound.payload["text"]) > MAX_REPLY_BYTES:
             store.mark_failed(outbound.id, "Google Chat reply exceeds 32000 UTF-8 bytes after file link")
             return store.get_outbound(outbound.id)
@@ -116,6 +163,7 @@ def send_text(store: GoogleStore, row: GoogleMessage, text: str,
               post: Callable[[GoogleOutbound, google_chat.AgentConfig], None] = _post,
               *, file_path: Path | None = None,
               upload: Callable[[google_chat.AgentConfig, Path], str] = google_drive.upload_file,
+              check_folder: Callable[[google_chat.AgentConfig], None] | None = None,
               ) -> GoogleOutbound:
     """Fix one reply in the outbox before posting, never taking a new route."""
     if row.agent != config.agent:
@@ -124,26 +172,35 @@ def send_text(store: GoogleStore, row: GoogleMessage, text: str,
         raise ValueError(f"{row.id}: invalid original direct-message space")
     if (not text or not text.strip()) and file_path is None:
         raise ValueError("Google Chat reply needs text or one file")
-    long_answer = _wire_bytes(text) > MAX_REPLY_BYTES
+    formatted = _chat_text(text)
+    long_answer = _wire_bytes(formatted) > MAX_REPLY_BYTES
     if long_answer and file_path is not None:
         raise ValueError("a long answer and a separate file require two replies")
     _still_allowed(row, private_row)
     outgoing = store.reply_for_message(row.id)
     if outgoing is not None:
-        if ((outgoing.payload.get("source_text", outgoing.payload["text"]) != text)
+        replaceable = (outgoing.state == "failed" and outgoing.payload.get("file_path")
+                       and not outgoing.payload.get("drive_link"))
+        if not replaceable and ((outgoing.payload.get("source_text", outgoing.payload["text"]) != text)
                 or (file_path is not None and
                     outgoing.payload.get("file_path") !=
                     str(google_drive.validate_outbound_file(config.agent, file_path)))):
             raise ValueError(f"{row.id}: a different reply is already recorded")
-    else:
+    if outgoing is None or replaceable:
+        if long_answer or file_path is not None:
+            preflight = check_folder
+            if preflight is None and upload is google_drive.upload_file:
+                preflight = google_drive.check_reply_folder
+            if preflight is not None:
+                preflight(config)
         source = (google_drive.create_long_answer(config.agent, text) if long_answer
                   else google_drive.validate_outbound_file(config.agent, file_path) if file_path
                   else None)
-        wire_text = ("Long answer (complete text in the linked file): " + text[:1000] + "…"
-                     if long_answer else text)
+        wire_text = ("Long answer (complete text in the linked file): " + formatted[:1000] + "…"
+                     if long_answer else formatted)
         outgoing = store.queue_reply(row, wire_text, str(uuid.uuid4()),
                                      str(source) if source is not None else None,
-                                     source_text=text)
+                                     source_text=text, generated_answer=long_answer)
     if outgoing.state == "sent":
         return outgoing
     if outgoing.state == "failed":

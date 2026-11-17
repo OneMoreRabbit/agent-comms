@@ -13,6 +13,11 @@ DRIVE_BACKED = ("This kind of Chat attachment is not supported yet. "
 NOT_DELIVERED = "Your message was not delivered. Please send it again."
 
 
+def retirement(event_time: str) -> str:
+    """A fixed line, without copying event content into the person-facing post."""
+    return NOT_DELIVERED
+
+
 def for_refusal(reason: str) -> str:
     if reason.partition(" (Google account ")[0] == "person is not listed":
         return NOT_LISTED
@@ -22,4 +27,4 @@ def for_refusal(reason: str) -> str:
         return FILE_TOO_LARGE
     if reason == "agent delivery is none":
         return NOT_ACCEPTING
-    return NOT_DELIVERED
+    return ""

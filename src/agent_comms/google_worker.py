@@ -56,17 +56,37 @@ def run_once(state_dir: Path, project: str, seat_name: str,
              notice_post: Callable | None = None,
              reply_post: Callable | None = None,
              reply_upload: Callable | None = None,
+             configured_override: dict[str, google_chat.AgentConfig] | None = None,
+             media_download: Callable | None = None,
+             seat_handoff: Callable | None = None,
+             stand_in_run: Path | None = None,
+             cleanup_files: bool = True,
              *, raise_on_error: bool = True) -> int:
     """Pull one batch per configured agent; ack after commit, then hand off.
 
     No settings means no private directory, Google, or store call. A failed
     private read prevents all pulls, so no old people list admits anyone.
     """
-    configured = google_chat.load_settings(state_dir)
+    if stand_in_run is not None and (
+            configured_override is None or private_rows is None
+            or subscriber_factory is _subscriber or notice_post is None
+            or reply_post is None or reply_upload is None or media_download is None):
+        raise ValueError("stand-in run requires isolated settings, people, media, post and upload callbacks")
+    if stand_in_run is not None:
+        from . import google_standin
+        if Path(state_dir) != Path(stand_in_run) or len(configured_override) != 1:
+            raise ValueError("stand-in pass must use one marked run directory and one agent")
+        agent = next(iter(configured_override))
+        _, verified_config, verified_row, _ = google_standin.open_run(Path(stand_in_run), agent)
+        if configured_override[agent] != verified_config or private_rows != {agent: verified_row}:
+            raise ValueError("stand-in pass must use its marked settings and private fixture")
+    configured = configured_override if configured_override is not None else google_chat.load_settings(state_dir)
     if not configured:
         return 0
     store = GoogleStore(state_dir / "comms.db")
-    google_media.cleanup_inbound(store)
+    if cleanup_files:
+        google_media.cleanup_inbound(store)
+        google_reply.google_drive.cleanup_long_answers(store)
     for message_id in store.expire_pending_replies():
         if record is not None:
             record("warn", f"Google Chat {message_id}: reply failed after 24 hours")
@@ -150,17 +170,23 @@ def run_once(state_dir: Path, project: str, seat_name: str,
     # Pub/Sub is no longer on the critical path. This also resumes rows that
     # were committed before a prior process exit or a no-session result.
     for row in store.list():
-        if row.agent in valid_agents and row.state == "held":
-            store.queue_notice(row, "notice-held", google_notices.HELD)
-        elif row.agent in valid_agents and row.state == "expired":
-            store.queue_notice(row, "notice-expired", google_notices.NOT_DELIVERED)
-        elif row.agent in valid_agents and row.state == "abandoned":
-            store.queue_notice(row, "notice-abandoned", google_notices.NOT_DELIVERED)
         if row.agent in valid_agents and row.state == "queued":
             try:
-                prepared = google_media.prepare_queued(store, row, configured[row.agent])
+                if media_download is None:
+                    prepared = google_media.prepare_queued(store, row, configured[row.agent])
+                else:
+                    prepared = google_media.prepare_queued(store, row, configured[row.agent],
+                                                           download=media_download)
                 if prepared.state == "queued":
-                    google_intake.deliver_queued(store, prepared)
+                    if seat_handoff is None:
+                        if stand_in_run is None:
+                            google_intake.deliver_queued(store, prepared)
+                        else:
+                            google_intake.deliver_queued(store, prepared,
+                                                        stand_in_run=stand_in_run)
+                    else:
+                        google_intake.deliver_queued(store, prepared, handoff=seat_handoff,
+                                                    stand_in_run=stand_in_run)
             except Exception as exc:
                 warn(f"Google Chat {row.id}: handoff failed ({type(exc).__name__})")
     for outbound in store.pending_replies():
@@ -222,6 +248,7 @@ def run_forever(state_dir: Path, project: str, seat_name: str, stop: Event,
 
     rows = None
     refreshed_at = 0.0
+    cleaned_at = 0.0
     while not stop.is_set():
         delay = 5
         try:
@@ -237,7 +264,10 @@ def run_forever(state_dir: Path, project: str, seat_name: str, stop: Event,
                 refreshed_at = time.monotonic()
             count = run_once(state_dir, project, seat_name,
                              subscriber_factory=subscriber_factory, private_rows=rows,
-                             record=record, raise_on_error=False)
+                             record=record, raise_on_error=False,
+                             cleanup_files=time.monotonic() - cleaned_at >= 3600)
+            if time.monotonic() - cleaned_at >= 3600:
+                cleaned_at = time.monotonic()
             if count:
                 record("info", f"Google Chat: stored {count} new message(s)")
         except Exception as exc:  # noqa: BLE001 - Google failure must not end hub

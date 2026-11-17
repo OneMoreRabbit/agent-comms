@@ -3,12 +3,14 @@
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from click.testing import CliRunner
 
 from agent_comms import (cli, google_chat, google_drive, google_intake,
-                         google_media, google_notices, google_reply, google_standin)
+                         google_media, google_notices, google_reply, google_standin,
+                         google_worker, seat as seat_api)
 from agent_comms.google_store import GoogleStore
 
 AGENT = "bakehouse.agent-eco.agent-comms"
@@ -84,6 +86,27 @@ def test_drive_folder_requires_shared_drive_and_writer(tmp_path):
         "capabilities": {"canAddChildren": True}}))
 
 
+@pytest.mark.parametrize("status,expected", [
+    (403, "Drive API not enabled"),
+    (404, "not found or not shared"),
+    (503, "not reachable"),
+])
+def test_drive_folder_explains_http_failure(tmp_path, status, expected):
+    class HttpError(Exception):
+        response = SimpleNamespace(status_code=status)
+
+    class Session:
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def get(self, *args, **kwargs):
+            raise HttpError()
+
+    with pytest.raises(google_drive.DriveError, match=expected):
+        google_drive.check_reply_folder(_config(tmp_path), lambda _: Session())
+
+
 def test_drive_upload_uses_shared_drive_folder_and_returns_private_link(seat, tmp_path):
     root = Path.home() / "comms-files" / "out" / AGENT
     root.mkdir(mode=0o700, parents=True)
@@ -151,6 +174,95 @@ def test_long_reply_uploads_whole_text_before_post(seat, tmp_path):
     assert posted[0].payload["source_text"] == text
 
 
+def test_reply_folder_preflight_precedes_outbox_and_text_can_replace(seat, tmp_path):
+    store = GoogleStore(tmp_path / "preflight.db")
+    row = _delivered(store)
+    with pytest.raises(google_drive.DriveError, match="not shared"):
+        google_reply.send_text(store, row, "A" * 35000, _config(tmp_path), _private(),
+                               check_folder=lambda _: (_ for _ in ()).throw(
+                                   google_drive.DriveError("reply folder not shared")))
+    assert store.reply_for_message(row.id) is None
+    posted = []
+    result = google_reply.send_text(store, row, "Text fallback", _config(tmp_path), _private(),
+                                    post=lambda outbound, _: posted.append(outbound))
+    assert result.state == "sent" and len(posted) == 1
+
+
+def test_upload_is_bounded_and_failed_file_reply_can_be_replaced(seat, tmp_path):
+    store = GoogleStore(tmp_path / "upload-bound.db")
+    row = _delivered(store)
+    calls = []
+
+    def failed_upload(config, path):
+        calls.append(path)
+        raise OSError("offline")
+
+    first = google_reply.send_text(store, row, "A" * 35000, _config(tmp_path), _private(),
+                                   post=lambda *a: pytest.fail("post before upload"),
+                                   upload=failed_upload)
+    assert first.state == "pending" and first.upload_attempts == 1
+    second = google_reply.retry_pending(store, first, _config(tmp_path), _private(),
+                                        post=lambda *a: pytest.fail("post before upload"),
+                                        upload=failed_upload)
+    third = google_reply.retry_pending(store, second, _config(tmp_path), _private(),
+                                       post=lambda *a: pytest.fail("post before upload"),
+                                       upload=failed_upload)
+    assert len(calls) == 3 and third.state == "failed"
+    assert third.failure_reason == "Google Drive is not reachable"
+    recovered = google_reply.send_text(store, row, "Text instead", _config(tmp_path), _private(),
+                                       post=lambda *a: None)
+    assert recovered.state == "sent" and recovered.request_id != third.request_id
+
+
+def test_uncertain_upload_is_not_repeated_after_restart(seat, tmp_path):
+    store = GoogleStore(tmp_path / "uncertain-upload.db")
+    row = _delivered(store)
+    first = google_reply.send_text(store, row, "A" * 35000, _config(tmp_path), _private(),
+                                   upload=lambda *a: (_ for _ in ()).throw(OSError()),
+                                   post=lambda *a: pytest.fail("no post"))
+    store.begin_upload(first.id)  # Simulate a crash after Google accepted bytes.
+    uploads = []
+    result = google_reply.retry_pending(store, store.get_outbound(first.id), _config(tmp_path),
+                                        _private(), upload=lambda *a: uploads.append(True),
+                                        post=lambda *a: pytest.fail("no post"))
+    assert result.state == "failed" and "uncertain" in result.failure_reason
+    assert uploads == []
+
+
+def test_completed_upload_with_unrecorded_link_is_not_repeated(seat, tmp_path, monkeypatch):
+    store = GoogleStore(tmp_path / "unrecorded-link.db")
+    row = _delivered(store)
+    uploads = []
+    monkeypatch.setattr(store, "set_outbound_link", lambda *a: None)
+
+    def upload(config, path):
+        uploads.append(path)
+        return "https://drive.google.com/file/d/uploaded/view"
+
+    with pytest.raises(google_reply.PermanentReplyError, match="could not be recorded"):
+        google_reply.send_text(store, row, "A" * 35000, _config(tmp_path), _private(),
+                               upload=upload, post=lambda *a: pytest.fail("no post"))
+    result = store.reply_for_message(row.id)
+    assert result.state == "failed" and result.upload_attempts == 1
+    assert len(uploads) == 1
+    google_reply.retry_pending(store, result, _config(tmp_path), _private(),
+                               upload=upload, post=lambda *a: pytest.fail("no post"))
+    assert len(uploads) == 1
+
+
+def test_chat_markdown_fallback_keeps_heading_table_and_code(seat, tmp_path):
+    store = GoogleStore(tmp_path / "markup.db")
+    row = _delivered(store)
+    posts = []
+    source = "# Heading\n| Name | Value |\n|---|---|\n| A | 42 |\n```\n# code\n```\n"
+    google_reply.send_text(store, row, source, _config(tmp_path), _private(),
+                           post=lambda outbound, config: posts.append(outbound))
+    wire = posts[0].payload["text"]
+    assert "*Heading*" in wire and "Name — Value" in wire and "A — 42" in wire
+    assert "|---|---|" not in wire and "```\n# code\n```" in wire
+    assert posts[0].payload["source_text"] == source
+
+
 def test_refusal_and_no_session_notices_are_durable_and_deduplicated(tmp_path):
     store = GoogleStore(tmp_path / "notices.db")
     refused, _ = google_intake.ingest(store, _event(account="users/other"), _private())
@@ -168,6 +280,34 @@ def test_refusal_and_no_session_notices_are_durable_and_deduplicated(tmp_path):
     assert row.state == "queued"
     no_session = [item for item in store.notices() if item.kind == "notice-no-session"]
     assert len(no_session) == 1 and no_session[0].payload["text"] == google_notices.NO_SESSION
+
+
+def test_noncontract_refusals_send_no_line_and_old_state_is_not_renotified(seat, tmp_path, monkeypatch):
+    store = GoogleStore(tmp_path / "comms.db")
+    group_event = _event()
+    group_event = google_intake.IntakeEvent(**{**group_event.__dict__, "space_type": "SPACE"})
+    refused, _ = google_intake.ingest(store, group_event, _private())
+    assert refused.state == "refused" and store.notices() == []
+    old, _ = google_intake.ingest(store, _event(name="spaces/dm/messages/old"), _private())
+    store.transition(old.id, from_state="queued", to_state="expired", reason="old state")
+    monkeypatch.setattr(google_chat, "load_settings", lambda *_: {AGENT: _config(tmp_path)})
+    google_worker.run_once(tmp_path, "agent-eco", "test-claude",
+                           subscriber_factory=lambda _: SimpleNamespace(
+                               pull=lambda **_: SimpleNamespace(received_messages=[]), close=lambda: None),
+                           private_rows={AGENT: _private()})
+    assert store.notices() == []
+
+
+def test_retirement_notice_uses_only_fixed_line(tmp_path):
+    store = GoogleStore(tmp_path / "expired.db")
+    from datetime import timedelta
+    old = datetime.now(timezone.utc) - timedelta(days=2)
+    event = _event()
+    event = google_intake.IntakeEvent(**{**event.__dict__, "event_time": old.isoformat()})
+    row, _ = google_intake.ingest(store, event, _private())
+    assert row.state == "expired"
+    notice = store.pending_notices()[0]
+    assert notice.payload["text"] == google_notices.NOT_DELIVERED
 
 
 def test_hidden_standin_reply_uses_run_store_and_no_google_client(seat, tmp_path, monkeypatch):
@@ -198,6 +338,55 @@ def test_hidden_standin_reply_uses_run_store_and_no_google_client(seat, tmp_path
     assert posts[0]["space"] == "spaces/dm"
 
 
+def test_standin_bounded_pass_names_isolated_reply_and_never_builds_google(seat, tmp_path, monkeypatch):
+    root = tmp_path / "stand-in"
+    root.mkdir(mode=0o700)
+    run = root / "two"
+    run.mkdir(mode=0o700)
+    marker = run / "marker.json"
+    marker.write_text(json.dumps({"stand_in_run": 1, "agent": AGENT,
+                                  "private_row": _private()}))
+    marker.chmod(0o600)
+    monkeypatch.setattr(google_standin, "ROOT", root)
+    _, config, private_row, _ = google_standin.open_run(run, AGENT)
+    monkeypatch.setattr(google_chat, "load_settings", lambda *a: pytest.fail("live settings"))
+    monkeypatch.setattr(google_worker, "_subscriber", lambda *a: pytest.fail("live subscriber"))
+    monkeypatch.setattr(google_media, "_download", lambda *a: pytest.fail("live media"))
+    monkeypatch.setattr(google_reply, "_post", lambda *a: pytest.fail("live Chat"))
+    monkeypatch.setattr(google_drive, "_session", lambda *a: pytest.fail("live Drive"))
+    raw = {"type": "MESSAGE", "eventTime": datetime.now(timezone.utc).isoformat(),
+           "message": {"name": "spaces/dm/messages/one", "text": "Hello"},
+           "space": {"name": "spaces/dm", "spaceType": "DIRECT_MESSAGE",
+                     "singleUserBotDm": True},
+           "user": {"name": "users/123", "email": "person@example.org", "type": "HUMAN"}}
+    acks, turns = [], []
+
+    class Subscriber:
+        def pull(self, **kwargs):
+            message = SimpleNamespace(data=json.dumps(raw).encode())
+            return SimpleNamespace(received_messages=[SimpleNamespace(message=message, ack_id="one")])
+        def acknowledge(self, *, request):
+            acks.extend(request["ack_ids"])
+        def close(self):
+            pass
+
+    def handoff(body, *, agent):
+        turns.append((body, agent))
+        return seat_api.Delivery(True, seat_api.DELIVERED, exit_code=0)
+
+    count = google_worker.run_once(
+        run, "agent-eco", "test-claude", subscriber_factory=lambda config: Subscriber(),
+        private_rows={AGENT: private_row}, configured_override={AGENT: config},
+        media_download=lambda name, config: [b"photo"],
+        notice_post=google_standin.recorder(run), reply_post=google_standin.recorder(run),
+        reply_upload=google_standin.fake_upload(run), seat_handoff=handoff,
+        stand_in_run=run)
+    assert count == 1 and acks == ["one"]
+    assert len(turns) == 1 and turns[0][1] == AGENT
+    assert "--stand-in-run " + str(run) in turns[0][0]
+    assert GoogleStore(run / "comms.db").get("gc-1").state == "delivered"
+
+
 def test_media_download_fault_has_three_attempt_bound(seat, tmp_path):
     store = GoogleStore(tmp_path / "fault.db")
     row, _ = google_intake.ingest(store, _event(attachments=[{
@@ -212,7 +401,7 @@ def test_media_download_fault_has_three_attempt_bound(seat, tmp_path):
         row = google_media.prepare_queued(store, row, _config(tmp_path), download=offline)
         assert row.attempts == attempt
     assert row.state == "refused" and row.reason == "media download unavailable after three attempts"
-    assert store.pending_notices()[0].payload["text"] == google_notices.NOT_DELIVERED
+    assert store.pending_notices() == []
 
 
 def test_inbound_generated_file_removed_after_30_days_but_metadata_kept(seat, tmp_path):
@@ -228,6 +417,20 @@ def test_inbound_generated_file_removed_after_30_days_but_metadata_kept(seat, tm
     assert path.exists()
     count = google_media.cleanup_inbound(store, now=datetime(2026, 2, 2, tzinfo=timezone.utc))
     assert count == 1 and not path.exists() and store.get(row.id).payload["files"]
+
+
+def test_generated_long_answer_removed_after_30_days(seat, tmp_path):
+    from datetime import timedelta
+    store = GoogleStore(tmp_path / "long-retention.db")
+    row = _delivered(store)
+    reply = google_reply.send_text(store, row, "A" * 35000, _config(tmp_path), _private(),
+                                   upload=lambda *a: "https://drive.google.com/file/d/one/view",
+                                   post=lambda *a: None)
+    path = Path(reply.payload["file_path"])
+    assert path.exists() and reply.payload["generated_answer"] is True
+    later = datetime.now(timezone.utc) + timedelta(days=31)
+    assert google_drive.cleanup_long_answers(store, now=later) == 1
+    assert not path.exists() and store.reply_for_message(row.id).state == "sent"
 
 
 def test_every_fixed_refusal_reason_is_classified_in_google_log(seat):
