@@ -10,6 +10,8 @@ about: one short entry per release, newest first
 
 ## Built, not yet released
 
+- 2.9.6 — 2026-11-17: Keep stand-in inbound files and 30-day cleanup inside the marked test run, so synthetic `gc-` IDs cannot overwrite or remove live Google files on a test seat.
+
 ## v2.9.5 — 2026-11-17
 
 **TL;DR:** Add bounded Google Chat file intake, shared-drive reply links, durable notices, stand-in reply testing and long-answer links without changing hub-only seats.

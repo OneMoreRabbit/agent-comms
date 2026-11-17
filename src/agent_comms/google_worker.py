@@ -85,7 +85,7 @@ def run_once(state_dir: Path, project: str, seat_name: str,
         return 0
     store = GoogleStore(state_dir / "comms.db")
     if cleanup_files:
-        google_media.cleanup_inbound(store)
+        google_media.cleanup_inbound(store, stand_in_run=stand_in_run)
         google_reply.google_drive.cleanup_long_answers(store)
     for message_id in store.expire_pending_replies():
         if record is not None:
@@ -173,10 +173,12 @@ def run_once(state_dir: Path, project: str, seat_name: str,
         if row.agent in valid_agents and row.state == "queued":
             try:
                 if media_download is None:
-                    prepared = google_media.prepare_queued(store, row, configured[row.agent])
+                    prepared = google_media.prepare_queued(store, row, configured[row.agent],
+                                                           stand_in_run=stand_in_run)
                 else:
                     prepared = google_media.prepare_queued(store, row, configured[row.agent],
-                                                           download=media_download)
+                                                           download=media_download,
+                                                           stand_in_run=stand_in_run)
                 if prepared.state == "queued":
                     if seat_handoff is None:
                         if stand_in_run is None:
