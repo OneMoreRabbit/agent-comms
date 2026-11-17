@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 from click.testing import CliRunner
 
-from agent_comms import cli, google_chat, google_intake, google_reply, google_worker, seat as seat_api
+from agent_comms import cli, google_chat, google_intake, google_media, google_reply, google_worker, seat as seat_api
 from agent_comms.google_store import GoogleStore
 
 AGENT = "bakehouse.agent-eco.agent-comms"
@@ -376,7 +376,7 @@ def test_private_account_id_form_and_precedence(tmp_path):
     ({"app_agent": "other.app.agent"}, "another Chat app"),
     ({"event_type": "ADDED_TO_SPACE"}, "unsupported event"),
     ({"sender_address": "intruder@example.net", "sender_account_id": "users/other"}, "person is not listed"),
-    ({"has_attachments": True}, "no partial text handoff"),
+    ({"has_attachments": True}, "attachment reference is unavailable"),
     ({"text": ""}, "empty message"),
 ])
 def test_wrong_source_is_stored_but_never_queued(tmp_path, change, reason):
@@ -394,6 +394,54 @@ def test_listed_account_id_wins_even_when_event_address_has_another_domain(tmp_p
         _store(tmp_path), _event(sender_address="changed@example.net",
                                  sender_account_id="users/123"), _private(), now=NOW)
     assert row.state == "queued"
+
+
+def test_uploaded_attachment_is_saved_before_the_seat_turn(seat, tmp_path):
+    attachment = {"source": "UPLOADED_CONTENT", "contentName": "../../ignore-me.jpg",
+                  "contentType": "image/jpeg",
+                  "attachmentDataRef": {"resourceName": "spaces/dm/messages/one/attachments/one"}}
+    store = _store(tmp_path)
+    row, _ = google_intake.ingest(
+        store, _event(text="", has_attachments=True, attachments=(attachment,),
+                      event_time=datetime.now(timezone.utc).isoformat()), _private())
+    assert row.state == "queued"
+    config = google_chat.AgentConfig(AGENT, "projects/fake/subscriptions/fake",
+                                     tmp_path / "credential.json", "fake-folder")
+    prepared = google_media.prepare_queued(store, row, config,
+                                           download=lambda *_: [b"photo", b" data"])
+    assert prepared.state == "queued" and prepared.payload["files"][0]["bytes"] == 10
+    path = seat / "comms-files" / "in" / "gc-1" / "file-01"
+    assert path.read_bytes() == b"photo data"
+    assert str(path) in google_intake.turn(prepared)
+    assert "ignore-me.jpg" not in google_intake.turn(prepared)
+    assert google_media.prepare_queued(store, prepared, config,
+                                       download=lambda *_: pytest.fail("download repeated")) == prepared
+
+
+def test_drive_backed_attachment_is_refused_without_text(tmp_path):
+    attachment = {"source": "DRIVE_FILE", "driveDataRef": {"driveFileId": "secret"}}
+    row, _ = google_intake.ingest(
+        _store(tmp_path), _event(has_attachments=True, attachments=(attachment,),
+                                 text="DO NOT DELIVER"), _private(), now=NOW)
+    assert row.state == "refused" and "Drive-backed" in row.reason
+    assert "text" not in row.payload
+
+
+def test_oversize_upload_refuses_without_naming_partial_file(seat, tmp_path, monkeypatch):
+    attachment = {"source": "UPLOADED_CONTENT", "contentType": "application/pdf",
+                  "attachmentDataRef": {"resourceName": "spaces/dm/media/one"}}
+    store = _store(tmp_path)
+    row, _ = google_intake.ingest(store, _event(has_attachments=True, attachments=(attachment,),
+                                                event_time=datetime.now(timezone.utc).isoformat()),
+                                   _private())
+    monkeypatch.setattr(google_media, "MAX_FILE_BYTES", 3)
+    config = google_chat.AgentConfig(AGENT, "projects/fake/subscriptions/fake",
+                                     tmp_path / "credential.json", "fake-folder")
+    prepared = google_media.prepare_queued(store, row, config,
+                                           download=lambda *_: [b"toolarge"])
+    assert prepared.state == "refused" and prepared.reason == "file too large"
+    assert "files" not in prepared.payload and "text" not in prepared.payload
+    assert not (seat / "comms-files" / "in" / "gc-1" / "file-01").exists()
 
 
 def test_unlisted_old_message_is_refused_without_storing_text(tmp_path):

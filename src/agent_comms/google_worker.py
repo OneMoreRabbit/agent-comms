@@ -9,7 +9,7 @@ from pathlib import Path
 from threading import Event
 from typing import Callable
 
-from . import google_chat, google_intake, google_reply
+from . import google_chat, google_intake, google_media, google_reply
 from .google_store import GoogleStore
 
 
@@ -148,7 +148,9 @@ def run_once(state_dir: Path, project: str, seat_name: str,
     for row in store.list():
         if row.agent in valid_agents and row.state == "queued":
             try:
-                google_intake.deliver_queued(store, row)
+                prepared = google_media.prepare_queued(store, row, configured[row.agent])
+                if prepared.state == "queued":
+                    google_intake.deliver_queued(store, prepared)
             except Exception as exc:
                 warn(f"Google Chat {row.id}: handoff failed ({type(exc).__name__})")
     for outbound in store.pending_replies():

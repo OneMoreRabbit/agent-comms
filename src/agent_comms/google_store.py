@@ -120,6 +120,22 @@ class GoogleStore:
         with self._open() as db:
             return [self._message(row) for row in db.execute(query, args)]
 
+    def set_files(self, row: GoogleMessage, files: list[dict]) -> GoogleMessage | None:
+        """Record fully downloaded files before a seat turn can name them."""
+        if row.state != "queued" or not row.payload.get("has_attachments"):
+            raise ValueError("files require a queued message with attachments")
+        payload = {**row.payload, "files": files}
+        with self._open() as db:
+            changed = db.execute("""UPDATE google_messages SET payload=?
+                WHERE id=? AND state='queued' AND payload=?""",
+                (json.dumps(payload, sort_keys=True), int(row.id[3:]),
+                 json.dumps(row.payload, sort_keys=True))).rowcount
+            if not changed:
+                return None
+            updated = db.execute("SELECT * FROM google_messages WHERE id=?",
+                                 (int(row.id[3:]),)).fetchone()
+            return self._message(updated)
+
     def transition(self, local_id: str, *, from_state: str, to_state: str,
                    reason: str = "", attempt: bool = False) -> GoogleMessage | None:
         """Compare-and-set a Google state so duplicate workers cannot both advance it."""
