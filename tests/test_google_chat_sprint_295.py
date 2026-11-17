@@ -3,6 +3,7 @@
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Event, Thread
 from types import SimpleNamespace
 
 import pytest
@@ -215,12 +216,17 @@ def test_upload_is_bounded_and_failed_file_reply_can_be_replaced(seat, tmp_path)
 
 
 def test_uncertain_upload_is_not_repeated_after_restart(seat, tmp_path):
+    from datetime import timedelta
     store = GoogleStore(tmp_path / "uncertain-upload.db")
     row = _delivered(store)
     first = google_reply.send_text(store, row, "A" * 35000, _config(tmp_path), _private(),
                                    upload=lambda *a: (_ for _ in ()).throw(OSError()),
                                    post=lambda *a: pytest.fail("no post"))
     store.begin_upload(first.id)  # Simulate a crash after Google accepted bytes.
+    old_start = (datetime.now(timezone.utc) - timedelta(minutes=11)).isoformat()
+    with store._open() as db:
+        db.execute("UPDATE google_outbound SET upload_started_at=? WHERE id=?",
+                   (old_start, first.id))
     uploads = []
     result = google_reply.retry_pending(store, store.get_outbound(first.id), _config(tmp_path),
                                         _private(), upload=lambda *a: uploads.append(True),
@@ -248,6 +254,92 @@ def test_completed_upload_with_unrecorded_link_is_not_repeated(seat, tmp_path, m
     google_reply.retry_pending(store, result, _config(tmp_path), _private(),
                                upload=upload, post=lambda *a: pytest.fail("no post"))
     assert len(uploads) == 1
+
+
+def test_worker_does_not_fail_or_repeat_command_upload_in_progress(seat, tmp_path):
+    store = GoogleStore(tmp_path / "comms.db")
+    row = _delivered(store)
+    uploading, release = Event(), Event()
+    posts, outcomes, errors = [], [], []
+
+    def slow_upload(config, path):
+        uploading.set()
+        assert release.wait(5)
+        return "https://drive.google.com/file/d/one/view"
+
+    def command():
+        try:
+            outcomes.append(google_reply.send_text(
+                store, row, "A" * 35000, _config(tmp_path), _private(),
+                upload=slow_upload, post=lambda outbound, config: posts.append(outbound)))
+        except Exception as exc:
+            errors.append(exc)
+
+    thread = Thread(target=command)
+    thread.start()
+    try:
+        assert uploading.wait(5)
+
+        class Subscriber:
+            def pull(self, **_):
+                return SimpleNamespace(received_messages=[])
+            def close(self):
+                pass
+
+        google_worker.run_once(
+            tmp_path, "agent-eco", "test-claude",
+            subscriber_factory=lambda _: Subscriber(),
+            configured_override={AGENT: _config(tmp_path)},
+            private_rows={AGENT: _private()},
+            reply_post=lambda *a: pytest.fail("worker posted during command upload"),
+            reply_upload=lambda *a: pytest.fail("worker repeated command upload"))
+        pending = store.reply_for_message(row.id)
+        assert pending.state == "pending" and pending.upload_in_progress
+    finally:
+        release.set()
+        thread.join(timeout=5)
+    assert not thread.is_alive() and errors == []
+    assert len(posts) == 1 and outcomes[0].state == "sent"
+    assert "https://drive.google.com/file/d/one/view" in posts[0].payload["text"]
+
+
+def test_command_does_not_fail_worker_upload_in_progress(seat, tmp_path):
+    store = GoogleStore(tmp_path / "comms.db")
+    row = _delivered(store)
+    uploading, release = Event(), Event()
+    posts, errors = [], []
+    text = "A" * 35000
+    source = google_drive.create_long_answer(AGENT, text)
+    store.queue_reply(row, "Long answer (complete text in the linked file): " + text[:1000] + "…",
+                      "worker-request", str(source), source_text=text, generated_answer=True)
+
+    def slow_upload(config, path):
+        uploading.set()
+        assert release.wait(5)
+        return "https://drive.google.com/file/d/two/view"
+
+    def worker():
+        try:
+            google_reply.retry_pending(store, store.reply_for_message(row.id),
+                                       _config(tmp_path), _private(),
+                                       upload=slow_upload,
+                                       post=lambda outbound, config: posts.append(outbound))
+        except Exception as exc:
+            errors.append(exc)
+
+    thread = Thread(target=worker)
+    thread.start()
+    try:
+        assert uploading.wait(5)
+        pending = google_reply.send_text(store, row, text, _config(tmp_path), _private(),
+                                         upload=lambda *a: pytest.fail("command repeated worker upload"),
+                                         post=lambda *a: pytest.fail("command posted during worker upload"))
+        assert pending.state == "pending" and pending.upload_in_progress
+    finally:
+        release.set()
+        thread.join(timeout=5)
+    assert not thread.is_alive() and errors == []
+    assert len(posts) == 1 and store.reply_for_message(row.id).state == "sent"
 
 
 def test_chat_markdown_fallback_keeps_heading_table_and_code(seat, tmp_path):
@@ -401,7 +493,7 @@ def test_media_download_fault_has_three_attempt_bound(seat, tmp_path):
         row = google_media.prepare_queued(store, row, _config(tmp_path), download=offline)
         assert row.attempts == attempt
     assert row.state == "refused" and row.reason == "media download unavailable after three attempts"
-    assert store.pending_notices() == []
+    assert store.pending_notices()[0].payload["text"] == google_notices.NOT_DELIVERED
 
 
 def test_inbound_generated_file_removed_after_30_days_but_metadata_kept(seat, tmp_path):

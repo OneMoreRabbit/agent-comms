@@ -36,6 +36,7 @@ class GoogleOutbound:
     failure_reason: str = ""
     upload_attempts: int = 0
     upload_in_progress: bool = False
+    upload_started_at: str = ""
 
 
 class GoogleStore:
@@ -83,6 +84,8 @@ class GoogleStore:
                 db.execute("ALTER TABLE google_outbound ADD COLUMN upload_attempts INTEGER NOT NULL DEFAULT 0")
             if "upload_in_progress" not in outbound_columns:
                 db.execute("ALTER TABLE google_outbound ADD COLUMN upload_in_progress INTEGER NOT NULL DEFAULT 0")
+            if "upload_started_at" not in outbound_columns:
+                db.execute("ALTER TABLE google_outbound ADD COLUMN upload_started_at TEXT NOT NULL DEFAULT ''")
 
     def _open(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.path, timeout=10)
@@ -192,7 +195,8 @@ class GoogleStore:
         return GoogleOutbound(row["id"], f"gc-{row['message_id']}", row["kind"],
                               json.loads(row["payload"]), row["request_id"], row["state"],
                               row["created_at"], row["failure_reason"],
-                              row["upload_attempts"], bool(row["upload_in_progress"]))
+                              row["upload_attempts"], bool(row["upload_in_progress"]),
+                              row["upload_started_at"])
 
     def queue_reply(self, row: GoogleMessage, text: str, request_id: str,
                     file_path: str | None = None,
@@ -221,7 +225,8 @@ class GoogleStore:
                 previous = json.loads(existing["payload"])
                 if previous.get("file_path") and not previous.get("drive_link"):
                     db.execute("""UPDATE google_outbound SET payload=?, request_id=?, state='pending',
-                        created_at=?, failure_reason='', upload_attempts=0, upload_in_progress=0
+                        created_at=?, failure_reason='', upload_attempts=0, upload_in_progress=0,
+                        upload_started_at=''
                         WHERE id=? AND state='failed'""",
                         (encoded, request_id, datetime.now(timezone.utc).isoformat(), existing["id"]))
             db.execute("""INSERT OR IGNORE INTO google_outbound
@@ -267,7 +272,8 @@ class GoogleStore:
         wire_text = outbound.payload["text"]
         payload["text"] = f"{wire_text}\n\nFile: {link}" if wire_text else f"File: {link}"
         with self._open() as db:
-            changed = db.execute("""UPDATE google_outbound SET payload=?, upload_in_progress=0
+            changed = db.execute("""UPDATE google_outbound SET payload=?, upload_in_progress=0,
+                upload_started_at=''
                 WHERE id=? AND state='pending' AND payload=?""",
                 (json.dumps(payload, sort_keys=True), outbound.id,
                  json.dumps(outbound.payload, sort_keys=True))).rowcount
@@ -285,20 +291,22 @@ class GoogleStore:
     def mark_failed(self, outbound_id: int, reason: str) -> None:
         with self._open() as db:
             db.execute("""UPDATE google_outbound SET state='failed', failure_reason=?
-                , upload_in_progress=0 WHERE id=? AND state='pending'""", (reason, outbound_id))
+                , upload_in_progress=0, upload_started_at=''
+                WHERE id=? AND state='pending'""", (reason, outbound_id))
 
     def begin_upload(self, outbound_id: int) -> GoogleOutbound | None:
         """Persist an attempt before upload; an interrupted attempt is never replayed."""
         with self._open() as db:
             changed = db.execute("""UPDATE google_outbound SET upload_attempts=upload_attempts+1,
-                upload_in_progress=1 WHERE id=? AND state='pending' AND upload_in_progress=0
-                AND upload_attempts<3""", (outbound_id,)).rowcount
+                upload_in_progress=1, upload_started_at=?
+                WHERE id=? AND state='pending' AND upload_in_progress=0
+                AND upload_attempts<3""", (datetime.now(timezone.utc).isoformat(), outbound_id)).rowcount
             row = db.execute("SELECT * FROM google_outbound WHERE id=?", (outbound_id,)).fetchone()
             return self._outbound(row) if changed else None
 
     def upload_failed(self, outbound_id: int, reason: str) -> GoogleOutbound:
         with self._open() as db:
-            db.execute("""UPDATE google_outbound SET upload_in_progress=0,
+            db.execute("""UPDATE google_outbound SET upload_in_progress=0, upload_started_at='',
                 failure_reason=?, state=CASE WHEN upload_attempts>=3 THEN 'failed' ELSE state END
                 WHERE id=? AND state='pending'""", (reason, outbound_id))
             row = db.execute("SELECT * FROM google_outbound WHERE id=?", (outbound_id,)).fetchone()

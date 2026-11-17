@@ -136,7 +136,8 @@ def prepare_queued(store: GoogleStore, row: GoogleMessage, config: AgentConfig,
         if row.attempts + 1 >= 3:
             return store.transition(row.id, from_state="queued", to_state="refused",
                                     reason="media download unavailable after three attempts",
-                                    attempt=True) or store.get(row.id)
+                                    attempt=True,
+                                    notice=google_notices.NOT_DELIVERED) or store.get(row.id)
         return store.transition(row.id, from_state="queued", to_state="queued",
                                 reason="media download unavailable",
                                 attempt=True) or store.get(row.id)

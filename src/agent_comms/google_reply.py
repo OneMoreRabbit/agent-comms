@@ -15,6 +15,7 @@ from .google_store import GoogleMessage, GoogleOutbound, GoogleStore
 
 MAX_REPLY_BYTES = 32000
 MAX_PENDING_SECONDS = 24 * 60 * 60
+MAX_UPLOAD_SECONDS = 10 * 60
 _SPACE = re.compile(r"^spaces/[A-Za-z0-9_-]+$")
 _HEADING = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*$")
 
@@ -104,6 +105,16 @@ def _permanent_http_status(exc: Exception) -> int | None:
     return status if isinstance(status, int) and 400 <= status < 500 and status not in (408, 429) else None
 
 
+def _upload_may_be_running(outbound: GoogleOutbound, moment: datetime) -> bool:
+    if not outbound.upload_started_at:
+        return False
+    try:
+        started = datetime.fromisoformat(outbound.upload_started_at.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return (moment - started).total_seconds() < MAX_UPLOAD_SECONDS
+
+
 def _attempt_pending(store: GoogleStore, outbound: GoogleOutbound,
                      config: google_chat.AgentConfig, private_row: dict,
                      post: Callable[[GoogleOutbound, google_chat.AgentConfig], None],
@@ -125,11 +136,17 @@ def _attempt_pending(store: GoogleStore, outbound: GoogleOutbound,
         return store.get_outbound(outbound.id)
     if outbound.payload.get("file_path") and not outbound.payload.get("drive_link"):
         if outbound.upload_in_progress:
-            store.mark_failed(outbound.id, "Drive upload outcome uncertain; automatic re-upload refused")
+            if not _upload_may_be_running(outbound, moment):
+                store.mark_failed(outbound.id, "Drive upload outcome uncertain; automatic re-upload refused")
             return store.get_outbound(outbound.id)
         started = store.begin_upload(outbound.id)
         if started is None:
-            store.mark_failed(outbound.id, "Drive upload attempt limit reached")
+            current = store.get_outbound(outbound.id)
+            if current.upload_in_progress:
+                if not _upload_may_be_running(current, moment):
+                    store.mark_failed(outbound.id, "Drive upload outcome uncertain; automatic re-upload refused")
+            elif current.state == "pending" and current.upload_attempts >= 3:
+                store.mark_failed(outbound.id, "Drive upload attempt limit reached")
             return store.get_outbound(outbound.id)
         try:
             link = upload(config, Path(outbound.payload["file_path"]))
