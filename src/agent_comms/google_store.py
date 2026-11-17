@@ -145,7 +145,8 @@ class GoogleStore:
 
     def transition(self, local_id: str, *, from_state: str, to_state: str,
                    reason: str = "", attempt: bool = False,
-                   notice: str | None = None) -> GoogleMessage | None:
+                   notice: str | None = None,
+                   notice_kind: str | None = None) -> GoogleMessage | None:
         """Compare-and-set a Google state so duplicate workers cannot both advance it."""
         if not re.fullmatch(r"gc-[0-9]+", local_id):
             raise ValueError("invalid Google message id")
@@ -179,7 +180,7 @@ class GoogleStore:
                 db.execute("""INSERT OR IGNORE INTO google_outbound
                     (message_id,kind,payload,request_id,created_at)
                     VALUES (?,?,?,?,?)""",
-                    (int(local_id[3:]), "notice-" + to_state,
+                    (int(local_id[3:]), notice_kind or "notice-" + to_state,
                      json.dumps({"space": original_route, "text": notice}, sort_keys=True),
                      str(uuid.uuid4()), datetime.now(timezone.utc).isoformat()))
             row = db.execute("SELECT * FROM google_messages WHERE id=?",

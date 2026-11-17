@@ -178,17 +178,16 @@ def ingest(store: GoogleStore, event: IntakeEvent, private_row: dict,
                                   event.event_time, payload)
     if not inserted and row.state != "received":
         return row, False
+    notice = (google_notices.for_refusal(reason) if state == "refused"
+              else google_notices.HELD if state == "held"
+              else google_notices.retirement(event.event_time) if state == "expired"
+              else None)
     updated = store.transition(row.id, from_state="received", to_state=state,
-                               reason=reason,
-                               notice=google_notices.for_refusal(reason) if state == "refused" else None)
+                               reason=reason, notice=notice)
     if updated is None:
         # Another collector completed the same durable event while this one
         # was checking it. The redelivery is safe and must still be acked.
         return store.get(row.id), False
-    if state == "held":
-        store.queue_notice(updated, "notice-held", google_notices.HELD)
-    elif state == "expired":
-        store.queue_notice(updated, "notice-expired", google_notices.retirement(updated.event_time))
     return updated, inserted
 
 
@@ -238,9 +237,9 @@ def deliver_queued(store: GoogleStore, row: GoogleMessage,
         return row
     moment = now or datetime.now(timezone.utc)
     if _age_seconds(row.event_time, moment) > MAX_AGE_SECONDS:
-        store.queue_notice(row, "notice-expired", google_notices.retirement(row.event_time))
         return store.transition(row.id, from_state="queued", to_state="expired",
-                                reason="Google event is older than 24 hours") or store.get(row.id)
+                                reason="Google event is older than 24 hours",
+                                notice=google_notices.retirement(row.event_time)) or store.get(row.id)
     body = turn(row, stand_in_run=stand_in_run)
     if len(body.encode("utf-8")) > seat.MAX_BODY_BYTES:
         return store.transition(row.id, from_state="queued", to_state="refused",
@@ -267,18 +266,18 @@ def deliver_queued(store: GoogleStore, row: GoogleMessage,
         attempt = True
         target = "abandoned" if claimed.attempts + 1 >= MAX_ATTEMPTS else "queued"
         reason = result.status
+    notice = None
+    notice_kind = None
+    if target == "abandoned":
+        notice = google_notices.retirement(row.event_time)
+    elif target == "queued" and result.status == seat.NO_SESSION:
+        notice, notice_kind = google_notices.NO_SESSION, "notice-no-session"
+    elif target == "queued" and result.status in {
+            seat.QUEUE_AT_CAPACITY, seat.RUNTIME_UNAVAILABLE, seat.ENGINE_UNAVAILABLE}:
+        notice, notice_kind = google_notices.TEMPORARILY_UNAVAILABLE, "notice-unavailable"
     advanced = store.transition(row.id, from_state="handing_off", to_state=target,
                                 reason=reason, attempt=attempt,
-                                notice=None)
+                                notice=notice, notice_kind=notice_kind)
     if advanced is None:
         return store.get(row.id)
-    if target == "queued":
-        if result.status == seat.NO_SESSION:
-            store.queue_notice(advanced, "notice-no-session", google_notices.NO_SESSION)
-        elif result.status in {seat.QUEUE_AT_CAPACITY, seat.RUNTIME_UNAVAILABLE,
-                               seat.ENGINE_UNAVAILABLE}:
-            store.queue_notice(advanced, "notice-unavailable", google_notices.TEMPORARILY_UNAVAILABLE)
-    if target == "abandoned":
-        store.queue_notice(advanced, "notice-abandoned",
-                           google_notices.retirement(advanced.event_time))
     return advanced
