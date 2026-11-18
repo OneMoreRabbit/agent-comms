@@ -239,6 +239,12 @@ class GoogleStore:
         encoded = json.dumps(payload, sort_keys=True)
         with self._open() as db:
             db.execute("BEGIN IMMEDIATE")
+            current = db.execute("SELECT state,agent,space FROM google_messages WHERE id=?",
+                                 (int(row.id[3:]),)).fetchone()
+            if (current is None or current["state"] not in
+                    {"delivered", "held", "retrieved", "uncertain"}
+                    or current["agent"] != row.agent or current["space"] != row.space):
+                raise ValueError(f"{row.id}: message state or route changed before reply")
             if row.state == "uncertain":
                 db.execute("""UPDATE google_messages SET state='delivered',
                     reason='agent reply confirms uncertain handoff'

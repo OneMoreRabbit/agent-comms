@@ -651,9 +651,9 @@ def test_each_reply_rechecks_person_and_message_state(tmp_path):
     with pytest.raises(google_reply.PermanentReplyError, match="no longer permitted"):
         google_reply.send_text(store, row, "second", config, _private([]),
                                post=lambda *a: pytest.fail("posted for removed person"))
-    refused = store.transition(row.id, from_state="delivered", to_state="refused")
+    store.transition(row.id, from_state="delivered", to_state="refused")
     with pytest.raises(ValueError, match="cannot reply to a refused"):
-        google_reply.send_text(store, refused, "first", config, _private(),
+        google_reply.send_text(store, row, "first", config, _private(),
                                post=lambda *a: pytest.fail("posted for refused message"))
     assert len(posts) == 1 and len(store.replies()) == 1
 

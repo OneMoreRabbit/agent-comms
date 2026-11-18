@@ -183,6 +183,9 @@ def send_text(store: GoogleStore, row: GoogleMessage, text: str,
               check_folder: Callable[[google_chat.AgentConfig], None] | None = None,
               ) -> GoogleOutbound:
     """Fix one reply in the outbox before posting, never taking a new route."""
+    row = store.get(row.id)
+    if row is None:
+        raise ValueError("Google Chat message no longer exists")
     if row.agent != config.agent:
         raise ValueError(f"{row.id}: agent does not match the configured Google contact")
     if row.state not in {"delivered", "held", "retrieved", "uncertain"}:
