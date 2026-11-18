@@ -9,19 +9,24 @@ from pathlib import Path
 from urllib.parse import quote
 
 from .google_chat import AgentConfig
+from .google_paths import FileDirectoryError, work_files_root
 from .google_store import GoogleOutbound, GoogleStore
 
-ROOT = Path("/home/dev/.local/share/agent-comms/stand-in")
+ROOT = Path("/home/dev/work/comms-files/stand-in")
 
 
 def open_run(path: Path, agent: str) -> tuple[GoogleStore, AgentConfig, dict, Path]:
     """Only a marked child of the fixed stand-in root can redirect a reply."""
     candidate = path.absolute()
-    if candidate.parent != ROOT or candidate == ROOT:
+    try:
+        files_root = work_files_root()
+    except FileDirectoryError as exc:
+        raise ValueError(str(exc)) from exc
+    if ROOT.parent != files_root or candidate.parent != ROOT or candidate == ROOT:
         raise ValueError("stand-in run must be a direct child of the fixed stand-in root")
-    for item in (ROOT, candidate):
+    for item in (files_root, ROOT, candidate):
         info = item.lstat()
-        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+        if (stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
                 or stat.S_IMODE(info.st_mode) & 0o077):
             raise ValueError("stand-in run directory must be owner-only")
     marker = candidate / "marker.json"
