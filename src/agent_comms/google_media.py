@@ -59,16 +59,22 @@ def _owner_only_directory(path: Path) -> None:
         raise MediaError("inbound file directory is not owner-only")
 
 
-def _target_directory(message_id: str) -> Path:
-    root = Path.home() / "comms-files"
-    for path in (root, root / "in", root / "in" / message_id):
+def _inbound_root(stand_in_run: Path | None = None) -> Path:
+    if stand_in_run is None:
+        return Path.home() / "comms-files" / "in"
+    return stand_in_run / "files" / "in"
+
+
+def _target_directory(message_id: str, *, stand_in_run: Path | None = None) -> Path:
+    root = _inbound_root(stand_in_run)
+    for path in (root.parent, root, root / message_id):
         _owner_only_directory(path)
-    return root / "in" / message_id
+    return root / message_id
 
 
 def prepare_queued(store: GoogleStore, row: GoogleMessage, config: AgentConfig,
                    download: Callable[[str, AgentConfig], Iterable[bytes]] = _download,
-                   *, now: datetime | None = None,
+                   *, now: datetime | None = None, stand_in_run: Path | None = None,
                    ) -> GoogleMessage:
     """Save all referenced bytes before the handoff; never use a Google filename."""
     if row.state != "queued" or not row.payload.get("has_attachments"):
@@ -83,7 +89,7 @@ def prepare_queued(store: GoogleStore, row: GoogleMessage, config: AgentConfig,
     if not isinstance(attachments, list) or not 1 <= len(attachments) <= 10:
         return store.transition(row.id, from_state="queued", to_state="refused",
                                 reason="attachment reference is unavailable") or store.get(row.id)
-    target_dir = _target_directory(row.id)
+    target_dir = _target_directory(row.id, stand_in_run=stand_in_run)
     files = []
     written = []
     total = 0
@@ -144,10 +150,11 @@ def prepare_queued(store: GoogleStore, row: GoogleMessage, config: AgentConfig,
     return store.set_files(row, files) or store.get(row.id)
 
 
-def cleanup_inbound(store: GoogleStore, *, now: datetime | None = None) -> int:
+def cleanup_inbound(store: GoogleStore, *, now: datetime | None = None,
+                    stand_in_run: Path | None = None) -> int:
     """Remove only generated, regular inbound files after 30 days; keep records."""
     cutoff = (now or datetime.now(timezone.utc)) - timedelta(days=30)
-    root = Path.home() / "comms-files" / "in"
+    root = _inbound_root(stand_in_run)
     for directory in (root.parent, root):
         try:
             info = directory.lstat()
