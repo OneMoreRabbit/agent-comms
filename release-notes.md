@@ -10,6 +10,15 @@ about: one short entry per release, newest first
 
 ## Built, not yet released
 
+## v2.9.9 — 2026-11-18
+
+**TL;DR:** Google Chat hands each message to the seat on one line, preserving every labelled field and the full stored text. This avoids the multi-line typing burst associated with Claude not taking Enter.
+
+- A rendered turn over 65,536 UTF-8 bytes is refused visibly, not shortened. Hub delivery and seat 2.9.1 are unchanged.
+- Source suite: 466/466. Known limit: non-whitespace control characters, such as ESC, still pass through person-authored text to the seat.
+
+**Action:** Install from this tag on test-claude and test-codex only, then run the full stand-in set on both seats. This tag is not operator beta acceptance.
+
 ## v2.9.8 — 2026-11-18
 
 **TL;DR:** Allow more than one distinct Google Chat reply to one admitted message, so an agent can say it is working and then send its answer.
