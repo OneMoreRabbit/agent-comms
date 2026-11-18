@@ -242,6 +242,32 @@ def test_long_reply_uploads_whole_text_before_post(seat, tmp_path):
     assert posted[0].payload["source_text"] == text
 
 
+def test_long_answer_then_file_are_distinct_and_each_repeat_is_inert(seat, tmp_path):
+    store = GoogleStore(tmp_path / "two-replies.db")
+    row = _delivered(store)
+    posted, uploads = [], []
+    def upload(config, path):
+        uploads.append(path)
+        return f"https://drive.google.com/file/d/{len(uploads)}/view"
+    post = lambda outbound, _: posted.append(outbound)
+    long_text = "L" * 35000
+    first = google_reply.send_text(store, row, long_text, _config(tmp_path), _private(),
+                                   post=post, upload=upload)
+    same_first = google_reply.send_text(store, row, long_text, _config(tmp_path), _private(),
+                                        post=post, upload=upload)
+    file_path = Path.home() / "comms-files" / "out" / AGENT / "answer.txt"
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text("file answer")
+    second = google_reply.send_text(store, row, "File follows", _config(tmp_path), _private(),
+                                    post=post, upload=upload, file_path=file_path)
+    same_second = google_reply.send_text(store, row, "File follows", _config(tmp_path), _private(),
+                                         post=post, upload=upload, file_path=file_path)
+    assert first.id == same_first.id and second.id == same_second.id
+    assert first.id != second.id and first.request_id != second.request_id
+    assert len(posted) == len(uploads) == 2
+    assert len(store.replies()) == 2
+
+
 def test_reply_folder_preflight_precedes_outbox_and_text_can_replace(seat, tmp_path):
     store = GoogleStore(tmp_path / "preflight.db")
     row = _delivered(store)
@@ -280,6 +306,40 @@ def test_upload_is_bounded_and_failed_file_reply_can_be_replaced(seat, tmp_path)
     recovered = google_reply.send_text(store, row, "Text instead", _config(tmp_path), _private(),
                                        post=lambda *a: None)
     assert recovered.state == "sent" and recovered.request_id != third.request_id
+
+
+def test_failed_file_reply_same_text_and_file_gets_a_new_attempt(seat, tmp_path):
+    store = GoogleStore(tmp_path / "retry-same-file.db")
+    row = _delivered(store)
+    file_path = Path.home() / "comms-files" / "out" / AGENT / "answer.txt"
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text("reply file")
+    uploads, posts = [], []
+
+    def upload(config, path):
+        uploads.append(path)
+        if len(uploads) <= 3:
+            raise OSError("offline")
+        return "https://drive.google.com/file/d/recovered/view"
+
+    first = google_reply.send_text(store, row, "Same text", _config(tmp_path), _private(),
+                                   file_path=file_path, upload=upload,
+                                   post=lambda out, _: posts.append(out))
+    second = google_reply.retry_pending(store, first, _config(tmp_path), _private(),
+                                        upload=upload, post=lambda out, _: posts.append(out))
+    failed = google_reply.retry_pending(store, second, _config(tmp_path), _private(),
+                                        upload=upload, post=lambda out, _: posts.append(out))
+    assert failed.state == "failed" and len(uploads) == 3 and posts == []
+    recovered = google_reply.send_text(store, row, "Same text", _config(tmp_path), _private(),
+                                       file_path=file_path, upload=upload,
+                                       post=lambda out, _: posts.append(out))
+    assert recovered.state == "sent" and recovered.id != failed.id
+    assert recovered.request_id != failed.request_id
+    assert len(uploads) == 4 and len(posts) == 1
+    again = google_reply.send_text(store, row, "Same text", _config(tmp_path), _private(),
+                                   file_path=file_path, upload=upload,
+                                   post=lambda out, _: posts.append(out))
+    assert again.id == recovered.id and len(uploads) == 4 and len(posts) == 1
 
 
 def test_uncertain_upload_is_not_repeated_after_restart(seat, tmp_path):
