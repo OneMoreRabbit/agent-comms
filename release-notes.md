@@ -10,7 +10,14 @@ about: one short entry per release, newest first
 
 ## Built, not yet released
 
-- 2.9.11 — 2026-11-18: transcribe admitted Google Chat voice notes through agent-transcribe 0.1.0 before seat handoff, retaining the audio and a fixed failure line when transcription fails; run transcription off the Google worker path so a slow service cannot hold other messages.
+## v2.9.11 — 2026-11-18
+
+**TL;DR:** Transcribe admitted Google Chat voice notes through agent-transcribe 0.1.0 before seat handoff. The agent receives the audio and transcript in one line, or the audio and a fixed not-transcribed line if the command fails.
+
+- Transcription runs off the Google worker path, so a slow service does not hold other Google or hub messages. The transcript words are not logged. Generated audio and transcript files are removed after 30 days; message state remains.
+- Source suite: 479/479. Hub commands and a seat without Google settings are unchanged.
+
+**Action:** Install v2.9.11 with agent-transcribe v0.1.0 and its declared service settings on test-claude and test-codex only, then run the G-S13 stand-in gate. No estate-seat install before acceptance.
 
 ## v2.9.10 — 2026-11-18
 
