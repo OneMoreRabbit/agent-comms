@@ -67,9 +67,12 @@ class GoogleStore:
                     created_at TEXT NOT NULL,
                     sent_at TEXT
                 );
-                CREATE UNIQUE INDEX IF NOT EXISTS google_outbound_one_kind
-                    ON google_outbound(message_id, kind);
             """)
+            # 2.9.7 allowed one reply per message. Keep notice deduplication,
+            # but let each distinct reply own its own durable outbox row.
+            db.execute("DROP INDEX IF EXISTS google_outbound_one_kind")
+            db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS google_outbound_one_notice
+                ON google_outbound(message_id, kind) WHERE kind != 'reply'""")
             # 2.9.3 stores already have the table. Add only Google-owned columns;
             # the hub's messages and cursor are never migrated by this module.
             columns = {row[1] for row in db.execute("PRAGMA table_info(google_messages)")}
@@ -198,6 +201,35 @@ class GoogleStore:
                               row["upload_attempts"], bool(row["upload_in_progress"]),
                               row["upload_started_at"])
 
+    @staticmethod
+    def _same_reply(payload: dict, source_text: str, file_path: str | None,
+                    generated_answer: bool) -> bool:
+        return (payload.get("source_text", payload["text"]) == source_text
+                and bool(payload.get("generated_answer")) == generated_answer
+                and (generated_answer or payload.get("file_path") == file_path))
+
+    @classmethod
+    def _reusable_reply(cls, existing: sqlite3.Row, source_text: str,
+                        file_path: str | None, generated_answer: bool) -> bool:
+        payload = json.loads(existing["payload"])
+        if (existing["state"] == "failed" and payload.get("file_path")
+                and not payload.get("drive_link")):
+            return False
+        return cls._same_reply(payload, source_text, file_path, generated_answer)
+
+    def matching_reply(self, message_id: str, source_text: str,
+                       file_path: str | None = None,
+                       generated_answer: bool = False) -> GoogleOutbound | None:
+        if not re.fullmatch(r"gc-[0-9]+", message_id):
+            return None
+        with self._open() as db:
+            for row in db.execute("""SELECT * FROM google_outbound
+                WHERE message_id=? AND kind='reply' ORDER BY id""", (int(message_id[3:]),)):
+                if self._reusable_reply(row, source_text, file_path,
+                                        generated_answer):
+                    return self._outbound(row)
+        return None
+
     def queue_reply(self, row: GoogleMessage, text: str, request_id: str,
                     file_path: str | None = None,
                     source_text: str | None = None,
@@ -215,28 +247,29 @@ class GoogleStore:
             payload["generated_answer"] = True
         encoded = json.dumps(payload, sort_keys=True)
         with self._open() as db:
+            db.execute("BEGIN IMMEDIATE")
+            current = db.execute("SELECT state,agent,space FROM google_messages WHERE id=?",
+                                 (int(row.id[3:]),)).fetchone()
+            if (current is None or current["state"] not in
+                    {"delivered", "held", "retrieved", "uncertain"}
+                    or current["agent"] != row.agent or current["space"] != row.space):
+                raise ValueError(f"{row.id}: message state or route changed before reply")
             if row.state == "uncertain":
                 db.execute("""UPDATE google_messages SET state='delivered',
                     reason='agent reply confirms uncertain handoff'
                     WHERE id=? AND state='uncertain'""", (int(row.id[3:]),))
-            existing = db.execute("SELECT * FROM google_outbound WHERE message_id=? AND kind='reply'",
-                                  (int(row.id[3:]),)).fetchone()
-            if existing is not None and existing["state"] == "failed":
-                previous = json.loads(existing["payload"])
-                if previous.get("file_path") and not previous.get("drive_link"):
-                    db.execute("""UPDATE google_outbound SET payload=?, request_id=?, state='pending',
-                        created_at=?, failure_reason='', upload_attempts=0, upload_in_progress=0,
-                        upload_started_at=''
-                        WHERE id=? AND state='failed'""",
-                        (encoded, request_id, datetime.now(timezone.utc).isoformat(), existing["id"]))
-            db.execute("""INSERT OR IGNORE INTO google_outbound
+            for existing in db.execute("""SELECT * FROM google_outbound
+                WHERE message_id=? AND kind='reply' ORDER BY id""", (int(row.id[3:]),)):
+                if self._reusable_reply(existing,
+                                        source_text if source_text is not None else text,
+                                        file_path, generated_answer):
+                    return self._outbound(existing)
+            cursor = db.execute("""INSERT INTO google_outbound
                 (message_id,kind,payload,request_id,created_at)
                 VALUES (?,'reply',?,?,?)""", (int(row.id[3:]), encoded, request_id,
                                               datetime.now(timezone.utc).isoformat()))
-            stored = db.execute("""SELECT * FROM google_outbound
-                WHERE message_id=? AND kind='reply'""", (int(row.id[3:]),)).fetchone()
-            if stored["payload"] != encoded:
-                raise ValueError(f"{row.id}: a different reply is already recorded")
+            stored = db.execute("SELECT * FROM google_outbound WHERE id=?",
+                                (cursor.lastrowid,)).fetchone()
             return self._outbound(stored)
 
     def reply_for_message(self, message_id: str) -> GoogleOutbound | None:
@@ -321,7 +354,7 @@ class GoogleStore:
         cutoff = ((now or datetime.now(timezone.utc)) - timedelta(hours=24)).isoformat()
         with self._open() as db:
             ids = [f"gc-{row['message_id']}" for row in db.execute(
-                "SELECT message_id FROM google_outbound WHERE kind='reply' "
+                "SELECT DISTINCT message_id FROM google_outbound WHERE kind='reply' "
                 "AND state='pending' AND created_at<=?", (cutoff,))]
             db.execute("""UPDATE google_outbound SET state='failed',
                 failure_reason='reply pending for 24 hours'

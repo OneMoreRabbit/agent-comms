@@ -183,8 +183,13 @@ def send_text(store: GoogleStore, row: GoogleMessage, text: str,
               check_folder: Callable[[google_chat.AgentConfig], None] | None = None,
               ) -> GoogleOutbound:
     """Fix one reply in the outbox before posting, never taking a new route."""
+    row = store.get(row.id)
+    if row is None:
+        raise ValueError("Google Chat message no longer exists")
     if row.agent != config.agent:
         raise ValueError(f"{row.id}: agent does not match the configured Google contact")
+    if row.state not in {"delivered", "held", "retrieved", "uncertain"}:
+        raise ValueError(f"{row.id}: cannot reply to a {row.state} message")
     if not _SPACE.fullmatch(row.space):
         raise ValueError(f"{row.id}: invalid original direct-message space")
     if (not text or not text.strip()) and file_path is None:
@@ -194,25 +199,19 @@ def send_text(store: GoogleStore, row: GoogleMessage, text: str,
     if long_answer and file_path is not None:
         raise ValueError("a long answer and a separate file require two replies")
     _still_allowed(row, private_row)
-    outgoing = store.reply_for_message(row.id)
-    if outgoing is not None:
-        replaceable = (outgoing.state == "failed" and outgoing.payload.get("file_path")
-                       and not outgoing.payload.get("drive_link"))
-        if not replaceable and ((outgoing.payload.get("source_text", outgoing.payload["text"]) != text)
-                or (file_path is not None and
-                    outgoing.payload.get("file_path") !=
-                    str(google_drive.validate_outbound_file(config.agent, file_path)))):
-            raise ValueError(f"{row.id}: a different reply is already recorded")
-    if outgoing is None or replaceable:
+    source = (google_drive.validate_outbound_file(config.agent, file_path)
+              if file_path is not None else None)
+    outgoing = store.matching_reply(row.id, text, str(source) if source else None,
+                                    generated_answer=long_answer)
+    if outgoing is None:
         if long_answer or file_path is not None:
             preflight = check_folder
             if preflight is None and upload is google_drive.upload_file:
                 preflight = google_drive.check_reply_folder
             if preflight is not None:
                 preflight(config)
-        source = (google_drive.create_long_answer(config.agent, text) if long_answer
-                  else google_drive.validate_outbound_file(config.agent, file_path) if file_path
-                  else None)
+        if long_answer:
+            source = google_drive.create_long_answer(config.agent, text)
         wire_text = ("Long answer (complete text in the linked file): " + formatted[:1000] + "…"
                      if long_answer else formatted)
         outgoing = store.queue_reply(row, wire_text, str(uuid.uuid4()),

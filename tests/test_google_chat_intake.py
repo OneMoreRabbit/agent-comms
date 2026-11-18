@@ -611,8 +611,51 @@ def test_text_reply_uses_original_space_and_stable_request_id(tmp_path):
     assert first.state == second.state == "sent"
     assert len(posts) == 1 and posts[0][1]["space"] == "spaces/dm"
     assert posts[0][1]["text"] == "Done."
-    with pytest.raises(ValueError, match="different reply"):
-        google_reply.send_text(store, row, "Changed.", config, _private(), post)
+    changed = google_reply.send_text(store, row, "Changed.", config, _private(), post)
+    repeated = google_reply.send_text(store, row, "Changed.", config, _private(), post)
+    assert changed.id != first.id and changed.request_id != first.request_id
+    assert repeated.id == changed.id and len(posts) == 2
+    assert [out.payload["text"] for out in store.replies()] == ["Done.", "Changed."]
+
+
+def test_297_store_migrates_without_losing_reply_and_rollback_is_explicit(tmp_path):
+    path = tmp_path / "old-comms.db"
+    old = GoogleStore(path)
+    row, _ = google_intake.ingest(old, _event(), _private(), now=NOW)
+    row = old.transition(row.id, from_state="queued", to_state="delivered")
+    with old._open() as db:
+        db.execute("DROP INDEX google_outbound_one_notice")
+        db.execute("CREATE UNIQUE INDEX google_outbound_one_kind ON google_outbound(message_id, kind)")
+    original = old.queue_reply(row, "first", "request-first")
+
+    upgraded = GoogleStore(path)
+    assert upgraded.get_outbound(original.id) == original
+    second = upgraded.queue_reply(row, "second", "request-second")
+    assert second.id != original.id
+    assert [reply.request_id for reply in upgraded.replies()] == ["request-first", "request-second"]
+    # 2.9.7 attempts to recreate this unique index at startup and cannot
+    # reopen a store after the second distinct reply was written.
+    with upgraded._open() as db, pytest.raises(sqlite3.IntegrityError):
+        db.execute("CREATE UNIQUE INDEX google_outbound_one_kind ON google_outbound(message_id, kind)")
+
+
+def test_each_reply_rechecks_person_and_message_state(tmp_path):
+    store = _store(tmp_path)
+    row, _ = google_intake.ingest(store, _event(), _private(), now=NOW)
+    row = store.transition(row.id, from_state="queued", to_state="delivered")
+    config = google_chat.AgentConfig(AGENT, "projects/fake/subscriptions/fake",
+                                     tmp_path / "credential.json", "fake-folder")
+    posts = []
+    google_reply.send_text(store, row, "first", config, _private(),
+                           post=lambda out, _: posts.append(out))
+    with pytest.raises(google_reply.PermanentReplyError, match="no longer permitted"):
+        google_reply.send_text(store, row, "second", config, _private([]),
+                               post=lambda *a: pytest.fail("posted for removed person"))
+    store.transition(row.id, from_state="delivered", to_state="refused")
+    with pytest.raises(ValueError, match="cannot reply to a refused"):
+        google_reply.send_text(store, row, "first", config, _private(),
+                               post=lambda *a: pytest.fail("posted for refused message"))
+    assert len(posts) == 1 and len(store.replies()) == 1
 
 
 def test_failed_text_post_stays_pending_and_retries_same_request_id(tmp_path):
