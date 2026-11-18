@@ -447,10 +447,15 @@ def test_standin_bounded_pass_names_isolated_reply_and_never_builds_google(seat,
     monkeypatch.setattr(google_reply, "_post", lambda *a: pytest.fail("live Chat"))
     monkeypatch.setattr(google_drive, "_session", lambda *a: pytest.fail("live Drive"))
     raw = {"type": "MESSAGE", "eventTime": datetime.now(timezone.utc).isoformat(),
-           "message": {"name": "spaces/dm/messages/one", "text": "Hello"},
+           "message": {"name": "spaces/dm/messages/one", "text": "Hello",
+                       "attachment": [{"source": "UPLOADED_CONTENT", "contentType": "image/png",
+                                       "attachmentDataRef": {"resourceName": "spaces/dm/media/one"}}]},
            "space": {"name": "spaces/dm", "spaceType": "DIRECT_MESSAGE",
                      "singleUserBotDm": True},
            "user": {"name": "users/123", "email": "person@example.org", "type": "HUMAN"}}
+    live_file = seat / "comms-files" / "in" / "gc-1" / "file-01.png"
+    live_file.parent.mkdir(parents=True, mode=0o700)
+    live_file.write_bytes(b"real Google file")
     acks, turns = [], []
 
     class Subscriber:
@@ -476,7 +481,16 @@ def test_standin_bounded_pass_names_isolated_reply_and_never_builds_google(seat,
     assert count == 1 and acks == ["one"]
     assert len(turns) == 1 and turns[0][1] == AGENT
     assert "--stand-in-run " + str(run) in turns[0][0]
-    assert GoogleStore(run / "comms.db").get("gc-1").state == "delivered"
+    stand_in_file = run / "files" / "in" / "gc-1" / "file-01.png"
+    assert stand_in_file.read_bytes() == b"photo"
+    assert str(stand_in_file) in turns[0][0]
+    assert live_file.read_bytes() == b"real Google file"
+    store = GoogleStore(run / "comms.db")
+    assert store.get("gc-1").state == "delivered"
+    from datetime import timedelta
+    assert google_media.cleanup_inbound(
+        store, stand_in_run=run, now=datetime.now(timezone.utc) + timedelta(days=31)) == 1
+    assert not stand_in_file.exists() and live_file.read_bytes() == b"real Google file"
 
 
 def test_media_download_fault_has_three_attempt_bound(seat, tmp_path):
