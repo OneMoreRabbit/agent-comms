@@ -10,7 +10,15 @@ about: one short entry per release, newest first
 
 ## Built, not yet released
 
-- 2.9.8 — 2026-11-18: Allow distinct Google Chat replies to one admitted message, each with its own durable request ID; repeating a sent reply returns its first row. A failed file reply with no Drive link can be tried again with the same text and file as a new row. A 2.9.7 store opens intact in 2.9.8. After 2.9.8 writes a second reply, 2.9.7 cannot open the Google store; its Google worker and commands fail, but hub delivery carries on. Return by the next patch, not by restoring comms.db, which also holds hub messages and cursor.
+## v2.9.8 — 2026-11-18
+
+**TL;DR:** Allow more than one distinct Google Chat reply to one admitted message, so an agent can say it is working and then send its answer.
+
+- Each distinct reply has its own durable request ID. Repeating a sent reply posts nothing new. A failed file reply without a Drive link can be tried again with the same text and file as a new row.
+- A 2.9.7 store opens intact in 2.9.8. After 2.9.8 writes a second reply, 2.9.7 cannot open the Google store: its Google worker and commands fail, while hub delivery continues. Return by the next patch; do not restore `comms.db`, which also holds hub messages and cursor.
+- Source suite: 464/464. No hub delivery code changed.
+
+**Action:** Install from this tag on test-claude and test-codex only, then rerun the full Google stand-in set on both seats. This tag is not operator beta acceptance.
 
 ## v2.9.7 — 2026-11-18
 
