@@ -10,6 +10,8 @@ about: one short entry per release, newest first
 
 ## Built, not yet released
 
+- 2.9.10 — 2026-11-18: Keep Google Chat inbound, outbound, long-answer and stand-in files under `~/work/comms-files`, so Claude can open an incoming image without an outside-working-directory prompt. Existing `~/comms-files` trees are no longer read; removal is a separate operator-approved step.
+
 ## v2.9.9 — 2026-11-18
 
 **TL;DR:** Google Chat hands each message to the seat on one line, preserving every labelled field and the full stored text. This avoids the multi-line typing burst associated with Claude not taking Enter.

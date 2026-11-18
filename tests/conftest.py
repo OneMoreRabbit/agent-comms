@@ -108,6 +108,7 @@ def seat(tmp_path, monkeypatch):
     """A seat with comms enabled, a valid credential, and an isolated home."""
     home = tmp_path / "home"
     (home / ".secrets").mkdir(parents=True)
+    (home / "work").mkdir(mode=0o755)
     (home / ".seat").mkdir(parents=True)
     (home / ".seat" / "seat.yml").write_text(
         "project: agent-eco\nseat: agent-comms\nhost: marten\n", encoding="utf-8"
