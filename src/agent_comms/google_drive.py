@@ -13,7 +13,7 @@ from typing import Callable
 from urllib.parse import quote, urlparse
 
 from .google_chat import AgentConfig, GoogleChatConfigError
-from .google_paths import FileDirectoryError, ensure_owner_only_directory
+from .google_paths import FileDirectoryError, ensure_owner_only_directory, work_files_root
 
 MAX_REPLY_FILE_BYTES = 50 * 1024 * 1024
 _FOLDER_MIME = "application/vnd.google-apps.folder"
@@ -65,8 +65,8 @@ def check_reply_folder(config: AgentConfig, session_factory: Callable = _session
 
 def ensure_outbound_root(agent: str) -> Path:
     """Prepare the directory named to an agent before handing it a turn."""
-    root = Path.home() / "comms-files" / "out" / agent
     try:
+        root = work_files_root() / "out" / agent
         for directory in (root.parent.parent, root.parent, root):
             ensure_owner_only_directory(directory)
     except FileDirectoryError as exc:
@@ -76,12 +76,15 @@ def ensure_outbound_root(agent: str) -> Path:
 
 def validate_outbound_file(agent: str, path: Path) -> Path:
     """Keep an agent's file beneath its own declared out root, with no symlink."""
-    root = Path.home() / "comms-files" / "out" / agent
+    try:
+        root = work_files_root() / "out" / agent
+    except FileDirectoryError as exc:
+        raise DriveError(str(exc)) from exc
     candidate = path.absolute()
     if ".." in path.parts or not candidate.is_relative_to(root):
         raise DriveError("reply file must be under the agent's comms-files/out folder")
     ensure_outbound_root(agent)
-    for item in (Path.home() / "comms-files", Path.home() / "comms-files" / "out", root,
+    for item in (root.parent.parent, root.parent, root,
                  *[root.joinpath(*candidate.relative_to(root).parts[:index])
                    for index in range(1, len(candidate.relative_to(root).parts) + 1)]):
         try:
@@ -160,17 +163,21 @@ def cleanup_long_answers(store, *, now: datetime | None = None) -> int:
         row = store.get(outbound.message_id)
         if row is None:
             continue
-        root = Path.home() / "comms-files" / "out" / row.agent
+        try:
+            root = work_files_root() / "out" / row.agent
+        except FileDirectoryError:
+            continue
         candidate = Path(outbound.payload.get("file_path", ""))
         if candidate.parent != root or not re.fullmatch(r"answer-[A-Za-z0-9_-]+\.txt", candidate.name):
             continue
         try:
             info = candidate.lstat()
-            directory = root.lstat()
+            directories = [path.lstat() for path in (root.parent.parent, root.parent, root)]
         except FileNotFoundError:
             continue
         if (stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid()
-                and stat.S_ISDIR(directory.st_mode) and directory.st_uid == os.getuid()):
+                and all(stat.S_ISDIR(directory.st_mode) and directory.st_uid == os.getuid()
+                        for directory in directories)):
             candidate.unlink()
             removed += 1
     return removed

@@ -11,6 +11,22 @@ class FileDirectoryError(ValueError):
     """A Google Chat file directory is not a real, owned directory."""
 
 
+def work_files_root() -> Path:
+    """Use the seat's work folder without creating or changing that folder."""
+    work = Path.home() / "work"
+    try:
+        info = work.lstat()
+    except OSError as exc:
+        raise FileDirectoryError("agent work folder is unavailable") from exc
+    if stat.S_ISLNK(info.st_mode):
+        raise FileDirectoryError("agent work folder is a symlink")
+    if not stat.S_ISDIR(info.st_mode):
+        raise FileDirectoryError("agent work folder is not a directory")
+    if info.st_uid != os.getuid():
+        raise FileDirectoryError("agent work folder is not owned by this seat user")
+    return work / "comms-files"
+
+
 def ensure_owner_only_directory(path: Path) -> None:
     """Create or tighten one directory without following its final component."""
     try:

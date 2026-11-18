@@ -15,7 +15,7 @@ from .google_chat import AgentConfig, GoogleChatConfigError
 from .google_intake import MAX_AGE_SECONDS, _age_seconds
 from .google_store import GoogleMessage, GoogleStore
 from . import google_notices
-from .google_paths import FileDirectoryError, ensure_owner_only_directory
+from .google_paths import FileDirectoryError, ensure_owner_only_directory, work_files_root
 
 MAX_FILE_BYTES = 50 * 1024 * 1024
 MAX_TOTAL_BYTES = 100 * 1024 * 1024
@@ -58,7 +58,7 @@ def _owner_only_directory(path: Path) -> None:
 
 def _inbound_root(stand_in_run: Path | None = None) -> Path:
     if stand_in_run is None:
-        return Path.home() / "comms-files" / "in"
+        return work_files_root() / "in"
     return stand_in_run / "files" / "in"
 
 
@@ -151,7 +151,10 @@ def cleanup_inbound(store: GoogleStore, *, now: datetime | None = None,
                     stand_in_run: Path | None = None) -> int:
     """Remove only generated, regular inbound files after 30 days; keep records."""
     cutoff = (now or datetime.now(timezone.utc)) - timedelta(days=30)
-    root = _inbound_root(stand_in_run)
+    try:
+        root = _inbound_root(stand_in_run)
+    except FileDirectoryError:
+        return 0
     for directory in (root.parent, root):
         try:
             info = directory.lstat()

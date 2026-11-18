@@ -413,7 +413,7 @@ def test_uploaded_attachment_is_saved_before_the_seat_turn(seat, tmp_path):
     prepared = google_media.prepare_queued(store, row, config,
                                            download=lambda *_: [b"photo", b" data"])
     assert prepared.state == "queued" and prepared.payload["files"][0]["bytes"] == 10
-    path = seat / "comms-files" / "in" / "gc-1" / "file-01.jpg"
+    path = seat / "work" / "comms-files" / "in" / "gc-1" / "file-01.jpg"
     assert path.read_bytes() == b"photo data"
     assert str(path) in google_intake.turn(prepared)
     assert "ignore-me.jpg" not in google_intake.turn(prepared)
@@ -499,7 +499,7 @@ def test_oversize_upload_refuses_without_naming_partial_file(seat, tmp_path, mon
                                            download=lambda *_: [b"toolarge"])
     assert prepared.state == "refused" and prepared.reason == "file too large"
     assert "files" not in prepared.payload and "text" not in prepared.payload
-    assert not (seat / "comms-files" / "in" / "gc-1" / "file-01.pdf").exists()
+    assert not (seat / "work" / "comms-files" / "in" / "gc-1" / "file-01.pdf").exists()
 
 
 def test_unlisted_old_message_is_refused_without_storing_text(tmp_path):

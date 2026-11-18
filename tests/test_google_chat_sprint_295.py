@@ -111,7 +111,7 @@ def test_drive_folder_explains_http_failure(tmp_path, status, expected):
 
 
 def test_drive_upload_uses_shared_drive_folder_and_returns_private_link(seat, tmp_path):
-    root = Path.home() / "comms-files" / "out" / AGENT
+    root = Path.home() / "work" / "comms-files" / "out" / AGENT
     root.mkdir(mode=0o700, parents=True)
     file = root / "answer.pdf"
     file.write_bytes(b"PDF body")
@@ -157,8 +157,9 @@ def test_drive_upload_uses_shared_drive_folder_and_returns_private_link(seat, tm
 
 
 def test_agent_file_out_then_file_in_and_long_answer_repair_owned_directories(seat, tmp_path):
-    root = seat / "comms-files"
+    root = seat / "work" / "comms-files"
     assert not root.exists()
+    work_mode = stat.S_IMODE((seat / "work").stat().st_mode)
     store = GoogleStore(tmp_path / "first-turn.db")
     row, _ = google_intake.ingest(store, _event(), _private())
     turns = []
@@ -170,6 +171,7 @@ def test_agent_file_out_then_file_in_and_long_answer_repair_owned_directories(se
     assert delivered.state == "delivered" and str(output) in turns[0]
     assert all(stat.S_IMODE(path.stat().st_mode) == 0o700
                for path in (root, root / "out", output))
+    assert stat.S_IMODE((seat / "work").stat().st_mode) == work_mode
 
     # An agent can create its file and make these folders group-writable.
     # Both a reply and the next inbound file must tighten them again.
@@ -198,8 +200,54 @@ def test_agent_file_out_then_file_in_and_long_answer_repair_owned_directories(se
     assert stat.S_IMODE(output.stat().st_mode) == 0o700
 
 
+def test_new_file_paths_leave_legacy_tree_unread_and_untouched(seat, tmp_path):
+    legacy = seat / "comms-files" / "in" / "gc-1" / "file-01.png"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_bytes(b"legacy image")
+    store = GoogleStore(tmp_path / "new-path.db")
+    attachment = {"source": "UPLOADED_CONTENT", "contentType": "image/png",
+                  "attachmentDataRef": {"resourceName": "spaces/dm/attachments/photo"}}
+    row, _ = google_intake.ingest(store, _event(attachments=(attachment,)), _private())
+    prepared = google_media.prepare_queued(store, row, _config(tmp_path),
+                                           download=lambda *_: [b"new image"])
+    new_file = seat / "work" / "comms-files" / "in" / "gc-1" / "file-01.png"
+    assert new_file.read_bytes() == b"new image"
+    assert legacy.read_bytes() == b"legacy image"
+    assert str(new_file) in google_intake.turn(prepared)
+    assert str(legacy) not in google_intake.turn(prepared)
+    old_reply = seat / "comms-files" / "out" / AGENT / "answer.txt"
+    old_reply.parent.mkdir(parents=True)
+    old_reply.write_text("old answer", encoding="utf-8")
+    with pytest.raises(google_drive.DriveError, match="under the agent"):
+        google_drive.validate_outbound_file(AGENT, old_reply)
+    assert old_reply.read_text(encoding="utf-8") == "old answer"
+
+
+def test_agent_work_folder_is_not_chmodded_or_followed(seat, tmp_path, monkeypatch):
+    work = seat / "work"
+    work.chmod(0o775)
+    google_drive.ensure_outbound_root(AGENT)
+    assert stat.S_IMODE(work.stat().st_mode) == 0o775
+    # A linked or foreign-owned work folder cannot redirect file IO.
+    (work / "comms-files" / "out" / AGENT).rmdir()
+    (work / "comms-files" / "out").rmdir()
+    (work / "comms-files").rmdir()
+    work.rmdir()
+    outside = tmp_path / "outside-work"
+    outside.mkdir()
+    work.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(google_drive.DriveError, match="symlink"):
+        google_drive.ensure_outbound_root(AGENT)
+    work.unlink()
+    work.mkdir()
+    real_uid = os.getuid()
+    monkeypatch.setattr("agent_comms.google_paths.os.getuid", lambda: real_uid + 1)
+    with pytest.raises(google_drive.DriveError, match="not owned"):
+        google_drive.ensure_outbound_root(AGENT)
+
+
 def test_google_file_directories_refuse_links_and_other_owners(seat, tmp_path, monkeypatch):
-    root = seat / "comms-files"
+    root = seat / "work" / "comms-files"
     outside = tmp_path / "outside"
     outside.mkdir()
     root.symlink_to(outside, target_is_directory=True)
@@ -255,7 +303,7 @@ def test_long_answer_then_file_are_distinct_and_each_repeat_is_inert(seat, tmp_p
                                    post=post, upload=upload)
     same_first = google_reply.send_text(store, row, long_text, _config(tmp_path), _private(),
                                         post=post, upload=upload)
-    file_path = Path.home() / "comms-files" / "out" / AGENT / "answer.txt"
+    file_path = Path.home() / "work" / "comms-files" / "out" / AGENT / "answer.txt"
     file_path.parent.mkdir(parents=True, exist_ok=True)
     file_path.write_text("file answer")
     second = google_reply.send_text(store, row, "File follows", _config(tmp_path), _private(),
@@ -311,7 +359,7 @@ def test_upload_is_bounded_and_failed_file_reply_can_be_replaced(seat, tmp_path)
 def test_failed_file_reply_same_text_and_file_gets_a_new_attempt(seat, tmp_path):
     store = GoogleStore(tmp_path / "retry-same-file.db")
     row = _delivered(store)
-    file_path = Path.home() / "comms-files" / "out" / AGENT / "answer.txt"
+    file_path = Path.home() / "work" / "comms-files" / "out" / AGENT / "answer.txt"
     file_path.parent.mkdir(parents=True, exist_ok=True)
     file_path.write_text("reply file")
     uploads, posts = [], []
@@ -530,8 +578,9 @@ def test_retirement_notice_uses_only_fixed_line(tmp_path):
 
 
 def test_hidden_standin_reply_uses_run_store_and_no_google_client(seat, tmp_path, monkeypatch):
-    root = tmp_path / "stand-in"
-    root.mkdir(mode=0o700)
+    root = seat / "work" / "comms-files" / "stand-in"
+    root.mkdir(mode=0o700, parents=True)
+    root.parent.chmod(0o700)
     run = root / "one"
     run.mkdir(mode=0o700)
     marker = run / "marker.json"
@@ -558,8 +607,9 @@ def test_hidden_standin_reply_uses_run_store_and_no_google_client(seat, tmp_path
 
 
 def test_standin_bounded_pass_names_isolated_reply_and_never_builds_google(seat, tmp_path, monkeypatch):
-    root = tmp_path / "stand-in"
-    root.mkdir(mode=0o700)
+    root = seat / "work" / "comms-files" / "stand-in"
+    root.mkdir(mode=0o700, parents=True)
+    root.parent.chmod(0o700)
     run = root / "two"
     run.mkdir(mode=0o700)
     marker = run / "marker.json"
@@ -580,7 +630,7 @@ def test_standin_bounded_pass_names_isolated_reply_and_never_builds_google(seat,
            "space": {"name": "spaces/dm", "spaceType": "DIRECT_MESSAGE",
                      "singleUserBotDm": True},
            "user": {"name": "users/123", "email": "person@example.org", "type": "HUMAN"}}
-    live_file = seat / "comms-files" / "in" / "gc-1" / "file-01.png"
+    live_file = seat / "work" / "comms-files" / "in" / "gc-1" / "file-01.png"
     live_file.parent.mkdir(parents=True, mode=0o700)
     live_file.write_bytes(b"real Google file")
     acks, turns = [], []
