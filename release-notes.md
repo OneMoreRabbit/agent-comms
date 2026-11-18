@@ -10,7 +10,7 @@ about: one short entry per release, newest first
 
 ## Built, not yet released
 
-- 2.9.8 — 2026-11-18: Allow distinct Google Chat replies to one admitted message, each with its own durable request ID, while repeating the same reply returns the first row without posting again. This fixes the v2.9.7 one-reply limit. A 2.9.7 store opens intact in 2.9.8; after a second reply is written, 2.9.7 cannot reopen that store because its one-reply index conflicts, so rollback requires a pre-2.9.8 database backup. Hub delivery is unchanged.
+- 2.9.8 — 2026-11-18: Allow distinct Google Chat replies to one admitted message, each with its own durable request ID; repeating a sent reply returns its first row. A failed file reply with no Drive link can be tried again with the same text and file as a new row. A 2.9.7 store opens intact in 2.9.8. After 2.9.8 writes a second reply, 2.9.7 cannot open the Google store; its Google worker and commands fail, but hub delivery carries on. Return by the next patch, not by restoring comms.db, which also holds hub messages and cursor.
 
 ## v2.9.7 — 2026-11-18
 

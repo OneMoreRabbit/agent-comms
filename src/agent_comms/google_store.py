@@ -208,6 +208,15 @@ class GoogleStore:
                 and bool(payload.get("generated_answer")) == generated_answer
                 and (generated_answer or payload.get("file_path") == file_path))
 
+    @classmethod
+    def _reusable_reply(cls, existing: sqlite3.Row, source_text: str,
+                        file_path: str | None, generated_answer: bool) -> bool:
+        payload = json.loads(existing["payload"])
+        if (existing["state"] == "failed" and payload.get("file_path")
+                and not payload.get("drive_link")):
+            return False
+        return cls._same_reply(payload, source_text, file_path, generated_answer)
+
     def matching_reply(self, message_id: str, source_text: str,
                        file_path: str | None = None,
                        generated_answer: bool = False) -> GoogleOutbound | None:
@@ -216,8 +225,8 @@ class GoogleStore:
         with self._open() as db:
             for row in db.execute("""SELECT * FROM google_outbound
                 WHERE message_id=? AND kind='reply' ORDER BY id""", (int(message_id[3:]),)):
-                if self._same_reply(json.loads(row["payload"]), source_text,
-                                    file_path, generated_answer):
+                if self._reusable_reply(row, source_text, file_path,
+                                        generated_answer):
                     return self._outbound(row)
         return None
 
@@ -251,9 +260,9 @@ class GoogleStore:
                     WHERE id=? AND state='uncertain'""", (int(row.id[3:]),))
             for existing in db.execute("""SELECT * FROM google_outbound
                 WHERE message_id=? AND kind='reply' ORDER BY id""", (int(row.id[3:]),)):
-                if self._same_reply(json.loads(existing["payload"]),
-                                    source_text if source_text is not None else text,
-                                    file_path, generated_answer):
+                if self._reusable_reply(existing,
+                                        source_text if source_text is not None else text,
+                                        file_path, generated_answer):
                     return self._outbound(existing)
             cursor = db.execute("""INSERT INTO google_outbound
                 (message_id,kind,payload,request_id,created_at)
