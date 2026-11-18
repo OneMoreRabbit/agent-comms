@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import json
 import time
+from concurrent.futures import Future
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event
 from typing import Callable
 
-from . import google_chat, google_intake, google_media, google_notices, google_reply
+from . import google_chat, google_intake, google_media, google_notices, google_reply, google_transcribe
 from .google_store import GoogleStore
 
 
@@ -61,6 +62,8 @@ def run_once(state_dir: Path, project: str, seat_name: str,
              seat_handoff: Callable | None = None,
              stand_in_run: Path | None = None,
              cleanup_files: bool = True,
+             transcription_jobs: dict[str, Future] | None = None,
+             transcription_executor: google_transcribe.TranscriptionPool | None = None,
              *, raise_on_error: bool = True) -> int:
     """Pull one batch per configured agent; ack after commit, then hand off.
 
@@ -180,6 +183,10 @@ def run_once(state_dir: Path, project: str, seat_name: str,
                                                            download=media_download,
                                                            stand_in_run=stand_in_run)
                 if prepared.state == "queued":
+                    prepared, ready = google_transcribe.prepare_queued(
+                        store, prepared, transcription_jobs, transcription_executor)
+                    if not ready:
+                        continue
                     if seat_handoff is None:
                         if stand_in_run is None:
                             google_intake.deliver_queued(store, prepared)
@@ -251,6 +258,8 @@ def run_forever(state_dir: Path, project: str, seat_name: str, stop: Event,
     rows = None
     refreshed_at = 0.0
     cleaned_at = 0.0
+    transcription_jobs: dict[str, Future] = {}
+    transcription_executor = google_transcribe.TranscriptionPool()
     while not stop.is_set():
         delay = 5
         try:
@@ -267,7 +276,9 @@ def run_forever(state_dir: Path, project: str, seat_name: str, stop: Event,
             count = run_once(state_dir, project, seat_name,
                              subscriber_factory=subscriber_factory, private_rows=rows,
                              record=record, raise_on_error=False,
-                             cleanup_files=time.monotonic() - cleaned_at >= 3600)
+                             cleanup_files=time.monotonic() - cleaned_at >= 3600,
+                             transcription_jobs=transcription_jobs,
+                             transcription_executor=transcription_executor)
             if time.monotonic() - cleaned_at >= 3600:
                 cleaned_at = time.monotonic()
             if count:

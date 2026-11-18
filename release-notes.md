@@ -10,6 +10,8 @@ about: one short entry per release, newest first
 
 ## Built, not yet released
 
+- 2.9.11 — 2026-11-18: transcribe admitted Google Chat voice notes through agent-transcribe 0.1.0 before seat handoff, retaining the audio and a fixed failure line when transcription fails; run transcription off the Google worker path so a slow service cannot hold other messages.
+
 ## v2.9.10 — 2026-11-18
 
 **TL;DR:** Keep Google Chat inbound, outbound, long-answer and stand-in files under `~/work/comms-files`, so an agent can open an incoming image without an outside-working-directory prompt.
