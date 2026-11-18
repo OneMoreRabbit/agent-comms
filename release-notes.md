@@ -10,7 +10,14 @@ about: one short entry per release, newest first
 
 ## Built, not yet released
 
-- 2.9.10 — 2026-11-18: Keep Google Chat inbound, outbound, long-answer and stand-in files under `~/work/comms-files`, so Claude can open an incoming image without an outside-working-directory prompt. Existing `~/comms-files` trees are no longer read; removal is a separate operator-approved step.
+## v2.9.10 — 2026-11-18
+
+**TL;DR:** Keep Google Chat inbound, outbound, long-answer and stand-in files under `~/work/comms-files`, so an agent can open an incoming image without an outside-working-directory prompt.
+
+- Comms does not create or change `~/work`; its own child directories remain owner-only. Existing `~/comms-files` trees are no longer read, moved or removed. Removal is a separate operator-approved step.
+- Source suite: 468/468. Hub delivery and seat 2.9.1 are unchanged.
+
+**Action:** Install from this tag on test-claude and test-codex only, then run the full stand-in set including G-S12 on both seats. This tag is not operator beta acceptance.
 
 ## v2.9.9 — 2026-11-18
 
