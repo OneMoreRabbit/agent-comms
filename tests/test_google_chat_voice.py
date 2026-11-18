@@ -7,6 +7,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from agent_comms import google_chat, google_intake, google_media, google_transcribe, google_worker
 from agent_comms.google_store import GoogleStore
 
@@ -55,23 +57,26 @@ def test_voice_success_uses_command_without_shell_and_one_line_turn(seat, monkey
     assert "File: " + str(audio) in body
     assert "Say what you heard before acting on anything that matters." in body
     assert "\n" not in body and "\r" not in body
+    assert "made-up transcript" not in str(store.get(row.id).payload)
     assert calls == [(["agent-transcribe", str(audio)], {
         "capture_output": True, "text": True, "timeout": 960, "check": False})]
 
 
-def test_voice_failure_keeps_audio_and_fixed_line(seat, monkeypatch):
+@pytest.mark.parametrize("exit_code", [10, 11, 12, 13, 14, 15])
+def test_voice_failure_keeps_audio_and_fixed_line(seat, monkeypatch, exit_code):
     store = GoogleStore(Path.home() / ".comms" / "comms.db")
     row = _message(store, "spaces/dm/messages/fail", audio=True)
     audio = Path.home() / "work" / "file-01.mp3"
     row = store.set_files(row, [{"path": str(audio), "content_type": "audio/mpeg", "bytes": 12}])
     monkeypatch.setattr(google_transcribe.subprocess, "run", lambda *_a, **_kw:
-                        SimpleNamespace(returncode=12, stdout="", stderr="sensitive service error"))
+                        SimpleNamespace(returncode=exit_code, stdout="", stderr="sensitive service error"))
     prepared, ready = google_transcribe.prepare_queued(store, row)
     body = google_intake.turn(prepared)
     assert ready and "Audio was not transcribed." in body
     assert str(audio) in body
     assert "sensitive service error" not in body
-    assert prepared.payload["files"][0]["transcription"] == {"status": "failed", "exit_code": 12}
+    assert prepared.payload["files"][0]["transcription"] == {
+        "status": "failed", "exit_code": exit_code}
 
 
 def test_long_transcript_keeps_path_without_shortening_store(seat, monkeypatch):
