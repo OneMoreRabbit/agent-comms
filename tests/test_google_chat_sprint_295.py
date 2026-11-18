@@ -242,6 +242,32 @@ def test_long_reply_uploads_whole_text_before_post(seat, tmp_path):
     assert posted[0].payload["source_text"] == text
 
 
+def test_long_answer_then_file_are_distinct_and_each_repeat_is_inert(seat, tmp_path):
+    store = GoogleStore(tmp_path / "two-replies.db")
+    row = _delivered(store)
+    posted, uploads = [], []
+    def upload(config, path):
+        uploads.append(path)
+        return f"https://drive.google.com/file/d/{len(uploads)}/view"
+    post = lambda outbound, _: posted.append(outbound)
+    long_text = "L" * 35000
+    first = google_reply.send_text(store, row, long_text, _config(tmp_path), _private(),
+                                   post=post, upload=upload)
+    same_first = google_reply.send_text(store, row, long_text, _config(tmp_path), _private(),
+                                        post=post, upload=upload)
+    file_path = Path.home() / "comms-files" / "out" / AGENT / "answer.txt"
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text("file answer")
+    second = google_reply.send_text(store, row, "File follows", _config(tmp_path), _private(),
+                                    post=post, upload=upload, file_path=file_path)
+    same_second = google_reply.send_text(store, row, "File follows", _config(tmp_path), _private(),
+                                         post=post, upload=upload, file_path=file_path)
+    assert first.id == same_first.id and second.id == same_second.id
+    assert first.id != second.id and first.request_id != second.request_id
+    assert len(posted) == len(uploads) == 2
+    assert len(store.replies()) == 2
+
+
 def test_reply_folder_preflight_precedes_outbox_and_text_can_replace(seat, tmp_path):
     store = GoogleStore(tmp_path / "preflight.db")
     row = _delivered(store)
