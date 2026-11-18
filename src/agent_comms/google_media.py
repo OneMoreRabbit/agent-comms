@@ -27,6 +27,9 @@ _EXTENSIONS = {
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
     "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+    "audio/mpeg": ".mp3", "audio/mp3": ".mp3", "audio/mp4": ".m4a",
+    "audio/ogg": ".ogg", "audio/webm": ".webm",
+    "audio/wav": ".wav", "audio/x-wav": ".wav",
 }
 
 
@@ -172,18 +175,26 @@ def cleanup_inbound(store: GoogleStore, *, now: datetime | None = None,
             continue
         expected = root / row.id
         for item in row.payload.get("files", []):
-            candidate = Path(item.get("path", "")) if isinstance(item, dict) else Path()
-            if candidate.parent != expected or not re.fullmatch(r"file-[0-9]{2}(\.[a-z0-9]+)?", candidate.name):
+            if not isinstance(item, dict):
                 continue
-            try:
-                info = candidate.lstat()
-                parent = expected.lstat()
-            except FileNotFoundError:
-                continue
-            if (stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid()
-                    and stat.S_ISDIR(parent.st_mode) and parent.st_uid == os.getuid()):
-                candidate.unlink()
-                removed += 1
+            paths = [item.get("path", "")]
+            transcription = item.get("transcription", {})
+            if isinstance(transcription, dict) and transcription.get("status") == "ok":
+                paths.append(transcription.get("path", ""))
+            for raw_path in paths:
+                candidate = Path(raw_path)
+                if (candidate.parent != expected
+                        or not re.fullmatch(r"file-[0-9]{2}(\.[a-z0-9]+)?(\.txt)?", candidate.name)):
+                    continue
+                try:
+                    info = candidate.lstat()
+                    parent = expected.lstat()
+                except FileNotFoundError:
+                    continue
+                if (stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid()
+                        and stat.S_ISDIR(parent.st_mode) and parent.st_uid == os.getuid()):
+                    candidate.unlink()
+                    removed += 1
         try:
             expected.rmdir()
         except OSError:
