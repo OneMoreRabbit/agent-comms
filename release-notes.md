@@ -1,7 +1,7 @@
 ---
 title: Release notes — agent-comms
 status: active
-updated: 2026-11-16
+updated: 2026-11-18
 owner: agent-eco.component.agent-comms
 about: one short entry per release, newest first
 ---
@@ -10,7 +10,15 @@ about: one short entry per release, newest first
 
 ## Built, not yet released
 
-- 2.9.6 — 2026-11-17: Keep stand-in inbound files and 30-day cleanup inside the marked test run, so synthetic `gc-` IDs cannot overwrite or remove live Google files on a test seat.
+## v2.9.6 — 2026-11-18
+
+**TL;DR:** Keep stand-in inbound files and their 30-day cleanup inside the marked test run, so synthetic `gc-` IDs cannot overwrite or remove real Google files on a test seat.
+
+- The stand-in turn names its own file path below the run directory. The live Google inbound path and hub behavior are unchanged.
+- A regression verifies that a same-ID real-path file is untouched after stand-in handoff and cleanup.
+- The known 2.9.5 second-upload race remains open; this patch does not change reply uploading.
+
+**Action:** Install on test-claude and test-codex for the full G-S03–G-S07 stand-in rerun. Do not install on other seats before beta acceptance.
 
 ## v2.9.5 — 2026-11-17
 
