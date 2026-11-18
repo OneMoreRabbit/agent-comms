@@ -10,6 +10,8 @@ about: one short entry per release, newest first
 
 ## Built, not yet released
 
+- 2.9.7 — 2026-11-18: Prepare and tighten the Google Chat file directories before naming the file-out path in an agent turn, so an agent-created group-writable folder cannot break later file input or long answers. Retain refusal for symlinks and foreign-owned paths.
+
 ## v2.9.6 — 2026-11-18
 
 **TL;DR:** Keep stand-in inbound files and their 30-day cleanup inside the marked test run, so synthetic `gc-` IDs cannot overwrite or remove real Google files on a test seat.

@@ -13,7 +13,7 @@ from typing import Callable
 
 from .google_chat import people_for_agent
 from .google_store import GoogleMessage, GoogleStore
-from . import google_notices, seat
+from . import google_drive, google_notices, seat
 
 MAX_AGE_SECONDS = 24 * 60 * 60
 MAX_ATTEMPTS = 3
@@ -240,6 +240,11 @@ def deliver_queued(store: GoogleStore, row: GoogleMessage,
         return store.transition(row.id, from_state="queued", to_state="expired",
                                 reason="Google event is older than 24 hours",
                                 notice=google_notices.retirement(row.event_time)) or store.get(row.id)
+    try:
+        google_drive.ensure_outbound_root(row.agent)
+    except google_drive.DriveError as exc:
+        return store.transition(row.id, from_state="queued", to_state="refused",
+                                reason=str(exc), notice=google_notices.NOT_DELIVERED) or store.get(row.id)
     body = turn(row, stand_in_run=stand_in_run)
     if len(body.encode("utf-8")) > seat.MAX_BODY_BYTES:
         return store.transition(row.id, from_state="queued", to_state="refused",

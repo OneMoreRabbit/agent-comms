@@ -1,6 +1,8 @@
 """Sprint 1 Google file, notice and stand-in paths never contact live Google."""
 
 import json
+import os
+import stat
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Event, Thread
@@ -152,6 +154,71 @@ def test_drive_upload_uses_shared_drive_folder_and_returns_private_link(seat, tm
         google_drive.validate_outbound_file(AGENT, symlink)
     with pytest.raises(google_drive.DriveError, match="under the agent"):
         google_drive.validate_outbound_file(AGENT, tmp_path / "outside.pdf")
+
+
+def test_agent_file_out_then_file_in_and_long_answer_repair_owned_directories(seat, tmp_path):
+    root = seat / "comms-files"
+    assert not root.exists()
+    store = GoogleStore(tmp_path / "first-turn.db")
+    row, _ = google_intake.ingest(store, _event(), _private())
+    turns = []
+    delivered = google_intake.deliver_queued(
+        store, row,
+        lambda body, *, agent: (turns.append(body) or
+                                seat_api.Delivery(True, seat_api.DELIVERED)))
+    output = root / "out" / AGENT
+    assert delivered.state == "delivered" and str(output) in turns[0]
+    assert all(stat.S_IMODE(path.stat().st_mode) == 0o700
+               for path in (root, root / "out", output))
+
+    # An agent can create its file and make these folders group-writable.
+    # Both a reply and the next inbound file must tighten them again.
+    for path in (root, root / "out", output):
+        path.chmod(0o775)
+    reply_file = output / "answer.txt"
+    reply_file.write_text("answer", encoding="utf-8")
+    assert google_drive.validate_outbound_file(AGENT, reply_file) == reply_file
+    assert all(stat.S_IMODE(path.stat().st_mode) == 0o700
+               for path in (root, root / "out", output))
+
+    root.chmod(0o775)
+    attachment = {"source": "UPLOADED_CONTENT", "contentType": "image/png",
+                  "attachmentDataRef": {"resourceName": "spaces/dm/attachments/photo"}}
+    incoming, _ = google_intake.ingest(
+        store, _event(name="spaces/dm/messages/photo", attachments=(attachment,)), _private())
+    prepared = google_media.prepare_queued(store, incoming, _config(tmp_path),
+                                           download=lambda *_: [b"photo"])
+    assert prepared.payload["files"][0]["bytes"] == 5
+    assert stat.S_IMODE(root.stat().st_mode) == 0o700
+    assert stat.S_IMODE((root / "in").stat().st_mode) == 0o700
+
+    output.chmod(0o775)
+    answer = google_drive.create_long_answer(AGENT, "complete long answer")
+    assert answer.read_text(encoding="utf-8") == "complete long answer"
+    assert stat.S_IMODE(output.stat().st_mode) == 0o700
+
+
+def test_google_file_directories_refuse_links_and_other_owners(seat, tmp_path, monkeypatch):
+    root = seat / "comms-files"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    root.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(google_drive.DriveError, match="symlink"):
+        google_drive.ensure_outbound_root(AGENT)
+    store = GoogleStore(tmp_path / "linked-turn.db")
+    row, _ = google_intake.ingest(store, _event(), _private())
+    refused = google_intake.deliver_queued(
+        store, row, lambda *_a, **_kw: pytest.fail("linked root reached the seat"))
+    assert refused.state == "refused" and "symlink" in refused.reason
+    assert store.notices()[0].payload["text"] == google_notices.NOT_DELIVERED
+    root.unlink()
+    root.mkdir(mode=0o775)
+    root.chmod(0o775)
+    real_uid = os.getuid()
+    monkeypatch.setattr("agent_comms.google_paths.os.getuid", lambda: real_uid + 1)
+    with pytest.raises(google_drive.DriveError, match="not owned"):
+        google_drive.ensure_outbound_root(AGENT)
+    assert stat.S_IMODE(root.stat().st_mode) == 0o775
 
 
 def test_long_reply_uploads_whole_text_before_post(seat, tmp_path):
