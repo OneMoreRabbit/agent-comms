@@ -10,7 +10,23 @@ about: one short entry per release, newest first
 
 ## Built, not yet released
 
-- 2.9.7 — 2026-11-18: Prepare and tighten the Google Chat file directories before naming the file-out path in an agent turn, so an agent-created group-writable folder cannot break later file input or long answers. Retain refusal for symlinks and foreign-owned paths.
+## v2.9.7 — 2026-11-18
+
+**TL;DR:** Prepare and tighten Google Chat file directories before naming
+the file-out path in an agent turn, so an agent-created group-writable
+folder cannot break later file input or long answers.
+
+- Owned real directories are made owner-only (0700) before a turn, inbound
+  file, outbound file or generated long answer uses them. Links and
+  foreign-owned paths remain refused.
+- Source suite: 460/460. This patch leaves hub delivery unchanged.
+- Known issue: a refusal for a linked or foreign-owned directory does not
+  yet name the exact path in the local log; this is a later-build improvement.
+
+**Action:** Install from the tag on test-codex and test-claude only. Rerun
+the stand-in gate on test-codex. Do not run test-claude rows until arch
+releases that seat after the separate typed-but-not-submitted handoff fault.
+This tag is not the operator's Google beta acceptance.
 
 ## v2.9.6 — 2026-11-18
 
