@@ -15,6 +15,7 @@ from .google_chat import AgentConfig, GoogleChatConfigError
 from .google_intake import MAX_AGE_SECONDS, _age_seconds
 from .google_store import GoogleMessage, GoogleStore
 from . import google_notices
+from .google_paths import FileDirectoryError, ensure_owner_only_directory
 
 MAX_FILE_BYTES = 50 * 1024 * 1024
 MAX_TOTAL_BYTES = 100 * 1024 * 1024
@@ -50,13 +51,9 @@ def _download(resource_name: str, config: AgentConfig) -> Iterable[bytes]:
 
 def _owner_only_directory(path: Path) -> None:
     try:
-        path.mkdir(mode=0o700)
-    except FileExistsError:
-        pass
-    info = path.lstat()
-    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
-            or stat.S_IMODE(info.st_mode) & 0o077):
-        raise MediaError("inbound file directory is not owner-only")
+        ensure_owner_only_directory(path)
+    except FileDirectoryError as exc:
+        raise MediaError(str(exc)) from exc
 
 
 def _inbound_root(stand_in_run: Path | None = None) -> Path:
@@ -89,11 +86,11 @@ def prepare_queued(store: GoogleStore, row: GoogleMessage, config: AgentConfig,
     if not isinstance(attachments, list) or not 1 <= len(attachments) <= 10:
         return store.transition(row.id, from_state="queued", to_state="refused",
                                 reason="attachment reference is unavailable") or store.get(row.id)
-    target_dir = _target_directory(row.id, stand_in_run=stand_in_run)
     files = []
     written = []
     total = 0
     try:
+        target_dir = _target_directory(row.id, stand_in_run=stand_in_run)
         for index, attachment in enumerate(attachments, 1):
             reference = attachment.get("attachmentDataRef", {})
             resource_name = reference.get("resourceName")

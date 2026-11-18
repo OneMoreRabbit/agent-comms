@@ -13,6 +13,7 @@ from typing import Callable
 from urllib.parse import quote, urlparse
 
 from .google_chat import AgentConfig, GoogleChatConfigError
+from .google_paths import FileDirectoryError, ensure_owner_only_directory
 
 MAX_REPLY_FILE_BYTES = 50 * 1024 * 1024
 _FOLDER_MIME = "application/vnd.google-apps.folder"
@@ -62,12 +63,24 @@ def check_reply_folder(config: AgentConfig, session_factory: Callable = _session
         raise DriveError("reply folder is not writable by this service account")
 
 
+def ensure_outbound_root(agent: str) -> Path:
+    """Prepare the directory named to an agent before handing it a turn."""
+    root = Path.home() / "comms-files" / "out" / agent
+    try:
+        for directory in (root.parent.parent, root.parent, root):
+            ensure_owner_only_directory(directory)
+    except FileDirectoryError as exc:
+        raise DriveError(str(exc)) from exc
+    return root
+
+
 def validate_outbound_file(agent: str, path: Path) -> Path:
     """Keep an agent's file beneath its own declared out root, with no symlink."""
     root = Path.home() / "comms-files" / "out" / agent
     candidate = path.absolute()
     if ".." in path.parts or not candidate.is_relative_to(root):
         raise DriveError("reply file must be under the agent's comms-files/out folder")
+    ensure_outbound_root(agent)
     for item in (Path.home() / "comms-files", Path.home() / "comms-files" / "out", root,
                  *[root.joinpath(*candidate.relative_to(root).parts[:index])
                    for index in range(1, len(candidate.relative_to(root).parts) + 1)]):
@@ -87,16 +100,7 @@ def validate_outbound_file(agent: str, path: Path) -> Path:
 
 def create_long_answer(agent: str, text: str) -> Path:
     """Keep an overlong answer whole in an owner-only file for Drive upload."""
-    root = Path.home() / "comms-files" / "out" / agent
-    for directory in (Path.home() / "comms-files", Path.home() / "comms-files" / "out", root):
-        try:
-            directory.mkdir(mode=0o700)
-        except FileExistsError:
-            pass
-        info = directory.lstat()
-        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
-                or stat.S_IMODE(info.st_mode) & 0o077):
-            raise DriveError("long-answer output directory is not owner-only")
+    root = ensure_outbound_root(agent)
     if len(text.encode("utf-8")) > MAX_REPLY_FILE_BYTES:
         raise DriveError("long answer is too large (limit 50 MiB)")
     descriptor, name = tempfile.mkstemp(prefix="answer-", suffix=".txt", dir=root)
